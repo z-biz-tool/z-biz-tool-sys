@@ -2,6 +2,9 @@ use serde::{Deserialize, Serialize};
 use sysinfo::{System, SystemExt, DiskExt, NetworkExt};
 use tauri::command;
 
+mod cleanup;
+use cleanup::{cleanup_categories, find_large_files, get_startup_items, scan_junk, CleanupResult, JunkReport, LargeFile, StartupItem};
+
 // 系统信息
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SystemInfo {
@@ -245,6 +248,8 @@ pub async fn get_processes() -> Result<Vec<ProcessInfo>, String> {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_fs::init())
         .invoke_handler(tauri::generate_handler![
             get_system_info,
             get_cpu_usage,
@@ -252,7 +257,99 @@ pub fn run() {
             get_disk_info,
             get_network_stats,
             get_processes,
+            scan_junk_files,
+            cleanup_junk_files,
+            find_large_files_cmd,
+            get_startup_items_cmd,
+            kill_process,
+            flush_dns_cache,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+// ================== 系统清理命令 ==================
+
+#[command]
+pub async fn scan_junk_files() -> Result<JunkReport, String> {
+    Ok(scan_junk())
+}
+
+#[command]
+pub async fn cleanup_junk_files(ids: Vec<String>) -> Result<CleanupResult, String> {
+    Ok(cleanup_categories(&ids))
+}
+
+#[command]
+pub async fn find_large_files_cmd(
+    path: String,
+    min_size_mb: u64,
+    limit: usize,
+) -> Result<Vec<LargeFile>, String> {
+    Ok(find_large_files(&path, min_size_mb * 1024 * 1024, limit))
+}
+
+#[command]
+pub async fn get_startup_items_cmd() -> Result<Vec<StartupItem>, String> {
+    Ok(get_startup_items())
+}
+
+#[command]
+pub async fn kill_process(pid: u32) -> Result<bool, String> {
+    #[cfg(unix)]
+    {
+        let result = std::process::Command::new("kill")
+            .arg("-9")
+            .arg(pid.to_string())
+            .output();
+        match result {
+            Ok(out) => Ok(out.status.success()),
+            Err(e) => Err(format!("杀进程失败: {}", e)),
+        }
+    }
+    #[cfg(windows)]
+    {
+        let result = std::process::Command::new("taskkill")
+            .args(["/F", "/PID", &pid.to_string()])
+            .output();
+        match result {
+            Ok(out) => Ok(out.status.success()),
+            Err(e) => Err(format!("杀进程失败: {}", e)),
+        }
+    }
+}
+
+#[command]
+pub async fn flush_dns_cache() -> Result<String, String> {
+    #[cfg(target_os = "macos")]
+    {
+        let result = std::process::Command::new("sudo")
+            .args(["dscacheutil", "-flushcache"])
+            .output();
+        match result {
+            Ok(out) => Ok(format!("macOS DNS 缓存已刷新: {}", String::from_utf8_lossy(&out.stdout))),
+            Err(e) => Err(format!("刷新失败: {}", e)),
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // 尝试 systemd-resolved
+        let result = std::process::Command::new("sudo")
+            .args(["systemctl", "restart", "systemd-resolved"])
+            .output();
+        match result {
+            Ok(out) => Ok(format!("systemd-resolved 已重启: {}", String::from_utf8_lossy(&out.stdout))),
+            Err(e) => Err(format!("刷新失败: {}", e)),
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let result = std::process::Command::new("ipconfig")
+            .arg("/flushdns")
+            .output();
+        match result {
+            Ok(out) => Ok(format!("Windows DNS 缓存已刷新: {}", String::from_utf8_lossy(&out.stdout))),
+            Err(e) => Err(format!("刷新失败: {}", e)),
+        }
+    }
 }
