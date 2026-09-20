@@ -22,6 +22,10 @@ import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContai
 import { invoke } from "@tauri-apps/api/core";
 import dayjs from "dayjs";
 
+// 渐变色主题常量
+const brandGradient = "linear-gradient(135deg, #667eea 0%, #764ba2 100%)";
+const cardBgGradient = "linear-gradient(135deg, rgba(102,126,234,0.04) 0%, rgba(118,75,162,0.04) 100%)";
+
 const { Header, Content } = Layout;
 const { Title, Text } = Typography;
 
@@ -349,17 +353,17 @@ function App() {
       <Layout style={{ height: "100vh" }}>
         <Header
           style={{
-            background: darkMode ? "#141414" : "#fff",
+            background: cardBgGradient,
             padding: "0 24px",
-            borderBottom: "1px solid #f0f0f0",
+            borderBottom: `1px solid var(--ant-color-border-secondary)`,
             display: "flex",
             justifyContent: "space-between",
             alignItems: "center",
           }}
         >
           <Space>
-            <DashboardOutlined style={{ fontSize: "24px", color: "#1890ff" }} />
-            <Title level={4} style={{ margin: 0 }}>
+            <DashboardOutlined style={{ fontSize: "24px", background: brandGradient, WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent" }} />
+            <Title level={4} style={{ margin: 0, background: brandGradient, WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent" }}>
               系统监控仪表盘
             </Title>
           </Space>
@@ -374,7 +378,14 @@ function App() {
               unCheckedChildren="☀️"
             />
             <Tooltip title="刷新 DNS 缓存">
-              <Button icon={<SyncOutlined />} onClick={flushDns}>
+              <Button 
+                icon={<SyncOutlined />} 
+                onClick={flushDns}
+                style={{ 
+                  borderRadius: 6,
+                  transition: "all 0.2s cubic-bezier(0.4, 0, 0.2, 1)",
+                }}
+              >
                 刷新 DNS
               </Button>
             </Tooltip>
@@ -382,13 +393,21 @@ function App() {
           </Space>
         </Header>
         <Content style={{ padding: "16px", overflow: "auto" }}>
-          <Tabs activeKey={activeTab} onChange={setActiveTab} size="large">
+          <Tabs activeKey={activeTab} onChange={setActiveTab} size="large" style={{ background: cardBgGradient, borderRadius: 16, overflow: "hidden" }}>
             {/* ============ 概览 ============ */}
             <Tabs.TabPane tab="概览" key="overview">
               <Row gutter={[16, 16]} style={{ marginBottom: "16px" }}>
                 <Col span={6}>
-                  <Card size="small" className="monitor-card">
-                    <div className="monitor-card-title">
+                  <Card 
+                    size="small" 
+                    className="monitor-card"
+                    style={{ 
+                      borderRadius: 12,
+                      background: cardBgGradient,
+                      transition: "all 0.3s cubic-bezier(0.4, 0, 0.2, 1)",
+                    }}
+                  >
+                    <div className="monitor-card-title" style={{ background: brandGradient, WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent" }}>
                       <DesktopOutlined /> CPU 使用率
                     </div>
                     <div className="monitor-card-value">
@@ -406,8 +425,16 @@ function App() {
                   </Card>
                 </Col>
                 <Col span={6}>
-                  <Card size="small" className="monitor-card">
-                    <div className="monitor-card-title">
+                  <Card 
+                    size="small" 
+                    className="monitor-card"
+                    style={{ 
+                      borderRadius: 12,
+                      background: cardBgGradient,
+                      transition: "all 0.3s cubic-bezier(0.4, 0, 0.2, 1)",
+                    }}
+                  >
+                    <div className="monitor-card-title" style={{ background: brandGradient, WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent" }}>
                       <CloudOutlined /> 内存使用
                     </div>
                     <div className="monitor-card-value">
@@ -425,8 +452,16 @@ function App() {
                   </Card>
                 </Col>
                 <Col span={6}>
-                  <Card size="small" className="monitor-card">
-                    <div className="monitor-card-title">
+                  <Card 
+                    size="small" 
+                    className="monitor-card"
+                    style={{ 
+                      borderRadius: 12,
+                      background: cardBgGradient,
+                      transition: "all 0.3s cubic-bezier(0.4, 0, 0.2, 1)",
+                    }}
+                  >
+                    <div className="monitor-card-title" style={{ background: brandGradient, WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent" }}>
                       <HddOutlined /> 磁盘使用
                     </div>
                     <div className="monitor-card-value">
@@ -444,8 +479,16 @@ function App() {
                   </Card>
                 </Col>
                 <Col span={6}>
-                  <Card size="small" className="monitor-card">
-                    <div className="monitor-card-title">
+                  <Card 
+                    size="small" 
+                    className="monitor-card"
+                    style={{ 
+                      borderRadius: 12,
+                      background: cardBgGradient,
+                      transition: "all 0.3s cubic-bezier(0.4, 0, 0.2, 1)",
+                    }}
+                  >
+                    <div className="monitor-card-title" style={{ background: brandGradient, WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent" }}>
                       <WifiOutlined /> 网络流量
                     </div>
                     <div className="monitor-card-value">
@@ -462,7 +505,22 @@ function App() {
 
               <Row gutter={[16, 16]}>
                 <Col span={12}>
-                  <Card size="small" title="CPU 使用率趋势" className="monitor-card">
+                  <Card 
+                    size="small" 
+                    title={
+                      <span style={{ 
+                        fontWeight: 600,
+                        background: brandGradient,
+                        WebkitBackgroundClip: "text",
+                        WebkitTextFillColor: "transparent",
+                      }}>CPU 使用率趋势</span>
+                    }
+                    className="monitor-card"
+                    style={{ 
+                      borderRadius: 12,
+                      background: cardBgGradient,
+                    }}
+                  >
                     <ResponsiveContainer width="100%" height={200}>
                       <AreaChart data={monitorData}>
                         <CartesianGrid strokeDasharray="3 3" />
@@ -472,16 +530,36 @@ function App() {
                         <Area
                           type="monotone"
                           dataKey="cpu"
-                          stroke="#1890ff"
-                          fill="#1890ff"
-                          fillOpacity={0.2}
+                          stroke="#667eea"
+                          fill="url(#cpuGradient)"
                         />
+                        <defs id="cpuGradient">
+                          <linearGradient id="colorCpu" x1="0" y1="0" x2="0" y2="1">
+                            <stop offset="5%" stopColor="#667eea" stopOpacity={0.8}/>
+                            <stop offset="95%" stopColor="#667eea" stopOpacity={0}/>
+                          </linearGradient>
+                        </defs>
                       </AreaChart>
                     </ResponsiveContainer>
                   </Card>
                 </Col>
                 <Col span={12}>
-                  <Card size="small" title="内存使用趋势" className="monitor-card">
+                  <Card 
+                    size="small" 
+                    title={
+                      <span style={{ 
+                        fontWeight: 600,
+                        background: brandGradient,
+                        WebkitBackgroundClip: "text",
+                        WebkitTextFillColor: "transparent",
+                      }}>内存使用趋势</span>
+                    }
+                    className="monitor-card"
+                    style={{ 
+                      borderRadius: 12,
+                      background: cardBgGradient,
+                    }}
+                  >
                     <ResponsiveContainer width="100%" height={200}>
                       <AreaChart data={monitorData}>
                         <CartesianGrid strokeDasharray="3 3" />
@@ -491,10 +569,15 @@ function App() {
                         <Area
                           type="monotone"
                           dataKey="memory"
-                          stroke="#52c41a"
-                          fill="#52c41a"
-                          fillOpacity={0.2}
+                          stroke="#764ba2"
+                          fill="url(#memoryGradient)"
                         />
+                        <defs id="memoryGradient">
+                          <linearGradient id="colorMemory" x1="0" y1="0" x2="0" y2="1">
+                            <stop offset="5%" stopColor="#764ba2" stopOpacity={0.8}/>
+                            <stop offset="95%" stopColor="#764ba2" stopOpacity={0}/>
+                          </linearGradient>
+                        </defs>
                       </AreaChart>
                     </ResponsiveContainer>
                   </Card>
