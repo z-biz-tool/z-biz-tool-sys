@@ -1,14 +1,12 @@
 import { useState, useEffect } from "react";
-import { ConfigProvider, theme, Layout, Card, Row, Col, Statistic, Switch, Space, Typography, Tabs, Table, Progress, Button, message, Tag, Popconfirm, Tooltip, InputNumber, Input } from "antd";
+import { ConfigProvider, theme, Layout, Card, Row, Col, Statistic, Switch, Space, Typography, Tabs, Table, Progress, Button, message, Tag, Popconfirm, Tooltip, InputNumber } from "antd";
 import {
   DashboardOutlined,
   DesktopOutlined,
   CloudOutlined,
   HddOutlined,
   WifiOutlined,
-  ThunderboltOutlined,
   ReloadOutlined,
-  FullscreenOutlined,
   SettingOutlined,
   DeleteOutlined,
   SearchOutlined,
@@ -18,7 +16,7 @@ import {
   SyncOutlined,
   FileSearchOutlined,
 } from "@ant-design/icons";
-import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, AreaChart, Area } from "recharts";
+import { XAxis, YAxis, CartesianGrid, Tooltip as ChartTooltip, ResponsiveContainer, AreaChart, Area } from "recharts";
 import { invoke } from "@tauri-apps/api/core";
 import dayjs from "dayjs";
 
@@ -113,7 +111,7 @@ function App() {
   const [darkMode, setDarkMode] = useState(false);
   const [systemInfo] = useState(mockSystemInfo);
   const [monitorData, setMonitorData] = useState(generateMockData(60));
-  const [refreshInterval, setRefreshInterval] = useState(1);
+  const [refreshInterval] = useState(1);
   const [activeTab, setActiveTab] = useState("overview");
   const [msgApi, msgContext] = message.useMessage();
 
@@ -468,7 +466,7 @@ function App() {
                         <CartesianGrid strokeDasharray="3 3" />
                         <XAxis dataKey="time" tick={{ fontSize: 12 }} />
                         <YAxis domain={[0, 100]} tick={{ fontSize: 12 }} />
-                        <Tooltip />
+                        <ChartTooltip />
                         <Area
                           type="monotone"
                           dataKey="cpu"
@@ -487,7 +485,7 @@ function App() {
                         <CartesianGrid strokeDasharray="3 3" />
                         <XAxis dataKey="time" tick={{ fontSize: 12 }} />
                         <YAxis domain={[0, 100]} tick={{ fontSize: 12 }} />
-                        <Tooltip />
+                        <ChartTooltip />
                         <Area
                           type="monotone"
                           dataKey="memory"
