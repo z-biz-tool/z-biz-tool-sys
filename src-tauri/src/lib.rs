@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use sysinfo::System;
+use sysinfo::{System, Disks, Networks};
 
 mod cleanup;
 use cleanup::{cleanup_categories, find_large_files, get_startup_items, scan_junk, CleanupResult, JunkReport, LargeFile, StartupItem};
@@ -111,16 +111,18 @@ pub async fn get_system_info() -> Result<SystemInfo, String> {
     // 磁盘信息
     let mut disk_total = 0.0;
     let mut disk_used = 0.0;
-    for disk in sys.disks() {
+    let disks = Disks::new_with_refreshed_list();
+    for disk in disks.list() {
         disk_total += disk.total_space() as f64 / 1024.0 / 1024.0 / 1024.0;
         disk_used += (disk.total_space() - disk.available_space()) as f64 / 1024.0 / 1024.0 / 1024.0;
     }
 
     // 网络接口
-    let network_interfaces: Vec<NetworkInterface> = sys.networks().iter().map(|(name, data)| {
+    let networks = Networks::new_with_refreshed_list();
+    let network_interfaces: Vec<NetworkInterface> = networks.list().iter().map(|(name, _data)| {
         NetworkInterface {
             name: name.clone(),
-            ip: format!("{:?}", data),
+            ip: String::new(),
             mac: "AA:BB:CC:DD:EE:FF".to_string(),
             speed: 1000,
         }
@@ -145,7 +147,7 @@ pub async fn get_system_info() -> Result<SystemInfo, String> {
 
 pub async fn get_cpu_usage() -> Result<CpuInfo, String> {
     let mut sys = System::new();
-    sys.refresh_cpu_all();
+    sys.refresh_cpu();
 
     let usage = sys.global_cpu_info().cpu_usage();
     let cores: Vec<CpuCore> = sys.cpus().iter().enumerate().map(|(i, cpu)| {
@@ -180,18 +182,17 @@ pub async fn get_memory_info() -> Result<MemoryInfo, String> {
 // 获取磁盘信息
 
 pub async fn get_disk_info() -> Result<Vec<DiskInfo>, String> {
-    let mut sys = System::new();
-    sys.refresh_disks_list();
+    let disks = Disks::new_with_refreshed_list();
 
-    let disks: Vec<DiskInfo> = sys.disks().iter().map(|disk| {
+    let result: Vec<DiskInfo> = disks.list().iter().map(|disk| {
         let total = disk.total_space() as f64 / 1024.0 / 1024.0 / 1024.0;
         let used = (disk.total_space() - disk.available_space()) as f64 / 1024.0 / 1024.0 / 1024.0;
         let free = disk.available_space() as f64 / 1024.0 / 1024.0 / 1024.0;
         let usage_percent = (used / total) * 100.0;
 
         DiskInfo {
-            name: disk.name().to_string_lossy().to_string(),
-            mount_point: disk.mount_point().to_string_lossy().to_string(),
+            name: disk.name().to_string(),
+            mount_point: disk.mount_point().to_string(),
             total,
             used,
             free,
@@ -199,16 +200,15 @@ pub async fn get_disk_info() -> Result<Vec<DiskInfo>, String> {
         }
     }).collect();
 
-    Ok(disks)
+    Ok(result)
 }
 
 // 获取网络统计
 
 pub async fn get_network_stats() -> Result<Vec<NetworkStats>, String> {
-    let mut sys = System::new();
-    sys.refresh_networks_list();
+    let networks = Networks::new_with_refreshed_list();
 
-    let stats: Vec<NetworkStats> = sys.networks().iter().map(|(name, data)| {
+    let stats: Vec<NetworkStats> = networks.list().iter().map(|(name, data)| {
         NetworkStats {
             interface: name.clone(),
             bytes_received: data.total_received(),
@@ -225,15 +225,15 @@ pub async fn get_network_stats() -> Result<Vec<NetworkStats>, String> {
 
 pub async fn get_processes() -> Result<Vec<ProcessInfo>, String> {
     let mut sys = System::new();
-    sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+    sys.refresh_processes();
 
     let mut processes: Vec<ProcessInfo> = sys.processes().iter().map(|(pid, proc_info)| {
         ProcessInfo {
             pid: pid.as_u32(),
-            name: proc_info.name().to_string_lossy().to_string(),
+            name: proc_info.name().to_string(),
             cpu_usage: proc_info.cpu_usage(),
             memory_usage: proc_info.memory(),
-            threads: proc_info.thread_count() as usize,
+            threads: 0,
         }
     }).collect();
 
