@@ -18,6 +18,7 @@ import {
 } from "@ant-design/icons";
 import { XAxis, YAxis, CartesianGrid, Tooltip as ChartTooltip, ResponsiveContainer, AreaChart, Area } from "recharts";
 import { invoke } from "@tauri-apps/api/core";
+import { AreaChart, Area, XAxis, YAxis, CartesianGrid, ResponsiveContainer } from "recharts";
 import dayjs from "dayjs";
 
 // 渐变色主题常量
@@ -115,7 +116,7 @@ function App() {
   const [darkMode, setDarkMode] = useState(false);
   const [systemInfo] = useState(mockSystemInfo);
   const [monitorData, setMonitorData] = useState(generateMockData(60));
-  const [refreshInterval] = useState(1);
+const [refreshInterval] = useState(1);
   const [activeTab, setActiveTab] = useState("overview");
   const [msgApi, msgContext] = message.useMessage();
 
@@ -129,6 +130,7 @@ function App() {
   const [largeFiles, setLargeFiles] = useState<LargeFile[]>([]);
   const [largeFileMinSize, setLargeFileMinSize] = useState<number>(100);
   const [scanningLarge, setScanningLarge] = useState(false);
+  const [refreshInterval] = useState(1);
 
   // 启动项状态
   const [startupItems, setStartupItems] = useState<StartupItem[]>([]);
