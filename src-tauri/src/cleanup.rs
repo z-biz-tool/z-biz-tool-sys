@@ -292,7 +292,7 @@ pub fn cleanup_categories(ids: &[String]) -> CleanupResult {
             continue;
         }
 
-        let (size_before, count_before) = dir_size(&path);
+        let (size_before, _count_before) = dir_size(&path);
 
         for entry in WalkDir::new(&path).into_iter().filter_map(Result::ok) {
             if entry.file_type().is_file() {

@@ -85,6 +85,7 @@ pub struct ProcessInfo {
 
 // 获取系统信息
 
+#[tauri::command]
 pub async fn get_system_info() -> Result<SystemInfo, String> {
     let mut sys = System::new_all();
     sys.refresh_all();
@@ -145,6 +146,7 @@ pub async fn get_system_info() -> Result<SystemInfo, String> {
 
 // 获取 CPU 使用率
 
+#[tauri::command]
 pub async fn get_cpu_usage() -> Result<CpuInfo, String> {
     let mut sys = System::new();
     sys.refresh_cpu();
@@ -162,6 +164,7 @@ pub async fn get_cpu_usage() -> Result<CpuInfo, String> {
 
 // 获取内存信息
 
+#[tauri::command]
 pub async fn get_memory_info() -> Result<MemoryInfo, String> {
     let mut sys = System::new();
     sys.refresh_memory();
@@ -181,6 +184,7 @@ pub async fn get_memory_info() -> Result<MemoryInfo, String> {
 
 // 获取磁盘信息
 
+#[tauri::command]
 pub async fn get_disk_info() -> Result<Vec<DiskInfo>, String> {
     let disks = Disks::new_with_refreshed_list();
 
@@ -191,8 +195,8 @@ pub async fn get_disk_info() -> Result<Vec<DiskInfo>, String> {
         let usage_percent = (used / total) * 100.0;
 
         DiskInfo {
-            name: disk.name().to_string(),
-            mount_point: disk.mount_point().to_string(),
+            name: disk.name().to_string_lossy().to_string(),
+            mount_point: disk.mount_point().to_string_lossy().to_string(),
             total,
             used,
             free,
@@ -205,6 +209,7 @@ pub async fn get_disk_info() -> Result<Vec<DiskInfo>, String> {
 
 // 获取网络统计
 
+#[tauri::command]
 pub async fn get_network_stats() -> Result<Vec<NetworkStats>, String> {
     let networks = Networks::new_with_refreshed_list();
 
@@ -223,6 +228,7 @@ pub async fn get_network_stats() -> Result<Vec<NetworkStats>, String> {
 
 // 获取进程列表
 
+#[tauri::command]
 pub async fn get_processes() -> Result<Vec<ProcessInfo>, String> {
     let mut sys = System::new();
     sys.refresh_processes();
@@ -230,7 +236,7 @@ pub async fn get_processes() -> Result<Vec<ProcessInfo>, String> {
     let mut processes: Vec<ProcessInfo> = sys.processes().iter().map(|(pid, proc_info)| {
         ProcessInfo {
             pid: pid.as_u32(),
-            name: proc_info.name().to_string(),
+            name: proc_info.name().to_string_lossy().to_string(),
             cpu_usage: proc_info.cpu_usage(),
             memory_usage: proc_info.memory(),
             threads: 0,
@@ -270,16 +276,19 @@ pub fn run() {
 // ================== 系统清理命令 ==================
 
 
+#[tauri::command]
 pub async fn scan_junk_files() -> Result<JunkReport, String> {
     Ok(scan_junk())
 }
 
 
+#[tauri::command]
 pub async fn cleanup_junk_files(ids: Vec<String>) -> Result<CleanupResult, String> {
     Ok(cleanup_categories(&ids))
 }
 
 
+#[tauri::command]
 pub async fn find_large_files_cmd(
     path: String,
     min_size_mb: u64,
@@ -289,11 +298,13 @@ pub async fn find_large_files_cmd(
 }
 
 
+#[tauri::command]
 pub async fn get_startup_items_cmd() -> Result<Vec<StartupItem>, String> {
     Ok(get_startup_items())
 }
 
 
+#[tauri::command]
 pub async fn kill_process(pid: u32) -> Result<bool, String> {
     #[cfg(unix)]
     {
@@ -319,6 +330,7 @@ pub async fn kill_process(pid: u32) -> Result<bool, String> {
 }
 
 
+#[tauri::command]
 pub async fn flush_dns_cache() -> Result<String, String> {
     #[cfg(target_os = "macos")]
     {
