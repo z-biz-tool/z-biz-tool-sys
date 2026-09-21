@@ -155,7 +155,7 @@ pub async fn get_processes() -> Result<Vec<ProcessInfo>, String> {
     let mut processes: Vec<ProcessInfo> = sys.processes().iter().map(|(pid, proc_info)| {
         ProcessInfo {
             pid: pid.as_u32(),
-            name: proc_info.name().to_string_lossy().to_string(),
+            name: proc_info.name().to_string(),
             cpu_usage: proc_info.cpu_usage(),
             memory_usage: proc_info.memory(),
             threads: 0,
