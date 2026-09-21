@@ -18,7 +18,6 @@ import {
 } from "@ant-design/icons";
 import { XAxis, YAxis, CartesianGrid, Tooltip as ChartTooltip, ResponsiveContainer, AreaChart, Area } from "recharts";
 import { invoke } from "@tauri-apps/api/core";
-import { AreaChart, Area, XAxis, YAxis, CartesianGrid, ResponsiveContainer } from "recharts";
 import dayjs from "dayjs";
 
 // 渐变色主题常量
