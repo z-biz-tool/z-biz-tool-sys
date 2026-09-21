@@ -129,7 +129,6 @@ const [refreshInterval] = useState(1);
   const [largeFiles, setLargeFiles] = useState<LargeFile[]>([]);
   const [largeFileMinSize, setLargeFileMinSize] = useState<number>(100);
   const [scanningLarge, setScanningLarge] = useState(false);
-  const [refreshInterval] = useState(1);
 
   // 启动项状态
   const [startupItems, setStartupItems] = useState<StartupItem[]>([]);
