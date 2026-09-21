@@ -21,6 +21,7 @@
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
     "recharts": "^2.10.0",
+    "z-biz-tool-shared": "file:../z-biz-tool-shared",
     "zustand": "^5.0.0"
   },
   "devDependencies": {
