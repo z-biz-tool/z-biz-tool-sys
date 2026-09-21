@@ -1,6 +1,5 @@
 use serde::{Deserialize, Serialize};
-use sysinfo::{System, SystemExt, DiskExt, NetworkExt};
-use tauri::command;
+use sysinfo::System;
 
 mod cleanup;
 use cleanup::{cleanup_categories, find_large_files, get_startup_items, scan_junk, CleanupResult, JunkReport, LargeFile, StartupItem};
@@ -85,7 +84,7 @@ pub struct ProcessInfo {
 }
 
 // 获取系统信息
-#[command]
+
 pub async fn get_system_info() -> Result<SystemInfo, String> {
     let mut sys = System::new_all();
     sys.refresh_all();
@@ -143,10 +142,10 @@ pub async fn get_system_info() -> Result<SystemInfo, String> {
 }
 
 // 获取 CPU 使用率
-#[command]
+
 pub async fn get_cpu_usage() -> Result<CpuInfo, String> {
     let mut sys = System::new();
-    sys.refresh_cpu();
+    sys.refresh_cpu_all();
 
     let usage = sys.global_cpu_info().cpu_usage();
     let cores: Vec<CpuCore> = sys.cpus().iter().enumerate().map(|(i, cpu)| {
@@ -160,7 +159,7 @@ pub async fn get_cpu_usage() -> Result<CpuInfo, String> {
 }
 
 // 获取内存信息
-#[command]
+
 pub async fn get_memory_info() -> Result<MemoryInfo, String> {
     let mut sys = System::new();
     sys.refresh_memory();
@@ -179,10 +178,10 @@ pub async fn get_memory_info() -> Result<MemoryInfo, String> {
 }
 
 // 获取磁盘信息
-#[command]
+
 pub async fn get_disk_info() -> Result<Vec<DiskInfo>, String> {
     let mut sys = System::new();
-    sys.refresh_disks();
+    sys.refresh_disks_list();
 
     let disks: Vec<DiskInfo> = sys.disks().iter().map(|disk| {
         let total = disk.total_space() as f64 / 1024.0 / 1024.0 / 1024.0;
@@ -204,16 +203,16 @@ pub async fn get_disk_info() -> Result<Vec<DiskInfo>, String> {
 }
 
 // 获取网络统计
-#[command]
+
 pub async fn get_network_stats() -> Result<Vec<NetworkStats>, String> {
     let mut sys = System::new();
-    sys.refresh_networks();
+    sys.refresh_networks_list();
 
     let stats: Vec<NetworkStats> = sys.networks().iter().map(|(name, data)| {
         NetworkStats {
             interface: name.clone(),
-            bytes_received: data.total_transmitted(),
-            bytes_sent: data.total_received(),
+            bytes_received: data.total_received(),
+            bytes_sent: data.total_transmitted(),
             packets_received: 0,
             packets_sent: 0,
         }
@@ -223,10 +222,10 @@ pub async fn get_network_stats() -> Result<Vec<NetworkStats>, String> {
 }
 
 // 获取进程列表
-#[command]
+
 pub async fn get_processes() -> Result<Vec<ProcessInfo>, String> {
     let mut sys = System::new();
-    sys.refresh_processes();
+    sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
 
     let mut processes: Vec<ProcessInfo> = sys.processes().iter().map(|(pid, proc_info)| {
         ProcessInfo {
@@ -234,7 +233,7 @@ pub async fn get_processes() -> Result<Vec<ProcessInfo>, String> {
             name: proc_info.name().to_string_lossy().to_string(),
             cpu_usage: proc_info.cpu_usage(),
             memory_usage: proc_info.memory(),
-            threads: proc_info.threads.len(),
+            threads: proc_info.thread_count() as usize,
         }
     }).collect();
 
@@ -270,17 +269,17 @@ pub fn run() {
 
 // ================== 系统清理命令 ==================
 
-#[command]
+
 pub async fn scan_junk_files() -> Result<JunkReport, String> {
     Ok(scan_junk())
 }
 
-#[command]
+
 pub async fn cleanup_junk_files(ids: Vec<String>) -> Result<CleanupResult, String> {
     Ok(cleanup_categories(&ids))
 }
 
-#[command]
+
 pub async fn find_large_files_cmd(
     path: String,
     min_size_mb: u64,
@@ -289,12 +288,12 @@ pub async fn find_large_files_cmd(
     Ok(find_large_files(&path, min_size_mb * 1024 * 1024, limit))
 }
 
-#[command]
+
 pub async fn get_startup_items_cmd() -> Result<Vec<StartupItem>, String> {
     Ok(get_startup_items())
 }
 
-#[command]
+
 pub async fn kill_process(pid: u32) -> Result<bool, String> {
     #[cfg(unix)]
     {
@@ -319,7 +318,7 @@ pub async fn kill_process(pid: u32) -> Result<bool, String> {
     }
 }
 
-#[command]
+
 pub async fn flush_dns_cache() -> Result<String, String> {
     #[cfg(target_os = "macos")]
     {
