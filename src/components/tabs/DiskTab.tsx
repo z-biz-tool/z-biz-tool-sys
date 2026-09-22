@@ -4,6 +4,11 @@ import { formatBytes, formatRate, usageColor } from "../../lib/format";
 
 const { Text } = Typography;
 
+type DiskRow = MetricsSnapshot["disks"][number];
+
+/** 后端说"这一项没有读数"时界面唯一的画法。0 是读数，不是缺测。 */
+const MISSING = "—";
+
 export function DiskTab({ snapshot }: { snapshot: MetricsSnapshot | null }) {
   return (
     <Card title="分区" className="monitor-card">
@@ -23,34 +28,40 @@ export function DiskTab({ snapshot }: { snapshot: MetricsSnapshot | null }) {
             dataIndex: "totalBytes",
             key: "total",
             width: 120,
-            render: (v: number) => formatBytes(v, 0),
+            // `available: false` 是"这块分区的容量读不出来"，不是"容量 0 / 用了 0 %"。
+            // 后端对这种分区给的 `usagePercent` 是 0.0（类型上不是 Option），所以必须由这一列
+            // 把它显示成 `—`，否则 FI-04 里断掉的挂载点会在表里装成一块全空的盘。
+            render: (v: number, disk: DiskRow) => (disk.available ? formatBytes(v, 0) : MISSING),
           },
           {
             title: "已用",
             dataIndex: "usedBytes",
             key: "used",
             width: 120,
-            render: (v: number) => formatBytes(v, 0),
+            render: (v: number, disk: DiskRow) => (disk.available ? formatBytes(v, 0) : MISSING),
           },
           {
             title: "可用",
             dataIndex: "availableBytes",
             key: "free",
             width: 120,
-            render: (v: number) => formatBytes(v, 0),
+            render: (v: number, disk: DiskRow) => (disk.available ? formatBytes(v, 0) : MISSING),
           },
           {
             title: "使用率",
             dataIndex: "usagePercent",
             key: "usagePercent",
             width: 160,
-            render: (v: number) => (
-              <Progress
-                percent={Number(v.toFixed(1))}
-                size="small"
-                strokeColor={usageColor(v, 90)}
-              />
-            ),
+            render: (v: number, disk: DiskRow) =>
+              disk.available ? (
+                <Progress
+                  percent={Number(v.toFixed(1))}
+                  size="small"
+                  strokeColor={usageColor(v, 90)}
+                />
+              ) : (
+                <Text type="secondary">{MISSING}</Text>
+              ),
           },
           {
             title: "读取",

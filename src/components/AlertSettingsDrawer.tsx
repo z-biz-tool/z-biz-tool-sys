@@ -1,4 +1,5 @@
-import { Alert, Divider, Drawer, InputNumber, Space, Switch, Typography } from "antd";
+import { Alert, Button, Divider, Drawer, InputNumber, Space, Switch, Typography } from "antd";
+import { useEffect, useState } from "react";
 import {
   ALERT_METRIC_LABELS,
   ALERT_METRIC_ORDER,
@@ -30,10 +31,40 @@ function currentValue(metric: AlertMetric, snapshot: MetricsSnapshot | null): nu
 }
 
 export function AlertSettingsDrawer({ open, onClose, config, onChange, snapshot, alerts }: Props) {
-  const { pushed, syncError, listenError } = alerts;
+  const { pushed, syncError, listenError, notifyStatus, notifyError, refreshNotifyStatus } = alerts;
+  const [testing, setTesting] = useState(false);
+  const [testOutcome, setTestOutcome] = useState<{ level: "success" | "warning"; text: string } | null>(null);
   const patch = (part: Partial<AlertConfig>) => onChange({ ...config, ...part });
   const patchThresholds = (metric: AlertMetric, part: Partial<AlertThresholds>) =>
     onChange({ ...config, [metric]: { ...config[metric], ...part } });
+
+  // 记账是累计的、又不急，所以只在抽屉打开这一动作上读一次（不在挂载时读，也不每帧读）
+  useEffect(() => {
+    if (open) refreshNotifyStatus();
+  }, [open, refreshNotifyStatus]);
+
+  const notifyCountLine = notifyStatus
+    ? `已提交 ${notifyStatus.submitted} 条 · 失败 ${notifyStatus.failed} 条${
+        notifyStatus.lastError ? `；最后一次失败：${notifyStatus.lastError}` : "；没有失败记录"
+      }`
+    : "还没有读到这一轮的投递记账";
+
+  const onTestNotification = () => {
+    setTesting(true);
+    setTestOutcome(null);
+    alerts
+      .sendTestNotification()
+      .then(() =>
+        setTestOutcome({
+          level: "success",
+          text: "这条测试通知已提交给系统的通知接口 —— 看到了就说明通道可用，没看到就是系统那边拦着",
+        })
+      )
+      .catch(() => {
+        /* 失败原文由 notifyError 呈现，两处不重复报同一句话 */
+      })
+      .finally(() => setTesting(false));
+  };
 
   return (
     <Drawer open={open} onClose={onClose} size={520} title="告警阈值与历史">
@@ -60,6 +91,39 @@ export function AlertSettingsDrawer({ open, onClose, config, onChange, snapshot,
             showIcon
             title={`告警事件订阅失败：${listenError}`}
             description="后端仍会按阈值判定，但触发时这个窗口收不到推送，也不会补报。"
+          />
+        )}
+
+        <Divider style={{ margin: "8px 0" }} />
+        <Text strong>系统通知</Text>
+        <Text type="secondary">
+          告警触发时，除了这个窗口里的提示，还会往操作系统的通知中心投一条同样文案的通知。
+          它与上面的总开关同进同退：静默期间两边都不发，也不存在"窗口没弹但通知弹了"。
+        </Text>
+        <Space align="center" wrap>
+          <Button size="small" loading={testing} onClick={onTestNotification}>
+            发一条测试通知
+          </Button>
+          <Text type="secondary">{notifyCountLine}</Text>
+        </Space>
+        {testOutcome && <Text type={testOutcome.level}>{testOutcome.text}</Text>}
+        {/* macOS 的通知后端不会把投递结果报回来，所以这里只能说"提交"，不能说"已送达" */}
+        {notifyStatus && !notifyStatus.deliveryIsReported && (
+          <Text type="secondary">
+            "已提交"只表示这条已经交给操作系统的通知接口；这台机器的后端不把投递结果报回来，
+            真弹没弹请以通知中心为准（看不到就先按上面那颗按钮试一次）。
+          </Text>
+        )}
+        {notifyError && (
+          <Alert
+            type="warning"
+            showIcon
+            title={
+              notifyError.action === "test"
+                ? `测试通知没发出去：${notifyError.message}`
+                : `读不到系统通知的投递记账：${notifyError.message}`
+            }
+            description="这与「告警有没有判定」是两件事：判定与落盘在后端照常进行。"
           />
         )}
 

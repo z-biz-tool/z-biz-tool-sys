@@ -39,6 +39,7 @@ const METRIC_TEXT: Record<AgentFinding["metric"], string> = {
   disk: "磁盘",
   network: "网络",
   process: "进程",
+  thermal: "温度",
 };
 
 const INTENT_TEXT: Record<AgentReply["intent"], string> = {

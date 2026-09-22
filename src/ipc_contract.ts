@@ -159,6 +159,43 @@ export interface HistoryPage {
 
 export type RiskLevel = "safe" | "moderate" | "risky";
 
+export type SensorKind = "temperature" | "fan";
+/** 温度等级由后端按硬件自己上报的上限算出，前端只做上色（"判定不在前端"这条与告警一致） */
+export type SensorSeverity = "ok" | "warning" | "critical" | "unknown";
+
+/** 单个传感器读数（T5-08）。`value` 刻意不是 `number | null`：后端读不出的槽位不会进列表，
+ *  所以界面上不存在"把 0 当成缺测"这种误读。 */
+export interface ThermalSensor {
+  label: string;
+  kind: SensorKind;
+  value: number;
+  /** 传感器**自己**上报的临界值（Linux hwmon 的 `tempN_max`），不是应用阈值 */
+  critical: number | null;
+  severity: SensorSeverity;
+  /** 读数出自哪个内核节点，作为"这块数据从哪来"的凭据 */
+  source: string;
+}
+
+/** `get_thermal` 载荷：空列表一定带原因，非空列表一定不带原因 */
+export interface ThermalReport {
+  sensors: ThermalSensor[];
+  reason: string | null;
+}
+
+/**
+ * 系统通知（T5-02）的投递记账。刻意只有"提交/失败"两个数，**没有"已送达"**：
+ * macOS 的默认通知后端是在句柄析构时才真正发送、并把错误丢掉的，
+ * 所以 `submitted` 只说明"这条交给了操作系统的通知接口"。
+ */
+export interface NotifyStatus {
+  submitted: number;
+  failed: number;
+  /** 最后一次失败的原文；从没失败过时是 `null`，那不等于"全都弹出来了" */
+  lastError: string | null;
+  /** 本平台能不能报出投递失败。macOS 为 `false`，界面据此决定要不要挂那句说明 */
+  deliveryIsReported: boolean;
+}
+
 export interface JunkCategory {
   id: string;
   name: string;
@@ -369,7 +406,7 @@ export type AgentIntent =
   | "unknown";
 export type AgentRankBy = "cpu" | "memory";
 export type AgentSeverity = "info" | "warning" | "critical";
-export type AgentMetric = "cpu" | "memory" | "disk" | "network" | "process";
+export type AgentMetric = "cpu" | "memory" | "disk" | "network" | "process" | "thermal";
 
 export interface AgentFinding {
   metric: AgentMetric;
@@ -440,6 +477,12 @@ export const Commands = {
   importPrefsFile: "import_prefs_file",
   /** 诊断 Agent 问答（T5-04）；只读，返回结论与待确认的导航建议，永不执行 */
   agentQuery: "agent_query",
+  /** 温度/风扇读数（T5-08）；无参数、只读，没有免提权通路的平台返回空列表 + 原因 */
+  getThermal: "get_thermal",
+  /** 这一次运行里系统通知的投递记账（T5-02）；无参数 */
+  notifyStatus: "notify_status",
+  /** 投一条文案固定的测试通知（T5-02）；不接收任何参数，避免变成任意文本注入通道 */
+  sendTestNotification: "send_test_notification",
 } as const;
 
 /** 把 invoke/listen 抛出的任意值归一化为可读文案 */

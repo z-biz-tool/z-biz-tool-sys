@@ -2,11 +2,15 @@ mod agent;
 mod alert;
 mod cleanup;
 mod commands;
+#[cfg(test)]
+mod contract_fixtures;
 mod error;
 mod history;
 mod log_sanitize;
 mod monitor;
 mod netinfo;
+mod notify;
+mod platform;
 mod prefs;
 mod safety;
 use tauri::Manager;
@@ -16,11 +20,17 @@ pub fn run() {
     let service = monitor::MonitorService::new();
     service.publish();
     let alert_config = alert::AlertState::default();
+    // 系统通知（T5-02）：投递结果的记账。循环里写、`notify_status` 里读，两边各持一份同一份计数。
+    let notify = notify::NotifyState::default();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        // 通知只从后端 Rust API 投（`notify` 模块头写了为什么不走 JS 通道），
+        // 所以 capabilities 不需要加任何 notification 权限项。
+        .plugin(tauri_plugin_notification::init())
         .manage(service.clone())
         .manage(alert_config.clone())
+        .manage(notify.clone())
         .setup(move |app| {
             // 历史存储只在启动时解析一次：采集循环拿写入端，command 拿只读端。
             let store = history::store_for(app.handle());
@@ -33,6 +43,7 @@ pub fn run() {
                 store,
                 alert_store,
                 alert_config.0.clone(),
+                notify.clone(),
             );
             Ok(())
         })
@@ -60,6 +71,9 @@ pub fn run() {
             commands::export_prefs_file,
             commands::import_prefs_file,
             commands::agent_query,
+            commands::get_thermal,
+            commands::notify_status,
+            commands::send_test_notification,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

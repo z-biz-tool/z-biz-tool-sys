@@ -1,16 +1,66 @@
-import { Alert, Button, Card, Col, Divider, Row, Space, Statistic, Typography } from "antd";
-import type { MetricsSnapshot, StaticInfo } from "../../ipc_contract";
+import { Alert, Button, Card, Col, Divider, Row, Space, Statistic, Table, Tag, Typography } from "antd";
+import type { MetricsSnapshot, StaticInfo, ThermalReport, ThermalSensor } from "../../ipc_contract";
 import { formatGb, formatUptime, usageColor } from "../../lib/format";
+import { SEVERITY_COLOR, formatSensorLimit, formatSensorValue, severityText } from "../../lib/thermal";
 
 const { Text } = Typography;
+
+const SENSOR_COLUMNS = [
+  { title: "传感器", dataIndex: "label", key: "label" },
+  {
+    title: "读数",
+    key: "value",
+    render: (_: unknown, sensor: ThermalSensor) => (
+      <Text
+        style={{
+          color: SEVERITY_COLOR[sensor.severity],
+          fontVariantNumeric: "tabular-nums",
+        }}
+      >
+        {formatSensorValue(sensor)}
+      </Text>
+    ),
+  },
+  {
+    title: "硬件上限",
+    key: "limit",
+    render: (_: unknown, sensor: ThermalSensor) => (
+      <Text type="secondary">{formatSensorLimit(sensor)}</Text>
+    ),
+  },
+  {
+    title: "状态",
+    key: "severity",
+    render: (_: unknown, sensor: ThermalSensor) => (
+      <Tag color={SEVERITY_COLOR[sensor.severity] ?? "default"}>{severityText(sensor)}</Tag>
+    ),
+  },
+  {
+    title: "来源",
+    dataIndex: "source",
+    key: "source",
+    render: (source: string) => (
+      <Text type="secondary" style={{ fontSize: 12 }}>
+        {source}
+      </Text>
+    ),
+  },
+];
 
 export function SystemInfoTab({
   staticInfo,
   snapshot,
+  thermal,
+  thermalLoading,
+  onRefreshThermal,
   onTransferPrefs,
 }: {
   staticInfo: StaticInfo | null;
   snapshot: MetricsSnapshot | null;
+  /** null = 还没查过；空 sensors + reason = 查过但这台机器给不出读数，两种状态要分开显示 */
+  thermal: ThermalReport | null;
+  thermalLoading: boolean;
+  onRefreshThermal: () => void;
   /** 打开偏好导入/导出弹层（T5-11）。入口放这里，弹层本体在 App 的树尾 */
   onTransferPrefs: () => void;
 }) {
@@ -65,6 +115,38 @@ export function SystemInfoTab({
         </Row>
       ) : (
         <Alert type="info" showIcon title="正在读取系统信息…" />
+      )}
+
+      <Divider style={{ margin: "16px 0" }} />
+
+      <Space align="center" wrap style={{ marginBottom: 8 }}>
+        <Text strong>温度 / 风扇</Text>
+        <Button size="small" loading={thermalLoading} onClick={onRefreshThermal}>
+          重新读取
+        </Button>
+      </Space>
+      {thermal === null ? (
+        <Alert
+          type="info"
+          showIcon
+          title={thermalLoading ? "正在读取传感器…" : "还没有拿到这台机器的传感器读数"}
+          description="读数只在 Linux 的 /sys 上免提权可得，macOS 与 Windows 要走提权的接口 —— 本应用内不提权，也不会先摆一个 0 占位。"
+        />
+      ) : thermal.sensors.length === 0 ? (
+        <Alert
+          type="warning"
+          showIcon
+          title={thermal.reason ?? "后端没有给出读数，也没有给出原因"}
+          description="这一项没有读数就是真的没有读数：不用机型平均值、不用估算值补位。"
+        />
+      ) : (
+        <Table<ThermalSensor>
+          size="small"
+          rowKey="source"
+          pagination={false}
+          columns={SENSOR_COLUMNS}
+          dataSource={thermal.sensors}
+        />
       )}
 
       <Divider style={{ margin: "16px 0" }} />

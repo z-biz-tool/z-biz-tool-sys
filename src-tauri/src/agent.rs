@@ -10,6 +10,7 @@
 use crate::alert::{AlertConfig, AlertThresholds};
 use crate::log_sanitize::sanitize;
 use crate::monitor::{DiskMetrics, MetricsSnapshot, ProcessInfo};
+use crate::platform::thermal::{Sensor, SensorSeverity, ThermalReport};
 use serde::Serialize;
 
 /// 查询回显与意图识别前的截断长度。按**字符**截，中文查询按字节切会落在多字节中间。
@@ -22,6 +23,10 @@ const MAX_NOTES: usize = 4;
 /// 磁盘结论最多列几个分区，避免外挂一堆卷时把报告刷满。
 const MAX_DISK_FINDINGS: usize = 4;
 const MAX_NETWORK_FINDINGS: usize = 4;
+/// 温度结论最多列几条（按读数从高到低）。
+const MAX_THERMAL_FINDINGS: usize = 3;
+/// 风扇最多列几条：转速不是"越高越危险"，列多了反而像在排行。
+const MAX_FAN_FINDINGS: usize = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -40,7 +45,7 @@ pub enum Intent {
     StartupItems,
     /// 垃圾清理相关：Agent 不发起扫描，只给导航建议
     JunkFiles,
-    /// 温度 / 风扇：本机无采集通路（T5-08 未实现），如实说不知道
+    /// 温度 / 风扇：读数来自 `platform::thermal`，没有免提权通路时如实说原因（T5-08）
     Temperature,
     Unknown,
 }
@@ -69,6 +74,8 @@ pub enum AgentMetric {
     Disk,
     Network,
     Process,
+    /// 温度 / 风扇（T5-08）。判定只用传感器自己上报的上限，不新造一套阈值。
+    Thermal,
 }
 
 /// 预定义操作模板的全部种类：**只有导航与定位**。
@@ -166,7 +173,9 @@ impl Reply {
     }
 }
 
-/// Agent 能看到的**全部**数据：两个排好序的进程切片 + 一帧指标快照 + 当前阈值配置。
+/// Agent 能看到的**全部**数据：两个排好序的进程切片 + 一帧指标快照 + 当前阈值配置
+/// + 一份温度/风扇报告（T5-08，由命令层采好再传进来，引擎自己不去碰文件系统）。
+///
 /// 刻意不含进程命令行、环境变量、用户目录。
 #[derive(Debug, Clone, Copy)]
 pub struct Input<'a> {
@@ -177,6 +186,8 @@ pub struct Input<'a> {
     pub mem_ranked: &'a [ProcessInfo],
     /// 复用告警引擎的阈值，避免"界面上 80 % 报警、Agent 却说这很正常"两套口径
     pub alert: &'a AlertConfig,
+    /// 温度/风扇。空报告一定带着"为什么空"，所以这里不需要 `Option`
+    pub thermal: &'a ThermalReport,
 }
 
 // ==================== 意图识别 ====================
@@ -382,7 +393,33 @@ pub fn answer(raw_query: &str, input: &Input) -> Reply {
             });
         }
         Intent::Temperature => {
-            reply.note("本机还没有温度/风扇采集通路（T5-08 未实现），我不会用估算值或历史值代替读数。".to_string());
+            if input.thermal.sensors.is_empty() {
+                // 没有通路就只说没有通路，连"大概几十度"这种话都不说。
+                let reason = input
+                    .thermal
+                    .reason
+                    .clone()
+                    .unwrap_or_else(|| "温度采集没有返回任何说明。".to_string());
+                reply.note(format!(
+                    "{reason} 我不会用估算值、机型平均值或历史值代替读数。"
+                ));
+            } else {
+                let mut temps: Vec<&Sensor> = input.thermal.temperatures().collect();
+                temps.sort_by(|a, b| b.value.partial_cmp(&a.value).unwrap_or(std::cmp::Ordering::Equal));
+                for sensor in temps.iter().take(MAX_THERMAL_FINDINGS) {
+                    reply.find(thermal_finding(sensor));
+                }
+                for sensor in input.thermal.fans().take(MAX_FAN_FINDINGS) {
+                    reply.find(fan_finding(sensor));
+                }
+                reply.suggest(Suggestion::OpenTab {
+                    tab: "system",
+                    label: format!(
+                        "打开系统信息看全部 {} 个传感器",
+                        input.thermal.sensors.len()
+                    ),
+                });
+            }
         }
         Intent::Unknown => {
             if parsed.refused {
@@ -402,6 +439,54 @@ pub fn answer(raw_query: &str, input: &Input) -> Reply {
 
 fn no_source(reply: &mut Reply) {
     reply.note("还没有可用的指标快照（采集第一帧未到），我不编造数值。".to_string());
+}
+
+/// 温度一条结论。等级直接取后端算好的 [`Sensor::severity`] —— 判级的唯一口径在 `thermal.rs`，
+/// Agent 不再自己比一次大小，否则会出现"界面标黄、Agent 说正常"两套说法。
+fn thermal_finding(sensor: &Sensor) -> Finding {
+    let level = match sensor.severity {
+        SensorSeverity::Critical => Severity::Critical,
+        SensorSeverity::Warning => Severity::Warning,
+        // unknown 只说明"这块传感器没上报上限"，不等于"温度正常"，所以文案里要显式讲出来
+        SensorSeverity::Unknown | SensorSeverity::Ok => Severity::Info,
+    };
+    let text = match sensor.critical {
+        Some(limit) => format!(
+            "{} {:.1} {}，硬件上限 {:.0} {}",
+            sensor.label,
+            sensor.value,
+            sensor.kind.unit(),
+            limit,
+            sensor.kind.unit()
+        ),
+        None => format!(
+            "{} {:.1} {}（这块传感器没有上报自己的上限）",
+            sensor.label,
+            sensor.value,
+            sensor.kind.unit()
+        ),
+    };
+    Finding {
+        metric: AgentMetric::Thermal,
+        text,
+        value: Some(format!("{:.1} {}", sensor.value, sensor.kind.unit())),
+        level,
+    }
+}
+
+/// 风扇一条结论。0 RPM 是"这一路没在转"，属于要单独说出来的读数，不能被当成缺测。
+fn fan_finding(sensor: &Sensor) -> Finding {
+    let stopped = sensor.severity == SensorSeverity::Warning;
+    Finding {
+        metric: AgentMetric::Thermal,
+        text: if stopped {
+            format!("{} 0 {}：这一路风扇当前停转（有读数，不是缺测）", sensor.label, sensor.kind.unit())
+        } else {
+            format!("{} {:.0} {}", sensor.label, sensor.value, sensor.kind.unit())
+        },
+        value: Some(format!("{:.0} {}", sensor.value, sensor.kind.unit())),
+        level: if stopped { Severity::Warning } else { Severity::Info },
+    }
 }
 
 fn severity_of(value: f64, thresholds: &AlertThresholds) -> Severity {
@@ -616,6 +701,7 @@ fn human_rate(bytes_per_sec: f64) -> String {
 mod tests {
     use super::*;
     use crate::monitor::{CpuMetrics, MemoryMetrics, MemoryPressure, NetworkMetrics};
+    use crate::platform::thermal::{self, SensorKind};
 
     fn proc(pid: u32, name: &str, cpu: f64, mem: u64) -> ProcessInfo {
         ProcessInfo {
@@ -669,6 +755,7 @@ mod tests {
         cpu: Vec<ProcessInfo>,
         mem: Vec<ProcessInfo>,
         alert: AlertConfig,
+        thermal: ThermalReport,
     }
 
     impl Default for Fixture {
@@ -678,8 +765,46 @@ mod tests {
                 cpu: vec![proc(11, "Chrome Helper", 30.0, 2 * 1024u64.pow(3)), proc(12, "WindowServer", 12.0, 1024u64.pow(3))],
                 mem: vec![proc(11, "Chrome Helper", 30.0, 2 * 1024u64.pow(3)), proc(13, "idea", 1.0, 6 * 1024u64.pow(3))],
                 alert: AlertConfig::default(),
+                // 默认当作"这台机器给不出温度"，键写死 "macos" 而不是 `env::consts::OS`：
+                // Linux CI 上 probe() 走的是有货那条腿，用当台的值会让下面的 SMC 断言莫名红。
+                thermal: ThermalReport::unavailable(thermal::unsupported_reason("macos")),
             }
         }
+    }
+
+    /// 造一份"Linux 上真读到传感器"的报告，不用碰文件系统（解析链路已由 `thermal.rs` 的单测覆盖）。
+    /// 走 `Sensor::new` 而不是结构体字面量：判级必须和读数一起算出来，测试也不给"手填 severity"的机会。
+    fn thermal_report(rows: &[(&str, SensorKind, f64, Option<f64>)]) -> ThermalReport {
+        ThermalReport {
+            sensors: rows
+                .iter()
+                .map(|(label, kind, value, critical)| {
+                    Sensor::new(
+                        (*label).to_string(),
+                        *kind,
+                        *value,
+                        *critical,
+                        format!("/sys/class/hwmon/hwmon0/{}1_input", kind_prefix(*kind)),
+                    )
+                })
+                .collect(),
+            reason: None,
+        }
+    }
+
+    fn kind_prefix(kind: SensorKind) -> &'static str {
+        match kind {
+            SensorKind::Temperature => "temp",
+            SensorKind::Fan => "fan",
+        }
+    }
+
+    fn normal_thermal() -> ThermalReport {
+        thermal_report(&[
+            ("cpu_thermal temp1", SensorKind::Temperature, 48.5, Some(95.0)),
+            ("nvme temp1", SensorKind::Temperature, 71.0, Some(75.0)),
+            ("CPU FAN", SensorKind::Fan, 2410.0, None),
+        ])
     }
 
     impl Fixture {
@@ -689,6 +814,7 @@ mod tests {
                 cpu_ranked: &self.cpu,
                 mem_ranked: &self.mem,
                 alert: &self.alert,
+                thermal: &self.thermal,
             }
         }
     }
@@ -800,6 +926,7 @@ mod tests {
             cpu_ranked: &fixture.cpu,
             mem_ranked: &fixture.mem,
             alert: &fixture.alert,
+            thermal: &fixture.thermal,
         };
         let reply = answer("为什么这么卡", &input);
         // 指标快照缺席时，CPU/内存/磁盘三类的结论一条都不能有（进程榜是另一个数据源，照常给）
@@ -855,9 +982,120 @@ mod tests {
     fn unimplemented_temperature_is_answered_honestly() {
         let fixture = Fixture::default();
         let reply = ask(&fixture, "CPU 温度多少");
-        assert!(reply.findings.is_empty());
-        assert!(reply.suggestions.is_empty());
-        assert!(reply.notes[0].contains("T5-08"), "{:?}", reply.notes);
+        assert!(reply.findings.is_empty(), "没有通路时一条读数结论都不该有：{:?}", reply.findings);
+        assert!(reply.suggestions.is_empty(), "没有可看的东西就不该推着用户去开页面");
+        assert_eq!(reply.notes.len(), 1, "{:?}", reply.notes);
+        // 原因来自 thermal，而不是 Agent 自己写死一句"未实现"
+        assert!(reply.notes[0].contains("SMC"), "{:?}", reply.notes);
+        assert!(reply.notes[0].contains("应用内不执行提权"), "{:?}", reply.notes);
+        assert!(reply.notes[0].contains("不会用估算值"), "{:?}", reply.notes);
+    }
+
+    /// 有读数时：温度按从高到低排，等级只用传感器自己上报的上限。
+    #[test]
+    fn temperature_answer_ranks_real_sensors_against_their_own_limits() {
+        let fixture = Fixture {
+            thermal: normal_thermal(),
+            ..Default::default()
+        };
+        let reply = ask(&fixture, "CPU 温度多少");
+        assert_eq!(reply.intent, Intent::Temperature);
+        let temps: Vec<&Finding> = reply
+            .findings
+            .iter()
+            .filter(|f| f.text.contains("°C"))
+            .collect();
+        assert_eq!(temps.len(), 2, "{:?}", reply.findings);
+        assert!(temps[0].text.starts_with("nvme"), "71 °C 该排在 48.5 °C 前面：{:?}", temps[0].text);
+        assert_eq!(temps[0].level, Severity::Warning, "71/75 距上限不足 10 度");
+        assert_eq!(temps[1].level, Severity::Info, "48.5/95 还很远");
+        assert_eq!(temps[0].value.as_deref(), Some("71.0 °C"));
+
+        let fan = reply.findings.iter().find(|f| f.text.contains("CPU FAN")).expect("应有风扇结论");
+        assert_eq!(fan.level, Severity::Info);
+        assert!(fan.text.contains("2410 RPM"), "{:?}", fan.text);
+
+        assert!(reply.notes.is_empty(), "有读数时不该再挂\"没有通路\"的说明：{:?}", reply.notes);
+        assert_eq!(
+            reply.suggestions,
+            vec![Suggestion::OpenTab {
+                tab: "system",
+                label: "打开系统信息看全部 3 个传感器".to_string(),
+            }]
+        );
+    }
+
+    /// 越过硬件上限要说"危险"，且这条判断的依据必须是硬件自己给的数，不是 Agent 猜的常量。
+    #[test]
+    fn a_sensor_past_its_own_limit_is_critical() {
+        let fixture = Fixture {
+            thermal: thermal_report(&[("GPU die", SensorKind::Temperature, 96.0, Some(95.0))]),
+            ..Default::default()
+        };
+        let reply = ask(&fixture, "风扇转速");
+        let finding = &reply.findings[0];
+        assert_eq!(finding.level, Severity::Critical, "{:?}", finding);
+        assert!(finding.text.contains("96.0") && finding.text.contains("95"), "{:?}", finding.text);
+    }
+
+    /// 传感器没上报自己的上限时，只报读数、不给等级 —— 免得把"不知道"说成"正常"。
+    #[test]
+    fn a_sensor_without_a_reported_limit_stays_info() {
+        let fixture = Fixture {
+            thermal: thermal_report(&[("acpitz", SensorKind::Temperature, 120.0, None)]),
+            ..Default::default()
+        };
+        let reply = ask(&fixture, "温度");
+        assert_eq!(reply.findings[0].level, Severity::Info);
+        assert!(reply.findings[0].text.contains("没有上报自己的上限"), "{:?}", reply.findings[0].text);
+    }
+
+    /// 停转的风扇是 Warning，不是"没有数据"。
+    #[test]
+    fn a_fan_reading_zero_is_a_warning_not_a_missing_value() {
+        let fixture = Fixture {
+            thermal: thermal_report(&[("Case FAN", SensorKind::Fan, 0.0, None)]),
+            ..Default::default()
+        };
+        let reply = ask(&fixture, "风扇");
+        assert_eq!(reply.findings[0].level, Severity::Warning);
+        assert!(reply.findings[0].text.contains("停转"), "{:?}", reply.findings[0].text);
+        assert!(reply.findings[0].text.contains("不是缺测"), "{:?}", reply.findings[0].text);
+        assert_eq!(reply.findings[0].value.as_deref(), Some("0 RPM"));
+    }
+
+    /// 温度条数要封顶：一块 GPU 导出 10 个热点时不该把报告刷满。
+    #[test]
+    fn temperature_findings_are_capped() {
+        let rows: Vec<(&str, SensorKind, f64, Option<f64>)> = (0..10)
+            .map(|i| ("hot", SensorKind::Temperature, 40.0 + i as f64, Some(95.0)))
+            .collect();
+        let fixture = Fixture {
+            thermal: thermal_report(&rows),
+            ..Default::default()
+        };
+        let reply = ask(&fixture, "温度");
+        assert_eq!(
+            reply.findings.iter().filter(|f| f.metric == AgentMetric::Thermal).count(),
+            MAX_THERMAL_FINDINGS
+        );
+        assert!(reply.findings[0].text.contains("49.0"), "该列的是最高的那几个：{:?}", reply.findings[0].text);
+    }
+
+    /// 建议里那个页签必须真实存在（这条也在 `suggested_tabs_are_all_real_page_keys` 的覆盖面里）。
+    #[test]
+    fn the_temperature_suggestion_points_at_a_real_tab() {
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let app = std::fs::read_to_string(manifest.join("../src/App.tsx")).unwrap();
+        let fixture = Fixture { thermal: normal_thermal(), ..Default::default() };
+        let reply = ask(&fixture, "温度");
+        let Suggestion::OpenTab { tab, .. } = &reply.suggestions[0] else {
+            panic!("温度建议只可能是打开页签：{:?}", reply.suggestions);
+        };
+        assert!(app.contains(&format!("key: \"{tab}\"")), "页签 {tab} 在 App.tsx 里不存在");
+        // 系统信息页确实接了温度这条链路
+        let tab_src = std::fs::read_to_string(manifest.join("../src/components/tabs/SystemInfoTab.tsx")).unwrap();
+        assert!(tab_src.contains("thermal"), "系统信息页没有展示传感器");
     }
 
     #[test]

@@ -157,6 +157,16 @@ fn approved_cleanup_root(declared: &str) -> Option<PathBuf> {
     if is_denied(&canonical) || !under_allowed_root(&canonical) {
         return None;
     }
+    // 允许根**本身**（家目录、`$TMPDIR`）永远不是清理目标 —— 只接受严格位于其下的目录。
+    // 分类表是写死的，所以这条今天从命令入口走不到；但清理这台机器上真实文件的路径不该
+    // 依赖"没人会把家目录传进来"这种假设，特别是 `cleanup_declared` 现在能被 crate 内别处调到时。
+    if allowed_roots()
+        .iter()
+        .filter_map(|root| canonicalize_clean(root).ok())
+        .any(|root| canonical == root)
+    {
+        return None;
+    }
     Some(canonical)
 }
 
@@ -668,6 +678,24 @@ fn emit_progress(on_progress: &mut dyn FnMut(&ScanProgress), frame: ScanProgress
 
 // 清理选定的类别
 pub fn cleanup_categories(ids: &[String]) -> CleanupResult {
+    // 这个入口只负责一件事：把"用户勾了的分类 id"翻译成"声明目录字符串列表"。
+    // 真正的安全边界在 `cleanup_declared` 里的 `approved_cleanup_root` 那道闸上。
+    let declared: Vec<String> = get_junk_paths()
+        .into_iter()
+        .filter(|(id, _, _, _)| ids.contains(id))
+        .map(|(_, _, path, _)| path)
+        .collect();
+    cleanup_declared(&declared)
+}
+
+/// 按声明目录清理。**每个目录都要单独过 `approved_cleanup_root`（存在 + canonicalize + 不在黑名单 +
+/// 在允许根之下）**，闸不过就只记 `skipped_paths`，一个文件都不碰。
+///
+/// 拆出来不是为了好看：删除这台机器上真实文件的这段逻辑，此前只能靠"整条分类表"来触发，
+/// 于是没有任何一条测试量过 `freed_bytes` / `deleted_files` 到底算得对不对（06 的 IT-07）。
+/// 现在测试可以在临时目录里造一棵真树走同一条路径 —— 注意这**没有**放宽闸，
+/// 传进来的路径照样要过 `approved_cleanup_root`，被拒的那条测试也在这里。
+fn cleanup_declared(declared: &[String]) -> CleanupResult {
     let mut result = CleanupResult {
         freed_bytes: 0,
         deleted_files: 0,
@@ -676,11 +704,9 @@ pub fn cleanup_categories(ids: &[String]) -> CleanupResult {
         errors: Vec::new(),
     };
 
-    let raw_paths = get_junk_paths();
-    let target_paths: Vec<PathBuf> = raw_paths
-        .into_iter()
-        .filter(|(id, _, _, _)| ids.contains(id))
-        .filter_map(|(_, _, path, _)| match approved_cleanup_root(&path) {
+    let target_paths: Vec<PathBuf> = declared
+        .iter()
+        .filter_map(|path| match approved_cleanup_root(path) {
             Some(root) => Some(root),
             None => {
                 result.errors.push(crate::log_sanitize::sanitize(&format!(
@@ -1291,5 +1317,105 @@ mod tests {
                 "前端 ScanProgress 缺字段 {key}"
             );
         }
+    }
+
+    // ==================== IT-07 / IT-09（06 的集成矩阵）====================
+
+    /// IT-07 的正例：删除这条路径**真的**被量过。走的是生产同一个 `cleanup_declared`，
+    /// 所以 `freed_bytes` / `deleted_files` / 空目录收尾 / "根目录自己留着" 四件事一起验。
+    #[test]
+    fn it07_the_deletion_path_measures_a_real_tree() {
+        let dir = fixture("cleanup");
+        let nested = dir.join("子目录");
+        fs::create_dir_all(&nested).unwrap();
+        write_files(&dir, 3, 100);
+        write_files(&nested, 2, 50);
+        assert_eq!(dir_size(&dir), (400, 5), "夹具本身没造对，后面的断言就没有意义");
+
+        let result = cleanup_declared(&[dir.to_string_lossy().to_string()]);
+        assert_eq!(result.deleted_files, 5, "{result:?}");
+        assert_eq!(result.failed_files, 0, "{result:?}");
+        assert_eq!(result.skipped_paths, 0, "临时目录下的夹具应当过闸：{result:?}");
+        assert_eq!(result.freed_bytes, 400, "{result:?}");
+        assert!(!dir.join("f0.bin").exists());
+        assert!(!nested.exists(), "清完剩下的空目录也要收掉");
+        assert!(dir.exists(), "清理删的是内容，被声明的那个根目录本身要留着");
+
+        // 幂等：同一批目录再清一次什么都没有了，也不该报错。
+        let again = cleanup_declared(&[dir.to_string_lossy().to_string()]);
+        assert_eq!(again.deleted_files, 0, "{again:?}");
+        assert_eq!(again.freed_bytes, 0, "{again:?}");
+        assert_eq!(again.failed_files, 0, "{again:?}");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// IT-07 的反例：黑名单目录与不存在的目录一个文件都不许碰，只记 skipped；
+    /// 而"允许根本身（家目录 / `$TMPDIR`）不是清理目标"这条闸单独用 `approved_cleanup_root` 直接钉。
+    ///
+    /// **顺序是安全设计**：闸的断言放在前面，`cleanup_declared` 的入参里绝不出现家目录/临时目录 ——
+    /// 否则哪天有人把那道闸删掉，这条测试就会先把用户的家目录清空、再报错。
+    #[test]
+    fn it07_the_gate_refuses_denied_missing_and_the_allowed_roots_themselves() {
+        let home = dirs::home_dir().expect("测试需要家目录");
+        let tmp = std::env::temp_dir();
+        let denied = if cfg!(target_os = "macos") {
+            "/System/Library/Caches"
+        } else if cfg!(windows) {
+            "C:\\Windows\\Temp"
+        } else {
+            "/usr/share"
+        };
+
+        // 先量闸：允许根本身不是合法目标，它下面的子目录才是。
+        assert!(
+            approved_cleanup_root(&home.to_string_lossy()).is_none(),
+            "家目录成了合法的清理根 —— 后面那步就不该在这里执行"
+        );
+        assert!(approved_cleanup_root(&tmp.to_string_lossy()).is_none());
+        assert!(approved_cleanup_root(denied).is_none(), "{denied} 在黑名单里，不该过闸");
+        let ok = fixture("gate");
+        assert!(
+            approved_cleanup_root(&ok.to_string_lossy()).is_some(),
+            "临时目录下的正常子目录应当过闸"
+        );
+
+        // 再量"整条删除路径"确实一个字节都没动：只喂被拒的那两类，不喂任何允许根。
+        let declared = vec![
+            denied.to_string(),
+            tmp.join("zsys-从不存在的-目录").to_string_lossy().into_owned(),
+        ];
+        let result = cleanup_declared(&declared);
+        assert_eq!(result.deleted_files, 0, "{result:?}");
+        assert_eq!(result.freed_bytes, 0, "{result:?}");
+        assert_eq!(result.skipped_paths, declared.len(), "{result:?}");
+        assert_eq!(
+            result.errors.len(),
+            declared.len(),
+            "每一条被拒都要说清为什么：{:?}",
+            result.errors
+        );
+        assert!(home.exists() && fs::read_dir(&home).is_ok(), "家目录被动过了");
+
+        let _ = fs::remove_dir_all(&ok);
+    }
+
+    /// IT-09：启动项枚举在任何一台机器上都不许 panic，且每条项的字段得是能显示的。
+    /// 空列表是合法结果（干净的 runner 就是没有），所以只钉"有就得完整"。
+    #[test]
+    fn it09_startup_items_are_complete_or_absent_and_never_panic() {
+        let items = get_startup_items();
+        for item in &items {
+            assert!(!item.id.trim().is_empty(), "启动项没有 id：{item:?}");
+            assert!(!item.name.trim().is_empty(), "启动项没有名字：{item:?}");
+            assert!(!item.source.trim().is_empty(), "启动项没说来源：{item:?}");
+            assert!(!item.location.trim().is_empty(), "启动项没说位置：{item:?}");
+        }
+        // 同一份清单里 id 不能撞：撞了前端的勾选与去重就会互相顶掉。
+        let mut ids: Vec<&str> = items.iter().map(|i| i.id.as_str()).collect();
+        ids.sort_unstable();
+        let unique = ids.len();
+        ids.dedup();
+        assert_eq!(ids.len(), unique, "启动项 id 有重复：{ids:?}");
     }
 }

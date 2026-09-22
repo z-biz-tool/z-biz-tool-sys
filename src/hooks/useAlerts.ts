@@ -8,6 +8,7 @@ import {
   type AlertConfig,
   type AlertEvent,
   type AlertHistoryPage,
+  type NotifyStatus,
 } from "../ipc_contract";
 import {
   alertIdentity,
@@ -54,6 +55,19 @@ export interface AlertsState {
   syncError: string | null;
   /** `sys://alert` 订阅失败的原文；与下发失败分开报，否则一句错话会把两条链路混成一个结论 */
   listenError: string | null;
+  /**
+   * 系统通知（T5-02）的投递记账。`null` = 还没读过，不是"读出来是 0"。
+   * 只有"提交/失败"两个数，界面上不许把它说成"已送达 N 条"（`NotifyStatus` 的注释写了为什么）。
+   */
+  notifyStatus: NotifyStatus | null;
+  /**
+   * 读记账或投测试通知失败的原文。分得清是哪一步：两句话不一样，
+   * 合成一条会出现"系统通知状态读取失败：系统通知投递失败：…"这种重复的错话。
+   */
+  notifyError: { action: "status" | "test"; message: string } | null;
+  refreshNotifyStatus: () => void;
+  /** 投一条文案固定的测试通知；resolve 时带回最新的记账 */
+  sendTestNotification: () => Promise<NotifyStatus>;
 }
 
 /**
@@ -77,6 +91,36 @@ export function useAlerts(
   const [historyError, setHistoryError] = useState<string | null>(null);
   const [historySpan, setHistorySpan] = useState(DEFAULT_ALERT_HISTORY_SPAN);
   const [reloadKey, setReloadKey] = useState(0);
+  // 系统通知（T5-02）的记账。不在挂载时读：这条链路不急，且抽屉打开时读一次就够新，
+  // 少一次"纯浏览器里没有 IPC 所以开局就报错"的噪声。
+  const [notifyStatus, setNotifyStatus] = useState<NotifyStatus | null>(null);
+  const [notifyError, setNotifyError] = useState<{ action: "status" | "test"; message: string } | null>(null);
+
+  const refreshNotifyStatus = useCallback(() => {
+    invoke<NotifyStatus>(Commands.notifyStatus)
+      .then((status) => {
+        setNotifyStatus(status);
+        setNotifyError(null);
+      })
+      .catch((e) => setNotifyError({ action: "status", message: describeError(e) }));
+  }, []);
+
+  /** 投一条文案固定的测试通知。失败时把原文记进 `notifyError`，同时把 rejection 交给调用方去提示。 */
+  const sendTestNotification = useCallback(
+    () =>
+      invoke<NotifyStatus>(Commands.sendTestNotification).then(
+        (status) => {
+          setNotifyStatus(status);
+          setNotifyError(null);
+          return status;
+        },
+        (e) => {
+          setNotifyError({ action: "test", message: describeError(e) });
+          throw e;
+        }
+      ),
+    []
+  );
   // 用 ref 承接回调：订阅只建立一次，回调换人不该把监听拆了重建（那会丢事件）
   const handlers = useRef({ onNotice, onCorrected });
   useEffect(() => {
@@ -175,5 +219,9 @@ export function useAlerts(
     pushed,
     syncError,
     listenError,
+    notifyStatus,
+    notifyError,
+    refreshNotifyStatus,
+    sendTestNotification,
   };
 }

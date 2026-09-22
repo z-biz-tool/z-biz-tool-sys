@@ -8,11 +8,13 @@ use crate::error::{AppError, CommandResult};
 use crate::monitor::{
     self, MonitorConfig, MonitorService, ProcessPage, ProcessQuery, ProcessSort, StaticInfo,
 };
+use crate::notify;
+use crate::platform::thermal;
 use crate::prefs;
 use crate::safety::{self, KillOutcome, KillValidation};
 use serde::Serialize;
 use std::time::Duration;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 const DEFAULT_KILL_GRACE_MS: u64 = 3000;
 
@@ -113,6 +115,10 @@ pub fn set_process_query(
     state: State<'_, MonitorService>,
     query: ProcessQuery,
 ) -> ProcessQuery {
+    // PROBE-E2E：临时回传通道，E2E 探针在 WKWebView 里跑完后把结果塞进 keyword 送回来
+    // （原生壳没有 CDP 可挂，stderr 是唯一能读到的出口）。验完删除。
+    #[cfg(debug_assertions)]
+    eprintln!("[probe-e2e] {}", query.keyword);
     state.set_process_query(query)
 }
 
@@ -351,8 +357,45 @@ pub async fn agent_query(
             cpu_ranked: &cpu_ranked,
             mem_ranked: &mem_ranked,
             alert: &alert,
+            // 温度这条支路只在"问到温度"时才会被读到；非 Linux 平台上 probe() 是一次字符串判断，不碰文件。
+            thermal: &thermal::probe(),
         },
     ))
+}
+
+// ==================== 温度 / 风扇（T5-08）====================
+
+/// 传感器读数。只读，且不接收任何参数 —— 能被读的位置只有 `thermal::SYSFS_ROOT` 一个常量，
+/// 前端传不进路径，也就没有"借这条命令去读任意文件"的通路。
+/// 没有免提权通路的平台会返回空列表 + 原因，不会返回 0 值凑数。
+#[tauri::command]
+pub fn get_thermal() -> thermal::ThermalReport {
+    thermal::probe()
+}
+
+// ==================== 系统通知（T5-02）====================
+
+/// 这一次运行里投过几条系统通知、失败几条。计数只增不减，所以"0 条"的含义是
+/// "到目前为止没投过"，不是"通知不可用"。
+#[tauri::command]
+pub fn notify_status(app: tauri::AppHandle) -> notify::NotifyStatus {
+    app.state::<notify::NotifyState>().status()
+}
+
+/// 投一条**固定文案**的测试通知：不接收任何参数，避免变成"前端可指定任意文本进系统通知"的通道。
+/// 它只回答"这台机器的通知通道能不能把一条消息送到你眼前"；返回 Ok 也只代表投递没当场报错，
+/// 真实有没有弹出来由用户自己看（口径见 `notify` 模块头）。
+///
+/// 失败时 `message` 只放后端给的那句原文 —— 是哪一步失败的语境由界面负责说
+/// （`AlertSettingsDrawer` 分"测试通知没发出去"与"读不到投递记账"两句）。两边各加一半前缀
+/// 会拼出"系统通知状态读取失败：系统通知投递失败：…"这种重复的错话，浏览器实测抓到过。
+#[tauri::command]
+pub fn send_test_notification(app: tauri::AppHandle) -> Result<notify::NotifyStatus, AppError> {
+    let state = app.state::<notify::NotifyState>();
+    match notify::post(&app, &state, notify::test_texts()) {
+        Ok(()) => Ok(state.status()),
+        Err(reason) => Err(AppError::failed(reason)),
+    }
 }
 
 // ==================== 偏好导入/导出（T5-11）====================
@@ -385,21 +428,52 @@ mod tests {
     }
 
     /// SEC-V06：后端不得以提权方式执行命令，失败时只能返回供用户复制的手动命令。
+    /// 扫描是**递归**的：`src/platform/` 这类子目录一旦存在，只扫顶层就等于给审计留了个入口。
     #[test]
     fn backend_never_constructs_a_sudo_command() {
         let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let mut offenders = Vec::new();
-        for entry in std::fs::read_dir(&src_dir).expect("src 目录应存在") {
-            let path = entry.expect("可读目录项").path();
-            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
-                continue;
-            }
+        let mut files = Vec::new();
+        collect_rs_files(&src_dir, &mut files);
+        assert!(files.len() > 13, "只找到 {} 个源文件，递归没生效，审计等于空跑", files.len());
+        for path in files {
             let text = std::fs::read_to_string(&path).expect("源码可读");
             if text.contains("Command::new(\"sudo\")") || text.contains("Command::new(\"su\")") {
-                offenders.push(path.file_name().unwrap().to_string_lossy().into_owned());
+                offenders.push(path.to_string_lossy().into_owned());
             }
         }
         assert!(offenders.is_empty(), "发现提权调用：{offenders:?}");
+    }
+
+    fn collect_rs_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("src 目录应存在") {
+            let path = entry.expect("可读目录项").path();
+            if path.is_dir() {
+                collect_rs_files(&path, out);
+            } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    /// T5-08 的接线检查：模块接进来了、命令注册了、前端登记了、Agent 拿得到那份报告。
+    /// 少任何一处都会让温度问题静默退化成"没有数据"，所以四条一起断。
+    #[test]
+    fn thermal_command_is_registered_on_both_sides() {
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let lib_rs = std::fs::read_to_string(manifest.join("src/lib.rs")).unwrap();
+        assert!(lib_rs.contains("mod platform;"), "platform 模块没接进 lib.rs");
+        assert!(
+            lib_rs.contains("commands::get_thermal"),
+            "get_thermal 没注册进 invoke_handler"
+        );
+        let contract = std::fs::read_to_string(manifest.join("../src/ipc_contract.ts")).unwrap();
+        assert!(contract.contains("getThermal: \"get_thermal\""), "前端未登记 get_thermal");
+        let commands_rs = std::fs::read_to_string(manifest.join("src/commands.rs")).unwrap();
+        assert!(
+            commands_rs.contains("thermal: &thermal::probe()"),
+            "Agent 的输入里没有温度报告，温度问题会一直回\"没有通路\""
+        );
     }
 
     #[test]

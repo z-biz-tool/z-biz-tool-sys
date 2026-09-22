@@ -41,6 +41,7 @@ import {
   type ProcessDetail,
   type ScanProgress,
   type StartupItem,
+  type ThermalReport,
 } from "./ipc_contract";
 import { useAlerts } from "./hooks/useAlerts";
 import { usePrefs } from "./hooks/usePrefs";
@@ -161,6 +162,14 @@ function App() {
 
   const [startupItems, setStartupItems] = useState<StartupItem[]>([]);
   const [loadingStartup, setLoadingStartup] = useState(false);
+  // 温度/风扇（T5-08）：不进采集流，只在进系统信息页时读一次 + 手动刷新。
+  // 读数本身可能永远为空（macOS 没有免提权通路），所以 null 与"空报告"是两种状态：
+  // null = 还没查到（没试过，或那一次失败了），空报告 = 查到了、后端给了"为什么没有读数"的原因。
+  const [thermal, setThermal] = useState<ThermalReport | null>(null);
+  const [loadingThermal, setLoadingThermal] = useState(false);
+  // "这一页查过没有"要单独记一笔：失败时 thermal 会退回 null，若拿 `thermal === null` 当"没查过"，
+  // 那次失败本身就把依赖改了、立刻再发一条 IPC（浏览器实测：点一次"重新读取"失败 → 2 条 get_thermal）。
+  const [thermalTried, setThermalTried] = useState(false);
 
   const [killTarget, setKillTarget] = useState<KillValidation | null>(null);
   const [killConfirmText, setKillConfirmText] = useState("");
@@ -322,8 +331,30 @@ function App() {
     }
   }, [msgApi, reportError]);
 
-  const flushDns = useCallback(async () => {
+  // 温度/风扇（T5-08）：不接收任何参数，能读的位置在后端是写死的常量。
+  const loadThermal = useCallback(async () => {
+    setLoadingThermal(true);
     try {
+      setThermal(await invoke<ThermalReport>(Commands.getThermal));
+    } catch (e) {
+      // 失败时退回 null（而不是"空报告"），界面才会显示"正在读取"之外的第三种状态；
+      // 具体错由 reportError 按 AppError.code 定级。
+      setThermal(null);
+      reportError("读取传感器", e);
+    } finally {
+      setLoadingThermal(false);
+    }
+  }, [msgApi, reportError]);
+
+  // 温度不是每帧都变的东西，所以不进采集流：首次进系统信息页读一次，之后只由「重新读取」按钮再读
+  useEffect(() => {
+    if (activeTab === "system" && !thermalTried) {
+      setThermalTried(true);
+      void loadThermal();
+    }
+  }, [activeTab, thermalTried, loadThermal]);
+
+  const flushDns = useCallback(async () => {    try {
       const result = await invoke<DnsFlushResult>(Commands.flushDns);
       if (result.flushed) {
         msgApi.success(result.message);
@@ -571,6 +602,9 @@ function App() {
           <SystemInfoTab
             staticInfo={staticInfo}
             snapshot={snapshot}
+            thermal={thermal}
+            thermalLoading={loadingThermal}
+            onRefreshThermal={loadThermal}
             onTransferPrefs={() => setPrefsPanelOpen(true)}
           />
         </ErrorBoundary>

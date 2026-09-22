@@ -410,30 +410,18 @@ impl Collector {
 
         let mut out = Vec::new();
         for disk in self.disks.iter() {
-            let total = disk.total_space();
-            let available = disk.available_space();
-            let used = total.saturating_sub(available);
             let key = disk.mount_point().to_string_lossy().into_owned();
-
             // 首个刷新窗口到来之前没有任何增量可说，保持 None。
-            let (read_rate, write_rate) = self.disk_rates.get(&key).copied().unwrap_or((None, None));
+            let rates = self.disk_rates.get(&key).copied().unwrap_or((None, None));
 
-            out.push(DiskMetrics {
-                name: disk.name().to_string_lossy().into_owned(),
-                mount_point: key,
-                file_system: disk.file_system().to_string_lossy().into_owned(),
-                available: total > 0,
-                total_bytes: total,
-                used_bytes: used,
-                available_bytes: available,
-                usage_percent: if total > 0 {
-                    round2(used as f64 / total as f64 * 100.0)
-                } else {
-                    0.0
-                },
-                read_bytes_per_sec: read_rate,
-                write_bytes_per_sec: write_rate,
-            });
+            out.push(disk_entry(
+                disk.name().to_string_lossy().into_owned(),
+                key,
+                disk.file_system().to_string_lossy().into_owned(),
+                disk.total_space(),
+                disk.available_space(),
+                rates,
+            ));
         }
         out.sort_by_key(|b| std::cmp::Reverse(b.total_bytes));
         out
@@ -827,13 +815,14 @@ impl MonitorService {
         history: Option<crate::history::HistoryStore>,
         alert_history: Option<crate::history::AlertStore>,
         alerts: Arc<RwLock<crate::alert::AlertConfig>>,
+        notify: crate::notify::NotifyState,
     ) {
         let config = self.config.clone();
         let latest = self.latest.clone();
         {
             let app = app.clone();
             tauri::async_runtime::spawn(async move {
-                run_metrics_loop(app, config, latest, history, alert_history, alerts).await;
+                run_metrics_loop(app, config, latest, history, alert_history, alerts, notify).await;
             });
         }
 
@@ -871,6 +860,7 @@ async fn run_metrics_loop(
     history: Option<crate::history::HistoryStore>,
     alert_history: Option<crate::history::AlertStore>,
     alert_config: Arc<RwLock<crate::alert::AlertConfig>>,
+    notify: crate::notify::NotifyState,
 ) {
     let mut collector = Collector::new();
     let mut recorder = history.map(crate::history::HistoryRecorder::open);
@@ -950,13 +940,15 @@ async fn run_metrics_loop(
                     if let Some(alert_recorder) = alert_recorder.as_mut() {
                         alert_recorder.record(&event);
                     }
+                    // 系统通知（T5-02）：判定已经由引擎做完，这里只是把同一条再投一次。
+                    // 投递结果绝不能影响上面两件事，所以 `post_alert` 内部吞掉错误、只记账。
+                    crate::notify::post_alert(&app, &notify, &event);
                 }
             }
-            Err(_) => {
-                // 采集器 panic 后重建，保证循环不退出。
-                collector = Collector::new();
-                // 这一帧没采到，连续计数同样要断开。
-                alerts.reset();
+            Err(payload) => {
+                // FI-03：恢复动作收在 `recover_metrics_after_panic` 里（日志 + 重建 + 断计数），
+                // 这样"恢复"本身能被单测真跑，而不是在测试里重抄一遍循环体的两行。
+                recover_metrics_after_panic(&mut collector, &mut alerts, panic_reason(payload));
             }
         }
 
@@ -1042,11 +1034,9 @@ async fn run_process_loop(
                     });
                 }
             }
-            Err(_) => {
-                // 重建必须走 `process_system()`：`System::new()` 会把 CPU 基准一起丢掉，
-                // 于是此后第一帧又是全 0（H-06 的同一条坑）。
-                sys = process_system();
-                warmed = false;
+            Err(payload) => {
+                // FI-03（进程侧）：同一套恢复口径 —— 留日志、走 `process_system()` 重建、回到暖机。
+                recover_processes_after_panic(&mut sys, &mut warmed, panic_reason(payload));
             }
         }
 
@@ -1067,6 +1057,91 @@ fn store<T>(slot: &Arc<RwLock<Option<T>>>, value: T) {
     if let Ok(mut guard) = slot.write() {
         *guard = Some(value);
     }
+}
+
+/// 一个分区的 `(总容量, 可用量)` 变成界面要的那几个字段。
+///
+/// 抽成纯函数是为了 FI-04：真机上"拿不到容量的分区"不是每次都能造出来（本机 `分区=2` 两块都有容量），
+/// 而"容量拿不到 ⇒ 只把这一块标成不可用、既不污染别的块、也不给出一个看起来正常的 0 %"这条规则
+/// 必须能被直接注入测到。`usage_percent` 的类型是 `f64`（不是 Option），所以拿不到容量时它仍是 `0.0`，
+/// 但同一条记录带着 `available: false` —— 读到 `false` 必须显示 `—`，这条在 `DiskTab` 那侧有回归盯着。
+fn disk_entry(
+    name: String,
+    mount_point: String,
+    file_system: String,
+    total: u64,
+    available: u64,
+    rates: (Option<f64>, Option<f64>),
+) -> DiskMetrics {
+    let usable = total > 0;
+    let used = total.saturating_sub(available);
+    DiskMetrics {
+        name,
+        mount_point,
+        file_system,
+        available: usable,
+        total_bytes: total,
+        used_bytes: used,
+        available_bytes: available,
+        usage_percent: if usable {
+            round2(used as f64 / total as f64 * 100.0)
+        } else {
+            0.0
+        },
+        read_bytes_per_sec: rates.0,
+        write_bytes_per_sec: rates.1,
+    }
+}
+
+/// 把 `catch_unwind` 的载荷变成可读的一句话，并与落盘/日志同口径过一遍脱敏
+/// （采集线程的 panic 文本会打到用户的终端上，不许带出家目录或内网地址）。
+/// 抓不到可读字符串就写"未知"，不拿 `{:?}` 把一个空串当成原因报出去
+/// —— `Box<dyn Any>` 的 `Debug` 只会打出 `Any { .. }`，走 `{:?}` 等于永远"未知"。
+///
+/// 参数**必须按值收 `Box`**：写成 `&(dyn Any + Send)` 再传 `&payload`（payload 是 `Box<...>`）
+/// 会让 downcast 看到的是那个盒子而不是盒子里的东西，于是一条正常的 `panic!("…")`
+/// 也会被打成"未知 panic"。这个错是 `fi03_probe_what_a_panic_payload_actually_carries`
+/// 在本轮实测里抓到的。
+fn panic_reason(payload: Box<dyn std::any::Any + Send>) -> String {
+    for candidate in [
+        payload.downcast_ref::<String>().map(String::as_str),
+        payload.downcast_ref::<&str>().copied(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if !candidate.trim().is_empty() {
+            return crate::log_sanitize::sanitize(candidate);
+        }
+    }
+    "未知 panic（载荷里没有可读的原因）".to_string()
+}
+
+/// FI-03：metrics 帧 panic 后的恢复动作，收成一个函数，好让"恢复"这件事本身可测。
+///
+/// 三件事缺一不可，而且顺序不能反：
+/// 1. **留日志** —— 静默重建等于"界面偶尔停一下又自己好了"，谁都没法查；这条不是 debug 专属，
+///    panic 是低频且必须被看见的事件。
+/// 2. **重建采集器** —— `sysinfo` 内部存的是"上次采样值 + 时间戳"的差值基准，panic 可能把它留在
+///    半更新状态，继续用会算出假值（H-06 同一类坑）。
+/// 3. **断开告警的连续计数** —— 这一帧没采到，把前后两帧当成"连续超限"就会报出没发生过的告警。
+fn recover_metrics_after_panic(
+    collector: &mut Collector,
+    alerts: &mut crate::alert::AlertEngine,
+    reason: String,
+) {
+    eprintln!("[monitor] 采集帧 panic，已重建采集器并断开告警的连续计数：{reason}");
+    *collector = Collector::new();
+    alerts.reset();
+}
+
+/// FI-03（进程循环那一侧）。重建必须走 `process_system()`：`System::new()` 会把 CPU 基准一起丢掉，
+/// 于是此后第一帧又是全 0（H-06）；`warmed = false` 则让那一帧**明确标成暖机中**，
+/// 而不是给一排 0 % 的排行榜。
+fn recover_processes_after_panic(sys: &mut System, warmed: &mut bool, reason: String) {
+    eprintln!("[monitor] 进程帧 panic，已重建进程表并回到暖机：{reason}");
+    *sys = process_system();
+    *warmed = false;
 }
 
 fn round2(v: f64) -> f64 {
@@ -1559,6 +1634,467 @@ mod tests {
         assert!(
             app.contains("<ErrorBoundary label=\"迷你模式\">"),
             "迷你模式要有自己的错误边界，不能让它抛错时整个界面塌掉"
+        );
+    }
+
+    // ==================== FI-01~FI-04 故障注入（06 文档"尚未自动化"那一项）====================
+
+    /// CPU 99 % 的一帧：越过默认的 critical 95 %，用来驱动"连续 N 帧"这条链。
+    fn hot_frame(timestamp_ms: u64) -> MetricsSnapshot {
+        MetricsSnapshot {
+            timestamp_ms,
+            uptime_seconds: 100,
+            cpu: CpuMetrics {
+                total: 99.0,
+                per_core: vec![99.0],
+                core_count: 1,
+            },
+            memory: MemoryMetrics {
+                total_bytes: 16 * 1024 * 1024 * 1024,
+                used_bytes: 1024 * 1024 * 1024,
+                available_bytes: 15 * 1024 * 1024 * 1024,
+                swap_total_bytes: 0,
+                swap_used_bytes: 0,
+                usage_percent: 6.25,
+                pressure: MemoryPressure::Normal,
+            },
+            disks: vec![disk_entry(
+                "Data".to_string(),
+                "/System/Volumes/Data".to_string(),
+                "apfs".to_string(),
+                100,
+                50,
+                (None, None),
+            )],
+            networks: Vec::new(),
+        }
+    }
+
+    /// 先量清楚 `catch_unwind` 的载荷里到底能拿到什么，再决定 `panic_reason` 怎么写。
+    /// 这条是"临时探针转正"：本仓库踩过的教训是 —— 不看真实形状就写提取逻辑，
+    /// 结果是日志一路打"未知 panic"，看着像没有原因，其实是取原因的方法错了。
+    #[test]
+    fn fi03_probe_what_a_panic_payload_actually_carries() {
+        let forms = [
+            std::panic::catch_unwind(|| panic!("注入：字面量")),
+            std::panic::catch_unwind(|| panic!("注入：{}", 42)),
+            // 注意：`panic!(42u32)` 在这个 edition 里根本编不过（"format argument must be a string
+            // literal"），非字符串载荷只能由 `panic_any` 产生 —— 这也是一种载荷形状。
+            std::panic::catch_unwind(|| std::panic::panic_any(42u32)),
+        ];
+        let mut readable = 0;
+        let mut shapes = Vec::new();
+        for payload in forms.into_iter().filter_map(|r| r.err()) {
+            let as_string = payload.downcast_ref::<String>().cloned();
+            let as_str = payload.downcast_ref::<&str>().copied().map(String::from);
+            let reason = panic_reason(payload);
+            shapes.push(format!(
+                "String={as_string:?} &str={as_str:?} -> {reason}"
+            ));
+            if !reason.starts_with("未知") {
+                readable += 1;
+            }
+        }
+        // 断言的是"至少字面量这一种必须能读出原因"，读不出的那种（`panic!(42u32)`）就承认读不出。
+        assert!(readable >= 1, "一种原因都读不出来：{shapes:?}");
+        for shape in &shapes {
+            println!("FI-03 载荷形状: {shape}");
+        }
+    }
+
+    /// FI-03：panic 之后**必须断掉"连续 N 帧"这条链**。
+    /// 少了这一步，恢复后的第一帧会被当成第 3 帧，于是弹出一条这台机器从没连续超限过的告警。
+    #[test]
+    fn fi03_a_panicked_frame_breaks_the_alert_chain() {
+        let mut collector = Collector::new();
+        let mut engine = crate::alert::AlertEngine::new();
+        let cfg = crate::alert::AlertConfig::default();
+        assert_eq!(cfg.consecutive, 3, "这条测试的前提是默认连续 3 帧");
+
+        // 先攒两帧越限：还差一帧就该触发。
+        assert!(engine.evaluate(&hot_frame(1_000), &cfg).is_empty());
+        assert!(engine.evaluate(&hot_frame(2_000), &cfg).is_empty());
+
+        // 走真实的恢复入口（循环里调的就是它），不是重抄一遍。
+        let boom = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| panic!("注入：采集器 panic")));
+        recover_metrics_after_panic(
+            &mut collector,
+            &mut engine,
+            panic_reason(boom.expect_err("注入的 panic 必须被捕获")),
+        );
+
+        // 计数已断开：这帧不该触发。
+        assert!(
+            engine.evaluate(&hot_frame(3_000), &cfg).is_empty(),
+            "panic 后第一帧就被当成'连续第 3 帧'，会报出没发生过的告警"
+        );
+        // 再两帧之后才触发 —— 引擎在恢复后仍然可用。
+        assert!(engine.evaluate(&hot_frame(4_000), &cfg).is_empty());
+        let fired = engine.evaluate(&hot_frame(5_000), &cfg);
+        assert_eq!(fired.len(), 1, "恢复后本该重新攒满 3 帧再触发：{fired:?}");
+        assert_eq!(fired[0].metric, crate::alert::AlertMetric::Cpu);
+    }
+
+    /// FI-03：重建出来的采集器必须还能交出可用的一帧（不是"重建了个空壳"）。
+    #[test]
+    fn fi03_the_rebuilt_collector_still_produces_a_usable_frame() {
+        let mut collector = Collector::new();
+        let mut engine = crate::alert::AlertEngine::new();
+        let _ = collector.snapshot(Duration::from_millis(0));
+
+        let boom = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| panic!("注入：重建用的采集器")));
+        recover_metrics_after_panic(
+            &mut collector,
+            &mut engine,
+            panic_reason(boom.expect_err("注入的 panic 必须被捕获")),
+        );
+
+        // 重建后的第一帧：结构上必须完整（CPU 百分比在 0..=100、核心数与内存容量非零）。
+        // 磁盘刷新间隔用生产同款：`Collector::new()` 刚把 `last_disk_sample` 设成 now，
+        // 所以这一帧没有窗口可算速率 —— 必须是 `None`，写 0 就是造数。
+        let frame = collector.snapshot(Duration::from_secs(5));
+        assert!(frame.cpu.total >= 0.0 && frame.cpu.total <= 100.0, "{:?}", frame.cpu.total);
+        assert!(frame.cpu.core_count > 0);
+        assert!(frame.memory.total_bytes > 0, "重建后拿不到内存容量就是空壳");
+        assert!(!frame.networks.is_empty(), "重建后网卡列表为空");
+        // 首帧的速率列必须是 None（还没有窗口可算），不能是 0。
+        for disk in &frame.disks {
+            assert!(
+                disk.read_bytes_per_sec.is_none() && disk.write_bytes_per_sec.is_none(),
+                "刚重建就报出速率 = 造数：{:?}",
+                (disk.mount_point.clone(), disk.read_bytes_per_sec, disk.write_bytes_per_sec)
+            );
+        }
+    }
+
+    /// FI-03（进程那一侧）：恢复后回到暖机中，于是那一帧**明确标注**在暖机，
+    /// 而不是给出一排 0 % 的排行（H-06 的原始症状）。
+    #[test]
+    fn fi03_the_process_recovery_restarts_warming_instead_of_a_zero_leaderboard() {
+        let mut sys = process_system();
+        let mut warmed = true;
+        let query = ProcessQuery::default();
+
+        let boom = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| panic!("注入：进程帧 panic")));
+        recover_processes_after_panic(
+            &mut sys,
+            &mut warmed,
+            panic_reason(boom.expect_err("注入的 panic 必须被捕获")),
+        );
+        assert!(!warmed, "恢复后必须回到暖机");
+
+        let page = collect_processes(&mut sys, warmed, &query);
+        assert!(page.warming, "恢复后的第一帧要标明还在暖机，不能让一排 0 % 冒充排行");
+        assert!(page.total > 0, "进程表本身就是空的，这条注入没跑到真枚举");
+    }
+
+    /// FI-03 的护栏：两处恢复都必须留日志，且循环里不许再留静默的 `Err(_) =>`。
+    /// 静默重启的表现是"界面偶尔停一下又自己好了"，谁都无法追查。
+    #[test]
+    fn fi03_neither_recovery_may_restart_the_loop_silently() {
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let production = std::fs::read_to_string(manifest.join("src/monitor.rs"))
+            .unwrap()
+            .split("#[cfg(test)]")
+            .next()
+            .expect("monitor.rs 应有测试模块")
+            .to_string();
+
+        assert!(
+            !production.contains("Err(_) =>"),
+            "还有静默的 `Err(_) =>` 分支：恢复动作必须走带日志的 recover_* 函数"
+        );
+        assert_eq!(
+            production.matches("Err(payload) =>").count(),
+            2,
+            "两个采集循环都该走恢复函数，多一处少一处都要重新看一眼"
+        );
+        assert!(production.contains("recover_metrics_after_panic(&mut collector, &mut alerts, panic_reason(payload))"));
+        assert!(production.contains("recover_processes_after_panic(&mut sys, &mut warmed, panic_reason(payload))"));
+
+        for name in ["recover_metrics_after_panic", "recover_processes_after_panic"] {
+            let needle = format!("fn {name}(");
+            let body = production
+                .split(needle.as_str())
+                .nth(1)
+                .unwrap_or_default()
+                .split("\n}")
+                .next()
+                .unwrap_or_default()
+                .to_string();
+            assert!(body.contains("eprintln!"), "{name} 没留日志：{body}");
+        }
+        // panic 载荷里的文本要过脱敏（这条日志会打到用户终端上）。
+        let reason_fn = production
+            .split("fn panic_reason(")
+            .nth(1)
+            .expect("应有 panic_reason")
+            .split("\n}")
+            .next()
+            .unwrap()
+            .to_string();
+        assert!(reason_fn.contains("log_sanitize::sanitize"), "panic 原因没脱敏");
+    }
+
+    /// FI-04：拿不到容量的分区只标记它自己。
+    /// 真机上"网络挂载断开"不是每次都能造出来，所以从 `disk_entry` 这个纯函数直接注入。
+    #[test]
+    fn fi04_a_partition_without_capacity_is_marked_alone() {
+        let dead = disk_entry(
+            "afp://10.0.0.8/".to_string(),
+            "/Volumes/断了".to_string(),
+            "smbfs".to_string(),
+            0,
+            0,
+            (None, None),
+        );
+        assert!(!dead.available, "容量为 0 的分区必须标成不可用");
+        assert_eq!(dead.total_bytes, 0);
+        assert_eq!(dead.usage_percent, 0.0, "不可用的分区不该有使用率");
+        assert!(
+            dead.read_bytes_per_sec.is_none() && dead.write_bytes_per_sec.is_none(),
+            "断掉的挂载点不该有速率读数"
+        );
+
+        // 同一批里其它分区完全不受影响。
+        let siblings = [
+            disk_entry("Data".to_string(), "/System/Volumes/Data".to_string(), "apfs".to_string(), 500, 100, (Some(1.0), Some(2.0))),
+            disk_entry("全满".to_string(), "/Volumes/Full".to_string(), "apfs".to_string(), 100, 0, (None, None)),
+        ];
+        assert!(siblings.iter().all(|d| d.available), "有容量的分区不该被邻居带崩");
+        assert_eq!(siblings[0].usage_percent, 80.0);
+        assert_eq!(siblings[1].usage_percent, 100.0, "可用 0 但容量已知的分区是真的全满");
+
+        // 荒谬组合（容量报 0、可用却 > 0）：仍然只标记这一块不可用，
+        // 且 `used` 走 saturating_sub，不许把 u64 减成一个巨大的已用量。
+        let absurd = disk_entry(
+            "假死".to_string(),
+            "/Volumes/Bad".to_string(),
+            "nullfs".to_string(),
+            0,
+            999,
+            (None, None),
+        );
+        assert!(!absurd.available);
+        assert_eq!(absurd.used_bytes, 0, "u64 回绕：{}", absurd.used_bytes);
+        assert_eq!(absurd.usage_percent, 0.0);
+
+        // 告警侧的口径（同一批数据）：只有可用且有容量的块参与判定。
+        let mut engine = crate::alert::AlertEngine::new();
+        let cfg = crate::alert::AlertConfig {
+            // 磁盘 90/95，连续 1 帧：把三块已知容量的摆在一起，最满的那块该是 100 % 的"全满"
+            disk: crate::alert::AlertThresholds {
+                warning: 90.0,
+                critical: 95.0,
+            },
+            consecutive: 1,
+            ..Default::default()
+        };
+        let mut frame = hot_frame(10_000);
+        frame.cpu.total = 1.0; // 只测磁盘这条路径
+        frame.memory.usage_percent = 1.0;
+        frame.memory.used_bytes = 1;
+        frame.disks = [siblings.to_vec(), vec![dead, absurd]].concat();
+        let fired = engine.evaluate(&frame, &cfg);
+        let disk_alerts: Vec<_> = fired
+            .iter()
+            .filter(|e| e.metric == crate::alert::AlertMetric::Disk)
+            .collect();
+        assert_eq!(disk_alerts.len(), 1, "一块全满 + 一块不可用 + 一块 80 %：只该报一条， got {fired:?}");
+        assert_eq!(disk_alerts[0].target.as_deref(), Some("/Volumes/Full"));
+
+        // 显示层的同一口径也要钉住：`available: false` 那一行不许把 `usagePercent` 的 0.0
+        // 画成"用了 0 %"的进度条 —— 后端类型上给不出 `None`，这一列就是最后一道闸。
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let tab = std::fs::read_to_string(manifest.join("../src/components/tabs/DiskTab.tsx")).unwrap();
+        assert!(tab.contains("const MISSING = \"—\""), "分区表没有统一的缺测画法");
+        assert!(tab.contains("disk.available"), "分区表没再看 available 标志");
+        let usage_col = tab
+            .split("title: \"使用率\"")
+            .nth(1)
+            .expect("应有使用率那一列")
+            .split("},\n          {")
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            usage_col.contains("disk.available") && usage_col.contains("MISSING"),
+            "使用率那一列还在无条件画进度条，等于把断掉的挂载点显示成 0 %：{usage_col}"
+        );
+    }
+
+    /// FI-02：没有 listener 时后端不许堆积。共享槽是"最后一帧"语义 —— 每帧覆盖，永不排队。
+    #[test]
+    fn fi02_the_latest_slot_holds_one_frame_not_a_queue() {
+        let slot: Arc<RwLock<Option<u32>>> = Arc::new(RwLock::new(None));
+        for frame_no in 1..=500 {
+            store(&slot, frame_no);
+        }
+        let held = slot.read().unwrap();
+        assert_eq!(*held, Some(500), "槽里必须只有最新那一帧");
+        // 覆盖写不换指针、也不新增任何容器 ⇒ "不堆积"是结构性的，不是靠清理。
+        assert_eq!(slot.read().ok().map(|g| *g), Some(Some(500)));
+    }
+
+    /// FI-02 的另一半：读侧/写侧任一时刻崩了，循环不能跟着崩。
+    /// `store` 用的是 `if let Ok(..)`，锁中毒时丢掉这一帧继续跑 —— 这条测试盯着这个选择。
+    #[test]
+    fn fi02_a_poisoned_slot_cannot_take_the_loop_down() {
+        let slot: Arc<RwLock<Option<u32>>> = Arc::new(RwLock::new(Some(1)));
+        let held = slot.clone();
+        let boom = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _guard = held.write().unwrap();
+            panic!("注入：持写锁时 panic");
+        }));
+        assert!(boom.is_err(), "前置条件：槽要处于中毒状态");
+
+        // 关键断言：中毒之后 `store` 只是丢掉这一帧，不 panic（= 循环不退出）。
+        store(&slot, 2);
+        assert!(
+            slot.read().is_err(),
+            "中毒的槽读不出来，这正是 `store` 不许 panic 的理由"
+        );
+
+        // 换一个健康的槽，恢复路径照常。
+        let fresh: Arc<RwLock<Option<u32>>> = Arc::new(RwLock::new(None));
+        store(&fresh, 3);
+        assert_eq!(*fresh.read().unwrap(), Some(3));
+    }
+
+    /// FI-01：规划原文假设"sysinfo refresh 失败返回 Err"，实测这条假设在本项目用的版本上不成立 ——
+    /// `sysinfo 0.33.1` 的采集 API 全是 `fn refresh_*/(&mut self)`，没有可注入的错误通道。
+    /// 这条测试把那个事实钉住：一旦哪天它开始返回 `Result`，这里会编译失败并逼我们补真正的 FI-01。
+    #[test]
+    fn fi01_sysinfo_offers_no_error_channel_to_inject() {
+        let mut sys = System::new();
+        // 显式要求返回类型是 `()`：写成 `let x: Result<..> = ...` 会编不过，那就是本测试要盯的变化。
+        let unit: () = sys.refresh_cpu_usage();
+        assert_eq!(unit, ());
+        let mut disks = Disks::new();
+        let unit: () = disks.refresh(true);
+        assert_eq!(unit, ());
+        // 因此这里能注入的"失败"只有 FI-03（panic 路径）与 FI-04（单块分区拿不到容量），
+        // 而"使用上次缓存 + 标 stale"由前端的采集停滞检测承担（>3 个周期无帧）。
+        let mut collector = Collector::new();
+        let frame = collector.snapshot(Duration::from_millis(0));
+        assert!(frame.timestamp_ms > 0, "没有错误通道时，唯一可信的失败信号就是'这一帧根本没出来'");
+    }
+
+    // ==================== IT-01~IT-03（06 的集成矩阵）====================
+
+    /// IT-01：事件名是前后端唯一的约定，改名不会有任何编译错误 —— 界面只会永远
+    /// "等待采集首帧…"，后端照样在推。这条把三个事件名钉在前端契约文件上。
+    #[test]
+    fn it01_every_stream_event_name_is_registered_by_the_frontend_contract() {
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let contract = std::fs::read_to_string(manifest.join("../src/ipc_contract.ts")).unwrap();
+        for event in [METRICS_EVENT, PROCESSES_EVENT, crate::alert::ALERT_EVENT] {
+            assert!(
+                contract.contains(&format!("\"{event}\"")),
+                "前端 MonitorEvent 里没有登记 {event}，推了也没人接"
+            );
+        }
+        // 首帧的结构完整性：payload 少一个字段与事件名错了的表现完全一样（界面静默空白），
+        // 所以这两件事在同一条测试里钉。
+        let mut collector = Collector::new();
+        let frame = collector.snapshot(Duration::from_secs(5));
+        let json = serde_json::to_string(&frame).unwrap();
+        for key in [
+            "timestampMs", "uptimeSeconds", "cpu", "memory", "disks", "networks",
+            "total", "perCore", "coreCount", "usagePercent", "pressure",
+        ] {
+            assert!(json.contains(&format!("\"{key}\"")), "metrics 载荷缺字段 {key}：{json}");
+        }
+        assert!(!json.contains('_'), "metrics 载荷必须全 camelCase：{json}");
+    }
+
+    /// IT-02：改间隔要落在**循环真正读的那份配置**上。`spawn` 走的是 `Arc` 克隆，
+    /// 所以这条测的是共享性本身 —— 哪天有人把 `config.clone()` 换成 `RwLock::new(*guard)`，
+    /// 现象是"界面把 5 s 显示成生效了，采集照旧 1 s 一帧"，没有任何报错。
+    #[test]
+    fn it02_a_config_change_lands_on_the_copy_the_loop_reads() {
+        let service = MonitorService::new();
+        // 与 spawn 完全同款：先克隆一份交给"循环"，再从原对象改配置。
+        let loop_side = {
+            let cloned = service.clone();
+            std::thread::spawn(move || cloned)
+        }
+        .join()
+        .unwrap();
+
+        let requested = MonitorConfig {
+            interval_ms: 1,
+            disk_interval_ms: 1_000,
+            process_interval_ms: 3_000,
+            paused: false,
+        };
+        let effective = service.set_config(requested);
+        let seen = loop_side.config.read().map(|g| g.clone()).unwrap_or_default();
+        assert_eq!(
+            seen.interval_ms, effective.interval_ms,
+            "循环那份配置没跟着变 ⇒ 改间隔只改了界面"
+        );
+        assert_eq!(seen.disk_interval_ms, effective.disk_interval_ms);
+        assert_eq!(seen.process_interval_ms, effective.process_interval_ms);
+        // 脏输入夹取后回读的是生效值，不是用户填的那个（否则界面会显示一份后端没收的配置）。
+        // 下限具体是多少由 `config_clamps_to_safe_ranges` 钉；这里只要求"1 ms 没被照单收下"。
+        let dirty = service.set_config(MonitorConfig {
+            interval_ms: 1,
+            ..Default::default()
+        });
+        assert!(dirty.interval_ms > 1, "1 ms 这种脏输入必须被夹掉：{dirty:?}");
+        assert_eq!(
+            loop_side.config.read().unwrap().interval_ms,
+            dirty.interval_ms,
+            "夹取后的生效值没落到循环那份配置上"
+        );
+    }
+
+    /// IT-03：关进程流要落在**循环轮询的那面旗**上（同一个 `Arc<AtomicBool>`）。
+    /// 表现同上：旗没共享受到，"停止进程枚举"就只是一句界面文案。
+    #[test]
+    fn it03_stopping_the_stream_flips_the_flag_the_loop_polls() {
+        let service = MonitorService::new();
+        let loop_side = {
+            let cloned = service.clone();
+            std::thread::spawn(move || cloned)
+        }
+        .join()
+        .unwrap();
+
+        assert!(!service.process_stream_enabled(), "默认不该开着枚举");
+        service.set_process_stream(true);
+        assert!(loop_side.process_stream.load(Ordering::Relaxed), "开启没传到循环那份");
+        service.set_process_stream(false);
+        assert!(!loop_side.process_stream.load(Ordering::Relaxed), "停止没传到循环那份");
+        assert!(!service.process_stream_enabled());
+    }
+
+    /// IT-02 的另一半：配置必须是**每帧重读**。循环开头读一次的话，改间隔要重启进程才生效，
+    /// 而界面上看起来已经生效了。
+    #[test]
+    fn it02_the_loop_rereads_the_config_every_frame() {
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let source = std::fs::read_to_string(manifest.join("src/monitor.rs")).unwrap();
+        let loop_body = source
+            .split("async fn run_metrics_loop")
+            .nth(1)
+            .expect("应有 run_metrics_loop")
+            .split("\n}\n")
+            .next()
+            .expect("函数应有结尾")
+            .to_string();
+        let loop_at = loop_body.find("loop {").expect("循环体应有 loop {");
+        let read_at = loop_body
+            .find("let cfg = config.read()")
+            .expect("循环里没有读配置？");
+        assert!(
+            read_at > loop_at,
+            "配置在 loop 之外被读了 ⇒ 改间隔要重启进程才生效"
+        );
+        assert!(
+            loop_body.contains("let tick = Duration::from_millis(cfg.interval_ms)"),
+            "帧间隔没跟着每帧重读出来的配置走"
         );
     }
 }
