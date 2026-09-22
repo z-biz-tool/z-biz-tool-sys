@@ -7,6 +7,7 @@ use crate::error::{AppError, CommandResult};
 use crate::monitor::{
     self, MonitorConfig, MonitorService, ProcessPage, ProcessQuery, StaticInfo,
 };
+use crate::prefs;
 use crate::safety::{self, KillOutcome, KillValidation};
 use serde::Serialize;
 use std::time::{Duration, Instant};
@@ -43,6 +44,21 @@ pub fn set_monitor_config(
     state.set_config(config)
 }
 
+/// 告警阈值配置（T5-01）：与 `set_monitor_config` 同口径 —— 后端夹取并把真正生效的值回给前端，
+/// 界面上的输入框据此校正，避免出现"显示 150、实际按 100 判"的两套数。
+#[tauri::command]
+pub fn get_alert_config(state: State<'_, crate::alert::AlertState>) -> crate::alert::AlertConfig {
+    state.get()
+}
+
+#[tauri::command]
+pub fn set_alert_config(
+    state: State<'_, crate::alert::AlertState>,
+    config: crate::alert::AlertConfig,
+) -> crate::alert::AlertConfig {
+    state.set(config)
+}
+
 /// 历史趋势（T3-07）：读已落盘的 10 s 采样点，跨度超过保留窗口时按上限夹取。
 /// 存储不可用时返回错误而不是空页 —— 前端需要能区分"没有历史"和"存不了历史"。
 #[tauri::command]
@@ -55,6 +71,26 @@ pub fn get_history(
     };
     let span = span_seconds.unwrap_or(crate::history::DEFAULT_SPAN_SECS);
     Ok(crate::history::query(store, crate::history::now_ms(), span))
+}
+
+/// 告警历史（T5-03）：读已落盘的触发记录，默认最近 7 天、上界为保留窗口。
+/// 与 `get_history` 同口径 —— 存储不可用时返回错误，前端要能分辨"没发生过告警"和"存不下"。
+#[tauri::command]
+pub fn get_alert_history(
+    state: State<'_, crate::history::AlertHistoryState>,
+    span_seconds: Option<u64>,
+) -> CommandResult<crate::history::AlertHistoryPage> {
+    let Some(store) = state.0.as_ref() else {
+        return Err(AppError::failed(
+            "告警历史存储不可用：应用数据目录无法写入，当前只显示本次会话内的告警",
+        ));
+    };
+    let span = span_seconds.unwrap_or(crate::history::DEFAULT_ALERT_SPAN_SECS);
+    Ok(crate::history::query_alerts(
+        store,
+        crate::history::now_ms(),
+        span,
+    ))
 }
 
 #[tauri::command]
@@ -246,6 +282,21 @@ pub fn find_large_files_cmd(
 #[tauri::command]
 pub fn get_startup_items_cmd() -> Vec<StartupItem> {
     get_startup_items()
+}
+
+// ==================== 偏好导入/导出（T5-11）====================
+
+#[tauri::command]
+pub fn export_prefs_file(
+    path: String,
+    prefs: serde_json::Value,
+) -> CommandResult<prefs::ExportOutcome> {
+    prefs::write_prefs_file(&path, prefs)
+}
+
+#[tauri::command]
+pub fn import_prefs_file(path: String) -> CommandResult<prefs::ImportOutcome> {
+    prefs::read_prefs_file(&path)
 }
 
 #[cfg(test)]

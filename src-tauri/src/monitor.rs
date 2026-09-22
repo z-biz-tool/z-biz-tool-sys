@@ -743,14 +743,21 @@ impl MonitorService {
     }
 
     /// 启动两个采集循环。前端未 listen 时 emit 失败会被静默丢弃。
-    /// `history` 为 `None` 时（应用数据目录不可用）只关掉落盘，实时链路不受影响。
-    pub fn spawn(&self, app: AppHandle, history: Option<crate::history::HistoryStore>) {
+    /// `history` / `alert_history` 为 `None` 时（应用数据目录不可用）只关掉对应那份落盘，
+    /// 实时链路不受影响。
+    pub fn spawn(
+        &self,
+        app: AppHandle,
+        history: Option<crate::history::HistoryStore>,
+        alert_history: Option<crate::history::AlertStore>,
+        alerts: Arc<RwLock<crate::alert::AlertConfig>>,
+    ) {
         let config = self.config.clone();
         let latest = self.latest.clone();
         {
             let app = app.clone();
             tauri::async_runtime::spawn(async move {
-                run_metrics_loop(app, config, latest, history).await;
+                run_metrics_loop(app, config, latest, history, alert_history, alerts).await;
             });
         }
 
@@ -786,9 +793,13 @@ async fn run_metrics_loop(
     config: Arc<RwLock<MonitorConfig>>,
     latest: Arc<RwLock<Option<MetricsSnapshot>>>,
     history: Option<crate::history::HistoryStore>,
+    alert_history: Option<crate::history::AlertStore>,
+    alert_config: Arc<RwLock<crate::alert::AlertConfig>>,
 ) {
     let mut collector = Collector::new();
     let mut recorder = history.map(crate::history::HistoryRecorder::open);
+    let mut alert_recorder = alert_history.map(crate::history::AlertRecorder::open);
+    let mut alerts = crate::alert::AlertEngine::new();
     // 首个采样点只建立基线，不推送（CPU 增量需要前一次采样）。
     collector.refresh_cpu();
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -796,6 +807,8 @@ async fn run_metrics_loop(
     loop {
         let cfg = config.read().map(|g| g.clone()).unwrap_or_default();
         if cfg.paused {
+            // 暂停期间没有帧，"连续 N 帧"的计数不能跨过这段空白继续攒。
+            alerts.reset();
             tokio::time::sleep(Duration::from_millis(500)).await;
             continue;
         }
@@ -836,10 +849,38 @@ async fn run_metrics_loop(
                 if let Some(recorder) = recorder.as_mut() {
                     recorder.observe(crate::history::HistoryPoint::from_snapshot(&snapshot));
                 }
+
+                // 告警判定（T5-01）：与历史落盘同一时间轴，用帧自带的时间戳做冷却计算。
+                let alert_cfg = alert_config.read().map(|g| g.clone()).unwrap_or_default();
+                for event in alerts.evaluate(&snapshot, &alert_cfg) {
+                    #[cfg(debug_assertions)]
+                    eprintln!(
+                        "[alert] {:?} {:?} 值={:.2}% 阈值={:.2}% 连续={} 帧 目标={:?}",
+                        event.metric,
+                        event.level,
+                        event.value,
+                        event.threshold,
+                        event.consecutive,
+                        event.target
+                    );
+                    // 与 metrics 帧同口径：无人 listen 时 emit 失败就丢弃，不影响采集链路。
+                    if let Err(e) = app.emit(crate::alert::ALERT_EVENT, &event) {
+                        static ALERT_EMIT_WARNED: std::sync::Once = std::sync::Once::new();
+                        ALERT_EMIT_WARNED.call_once(|| {
+                            eprintln!("[alert] 事件推送失败: {}", e)
+                        });
+                    }
+                    // 落盘（T5-03）与推送是两件事：界面没打开、事件没人接，历史照样要留下。
+                    if let Some(alert_recorder) = alert_recorder.as_mut() {
+                        alert_recorder.record(&event);
+                    }
+                }
             }
             Err(_) => {
                 // 采集器 panic 后重建，保证循环不退出。
                 collector = Collector::new();
+                // 这一帧没采到，连续计数同样要断开。
+                alerts.reset();
             }
         }
 
@@ -1057,48 +1098,6 @@ mod tests {
             std::thread::sleep(Duration::from_millis(50));
         }
         assert!(seen_total);
-    }
-
-    #[test]
-    fn tmp_measure_disk_io_for_iostat_reconciliation() {
-        use std::io::Write;
-        let mut collector = Collector::new();
-        // 只写 64 MiB：本机 Data 卷可用不足 4 GB，探针必须小体量、且结束即删。
-        let probe = std::env::temp_dir().join("zsys-iostat-probe.bin");
-        for i in 0..8 {
-            std::thread::sleep(Duration::from_millis(1000));
-            if i == 3 {
-                let mut f = std::fs::File::create(&probe).unwrap();
-                let chunk = vec![7u8; 4 * 1024 * 1024];
-                for _ in 0..16 {
-                    f.write_all(&chunk).unwrap();
-                    f.sync_all().unwrap();
-                }
-                drop(f);
-                std::fs::remove_file(&probe).ok();
-            }
-            let frames = collector.disk_metrics(Duration::from_millis(1000));
-            println!(
-                "T={} FRAME {} {}",
-                epoch_ms(),
-                i,
-                frames
-                    .iter()
-                    .map(|d| format!(
-                        "{} r={} w={}",
-                        d.mount_point,
-                        d.read_bytes_per_sec
-                            .map(|v| (v / 1e6).round() as i64)
-                            .unwrap_or(-1),
-                        d.write_bytes_per_sec
-                            .map(|v| (v / 1e6).round() as i64)
-                            .unwrap_or(-1),
-                    ))
-                    .collect::<Vec<_>>()
-                    .join(" | ")
-            );
-        }
-        std::fs::remove_file(&probe).ok();
     }
 
     #[test]

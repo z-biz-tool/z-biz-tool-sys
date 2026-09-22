@@ -2,10 +2,10 @@ import { Col, Row, Segmented, Space, Typography } from "antd";
 import { CloudOutlined, DesktopOutlined, HddOutlined, WifiOutlined } from "@ant-design/icons";
 import dayjs from "dayjs";
 import { useMemo } from "react";
-import type { HistoryPoint, MetricsSnapshot, StaticInfo } from "../../ipc_contract";
+import type { AlertEvent, HistoryPoint, MetricsSnapshot, StaticInfo } from "../../ipc_contract";
 import type { HistorySeedInfo } from "../../hooks/useSystemMonitor";
 import { formatBytes, formatGb, formatPercent, formatRate } from "../../lib/format";
-import { TREND_RANGES, downsampleHistory, windowHistory } from "../../lib/trend";
+import { TREND_RANGES, alignAlertMarkers, downsampleHistory, windowHistory } from "../../lib/trend";
 import { CpuCores } from "../CpuCores";
 import { MetricCard } from "../MetricCard";
 import { TrendChart } from "../TrendChart";
@@ -19,6 +19,7 @@ export function OverviewTab({
   trendRange,
   onTrendRangeChange,
   seedInfo,
+  alertEvents,
 }: {
   staticInfo: StaticInfo | null;
   snapshot: MetricsSnapshot | null;
@@ -26,6 +27,8 @@ export function OverviewTab({
   trendRange: number;
   onTrendRangeChange: (seconds: number) => void;
   seedInfo: HistorySeedInfo | null;
+  /** 已触发的告警（会话内 + 落盘回填），用来在曲线上标竖线 */
+  alertEvents: AlertEvent[];
 }) {
   const cpu = snapshot?.cpu;
   const memory = snapshot?.memory;
@@ -49,16 +52,39 @@ export function OverviewTab({
     return { total, used, percent: total > 0 ? (used / total) * 100 : 0 };
   }, [snapshot]);
 
+  // 先留一份裁剪+压缩后的原始点：告警竖线要按真实采样时刻对齐，不能拿格式化过的字符串反推
+  const chartRows = useMemo(
+    () => downsampleHistory(windowHistory(history, trendRange)),
+    [history, trendRange]
+  );
+
   const chartData = useMemo(
     () =>
-      downsampleHistory(windowHistory(history, trendRange)).map((p) => ({
+      chartRows.map((p) => ({
         time: dayjs(p.t).format("HH:mm:ss"),
         cpu: Number(p.cpu.toFixed(2)),
         memory: Number(p.memory.toFixed(2)),
         network: Number(((p.rxBytesPerSec + p.txBytesPerSec) / 1024).toFixed(2)),
       })),
-    [history, trendRange]
+    [chartRows]
   );
+
+  const markerRows = useMemo(
+    () => chartRows.map((p) => ({ t: p.t, time: dayjs(p.t).format("HH:mm:ss") })),
+    [chartRows]
+  );
+  const cpuMarkers = useMemo(
+    () => alignAlertMarkers(alertEvents, markerRows, "cpu"),
+    [alertEvents, markerRows]
+  );
+  const memoryMarkers = useMemo(
+    () => alignAlertMarkers(alertEvents, markerRows, "memory"),
+    [alertEvents, markerRows]
+  );
+  const markerSkewSecs = Math.round(
+    Math.max(cpuMarkers.maxSkewMs, memoryMarkers.maxSkewMs) / 1000
+  );
+  const markerOutside = cpuMarkers.outside + memoryMarkers.outside;
 
   // 曲线的来源必须写在脸上：跨重启回填的点是 10 s（或按桶均值）采样，
   // 与实时链路的 1 s 点混在一张图上，不标注就会让人误读分辨率。
@@ -146,6 +172,8 @@ export function OverviewTab({
             gradientId="colorCpu"
             yMax={100}
             unitFormatter={(v) => `${v.toFixed(1)}%`}
+            markers={cpuMarkers.markers}
+            markerSkewMs={cpuMarkers.maxSkewMs}
           />
         </Col>
         <Col span={12}>
@@ -157,9 +185,27 @@ export function OverviewTab({
             yMax={100}
             gradientId="colorMemory"
             unitFormatter={(v) => `${v.toFixed(1)}%`}
+            markers={memoryMarkers.markers}
+            markerSkewMs={memoryMarkers.maxSkewMs}
           />
         </Col>
       </Row>
+
+      {(cpuMarkers.markers.length > 0 ||
+        memoryMarkers.markers.length > 0 ||
+        markerOutside > 0) && (
+        <Row style={{ marginTop: 8 }}>
+          <Col span={24}>
+            <Text type="secondary" style={{ fontSize: 12 }}>
+              竖线是该指标已触发的告警时刻，对齐到最近的采样点（本图定位误差 ≤{" "}
+              {markerSkewSecs} s）；同一格多条合成一根。
+              {markerOutside > 0 &&
+                ` 另有 ${markerOutside} 条落在当前趋势窗口之外，图上不画。`}
+              {" 磁盘告警不画在此图 —— 这两张图没有磁盘曲线。"}
+            </Text>
+          </Col>
+        </Row>
+      )}
 
       {cpu && cpu.perCore.length > 1 ? (
         <Row gutter={[16, 16]} style={{ marginTop: 16 }}>

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import {
   Alert,
   Badge,
@@ -16,6 +16,7 @@ import {
   theme,
 } from "antd";
 import {
+  BellOutlined,
   ClearOutlined,
   DashboardOutlined,
   FileSearchOutlined,
@@ -27,39 +28,39 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import {
   Commands,
-  describeError,
   MonitorEvent,
+  type AlertEvent,
   type CleanupResult,
   type DnsFlushResult,
   type JunkReport,
   type KillValidation,
   type LargeFile,
   type ProcessDetail,
-  type ProcessQuery,
   type ScanProgress,
   type StartupItem,
 } from "./ipc_contract";
+import { useAlerts } from "./hooks/useAlerts";
+import { usePrefs } from "./hooks/usePrefs";
+import { useProcessQuery } from "./hooks/useProcessQuery";
 import { useProcessStream } from "./hooks/useProcessStream";
 import { useSystemMonitor } from "./hooks/useSystemMonitor";
+import { alertText } from "./lib/alert";
+import { presentError } from "./lib/error_ui";
 import { formatBytes } from "./lib/format";
-import { HISTORY_LIMIT, TREND_RANGES } from "./lib/trend";
-import {
-  INTERVAL_OPTIONS,
-  PROCESS_PAGE_SIZE,
-  PREF,
-  cardBgGradient,
-  gradientText,
-} from "./lib/ui";
+import { HISTORY_LIMIT } from "./lib/trend";
+import { INTERVAL_OPTIONS, PREF, cardBgGradient, gradientText } from "./lib/ui";
+import { AlertSettingsDrawer } from "./components/AlertSettingsDrawer";
 import { CleanupConfirmModal } from "./components/CleanupConfirmModal";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import { KillConfirmModal } from "./components/KillConfirmModal";
+import { PrefsTransferModal } from "./components/PrefsTransferModal";
 import { ProcessDetailDrawer } from "./components/ProcessDetailDrawer";
 import { CleanupTab } from "./components/tabs/CleanupTab";
 import { DiskTab } from "./components/tabs/DiskTab";
 import { LargeFileTab } from "./components/tabs/LargeFileTab";
 import { NetworkTab } from "./components/tabs/NetworkTab";
 import { OverviewTab } from "./components/tabs/OverviewTab";
-import { ProcessTab, type ProcessSortState } from "./components/tabs/ProcessTab";
+import { ProcessTab } from "./components/tabs/ProcessTab";
 import { StartupTab } from "./components/tabs/StartupTab";
 import { SystemInfoTab } from "./components/tabs/SystemInfoTab";
 
@@ -67,50 +68,63 @@ const { Header, Content } = Layout;
 const { Title, Text } = Typography;
 
 function App() {
-  const [darkMode, setDarkMode] = useState(() => localStorage.getItem(PREF + "dark") === "1");
-  const [intervalMs, setIntervalMs] = useState(() => {
-    const saved = Number(localStorage.getItem(PREF + "interval"));
-    // 只认下拉里真存在的档位：陌生值虽会被后端夹取，但界面拿它算"停滞"阈值就永远不会报停滞
-    return INTERVAL_OPTIONS.some((o) => o.value === saved) ? saved : 1000;
-  });
-  const [activeTab, setActiveTab] = useState(() => {
-    const saved = localStorage.getItem(PREF + "tab");
-    return saved ?? "overview";
-  });
-  const [trendRange, setTrendRange] = useState<number>(() => {
-    const saved = Number(localStorage.getItem(PREF + "trendRange"));
-    return TREND_RANGES.some((r) => r.value === saved) ? saved : 60;
-  });
+  const {
+    darkMode,
+    setDarkMode,
+    intervalMs,
+    setIntervalMs,
+    trendRange,
+    setTrendRange,
+    activeTab,
+    setActiveTab,
+    alertConfig,
+    setAlertConfig,
+    prefsSnapshot,
+    applyPrefs,
+  } = usePrefs();
   const [msgApi, msgContext] = message.useMessage();
 
-  useEffect(() => {
-    localStorage.setItem(PREF + "dark", darkMode ? "1" : "0");
-  }, [darkMode]);
-  useEffect(() => {
-    localStorage.setItem(PREF + "interval", String(intervalMs));
-  }, [intervalMs]);
-  useEffect(() => {
-    localStorage.setItem(PREF + "trendRange", String(trendRange));
-  }, [trendRange]);
+  // 失败一律经 presentError：按后端 code 决定级别，"进程已退出"这类不该报成红色故障。
+  const reportError = useCallback(
+    (context: string, e: unknown, onStale?: () => void) => {
+      const notice = presentError(e, context);
+      msgApi[notice.level](notice.message);
+      if (notice.staleData) onStale?.();
+    },
+    [msgApi]
+  );
 
   const { staticInfo, snapshot, history, status, seedInfo } = useSystemMonitor(
     HISTORY_LIMIT,
     intervalMs
   );
-  const [processKeyword, setProcessKeyword] = useState("");
-  const [processSort, setProcessSort] = useState<ProcessSortState>({ by: "cpu", desc: true });
-  const [processPage, setProcessPage] = useState(1);
-  const processQuery = useMemo<ProcessQuery>(
-    () => ({
-      keyword: processKeyword.trim().toLowerCase(),
-      sortBy: processSort.by,
-      desc: processSort.desc,
-      offset: (processPage - 1) * PROCESS_PAGE_SIZE,
-      limit: PROCESS_PAGE_SIZE,
-    }),
-    [processKeyword, processSort, processPage]
-  );
+  const {
+    query: processQuery,
+    keyword: processKeyword,
+    sort: processSort,
+    page: processPage,
+    changeKeyword: changeProcessKeyword,
+    changeSort: changeProcessSort,
+    changePage: changeProcessPage,
+  } = useProcessQuery();
   const processes = useProcessStream(activeTab === "processes", processQuery);
+
+  // 阈值只有一条链：面板改动 → usePrefs 落盘 → useAlerts 下发 → 后端回夹取后的生效值覆盖输入框
+  const alertNotice = useCallback(
+    (event: AlertEvent) => {
+      const text = alertText(event);
+      if (event.level === "critical") {
+        msgApi.error(text, 6);
+      } else {
+        msgApi.warning(text, 6);
+      }
+    },
+    [msgApi]
+  );
+  const alerts = useAlerts(alertConfig, alertNotice, setAlertConfig);
+  const [alertPanelOpen, setAlertPanelOpen] = useState(false);
+  // 偏好导入/导出（T5-11）：入口在"系统信息"页，弹层渲染在树尾，故页签白名单取自 tabItems
+  const [prefsPanelOpen, setPrefsPanelOpen] = useState(false);
 
   const [junkReport, setJunkReport] = useState<JunkReport | null>(null);
   const [selectedJunkIds, setSelectedJunkIds] = useState<string[]>([]);
@@ -150,7 +164,8 @@ function App() {
       .catch((e) => {
         if (stale) return;
         setDetail(null);
-        msgApi.error(`读取进程详情失败：${describeError(e)}`);
+        // 进程已退出（PID_NOT_FOUND）时顺带关掉抽屉，别留一个读不到东西的空抽屉
+        reportError("读取进程详情", e, () => setDetailPid(null));
       })
       .finally(() => {
         if (!stale) setDetailLoading(false);
@@ -158,7 +173,7 @@ function App() {
     return () => {
       stale = true;
     };
-  }, [detailPid, msgApi]);
+  }, [detailPid, reportError]);
 
   // 采集频率交给后端，避免前后端两套节奏。
   useEffect(() => {
@@ -169,8 +184,8 @@ function App() {
         diskIntervalMs: 10000,
         paused: false,
       },
-    }).catch((e) => msgApi.warning(`设置采集频率失败：${describeError(e)}`));
-  }, [intervalMs, msgApi]);
+    }).catch((e) => reportError("设置采集频率", e));
+  }, [intervalMs, reportError]);
 
   const scanJunk = useCallback(async () => {
     setScanning(true);
@@ -201,14 +216,14 @@ function App() {
         );
       }
     } catch (e) {
-      msgApi.error(`扫描失败：${describeError(e)}`);
+      reportError("扫描垃圾文件", e);
     } finally {
       unlisten?.();
       setScanning(false);
       setScanProgress(null);
       setCancelRequested(false);
     }
-  }, [msgApi]);
+  }, [msgApi, reportError]);
 
   // 取消只置一个标志位，由扫描线程在下一个检查点自己停下（T3-09）。
   const cancelJunkScan = useCallback(async () => {
@@ -221,9 +236,9 @@ function App() {
         msgApi.warning("当前没有进行中的扫描");
       }
     } catch (e) {
-      msgApi.error(`取消失败：${describeError(e)}`);
+      reportError("取消扫描", e);
     }
-  }, [msgApi]);
+  }, [msgApi, reportError]);
 
   const doCleanup = useCallback(async () => {
     if (selectedJunkIds.length === 0) {
@@ -246,11 +261,11 @@ function App() {
       }
       await scanJunk();
     } catch (e) {
-      msgApi.error(`清理失败：${describeError(e)}`);
+      reportError("清理垃圾文件", e);
     } finally {
       setCleaning(false);
     }
-  }, [msgApi, scanJunk, selectedJunkIds]);
+  }, [msgApi, reportError, scanJunk, selectedJunkIds]);
 
   const scanLargeFiles = useCallback(async () => {
     setScanningLarge(true);
@@ -268,11 +283,11 @@ function App() {
       }
     } catch (e) {
       setLargeFiles([]);
-      msgApi.error(`扫描失败：${describeError(e)}`);
+      reportError("扫描大文件", e);
     } finally {
       setScanningLarge(false);
     }
-  }, [largeFileMinSize, msgApi]);
+  }, [largeFileMinSize, msgApi, reportError]);
 
   const loadStartupItems = useCallback(async () => {
     setLoadingStartup(true);
@@ -280,11 +295,11 @@ function App() {
       setStartupItems(await invoke<StartupItem[]>(Commands.getStartupItems));
     } catch (e) {
       setStartupItems([]);
-      msgApi.error(`加载失败：${describeError(e)}`);
+      reportError("加载启动项", e);
     } finally {
       setLoadingStartup(false);
     }
-  }, [msgApi]);
+  }, [msgApi, reportError]);
 
   const flushDns = useCallback(async () => {
     try {
@@ -297,9 +312,9 @@ function App() {
         );
       }
     } catch (e) {
-      msgApi.error(`刷新失败：${describeError(e)}`);
+      reportError("刷新 DNS 缓存", e);
     }
-  }, [msgApi]);
+  }, [msgApi, reportError]);
 
   // 结束进程：先向后端要真实进程名与风险级别，再决定确认强度。
   const requestKill = useCallback(
@@ -313,10 +328,10 @@ function App() {
         setKillConfirmText("");
         setKillTarget(validation);
       } catch (e) {
-        msgApi.error(`校验失败：${describeError(e)}`);
+        reportError("校验结束请求", e, () => processes.refresh());
       }
     },
-    [msgApi]
+    [msgApi, processes, reportError]
   );
 
   const confirmKill = useCallback(async () => {
@@ -335,24 +350,11 @@ function App() {
       setKillTarget(null);
       processes.refresh();
     } catch (e) {
-      msgApi.error(`结束失败：${describeError(e)}`);
+      reportError("结束进程", e, () => processes.refresh());
     } finally {
       setKilling(false);
     }
-  }, [killTarget, msgApi, processes]);
-
-  // 关键字或排序变化后回到第一页：否则偏移会落在新结果集的空段上。
-  const changeProcessKeyword = useCallback((value: string) => {
-    setProcessKeyword(value);
-    setProcessPage(1);
-  }, []);
-  const changeProcessSort = useCallback((next: ProcessSortState) => {
-    setProcessSort(next);
-    setProcessPage(1);
-  }, []);
-  const changeProcessPage = useCallback((next: number) => {
-    setProcessPage(Math.max(1, next));
-  }, []);
+  }, [killTarget, msgApi, processes, reportError]);
 
   const tabItems = [
     {
@@ -367,6 +369,7 @@ function App() {
             trendRange={trendRange}
             onTrendRangeChange={setTrendRange}
             seedInfo={seedInfo}
+            alertEvents={alerts.events}
           />
         </ErrorBoundary>
       ),
@@ -473,7 +476,11 @@ function App() {
       label: "系统信息",
       children: (
         <ErrorBoundary label="系统信息页">
-          <SystemInfoTab staticInfo={staticInfo} snapshot={snapshot} />
+          <SystemInfoTab
+            staticInfo={staticInfo}
+            snapshot={snapshot}
+            onTransferPrefs={() => setPrefsPanelOpen(true)}
+          />
         </ErrorBoundary>
       ),
     },
@@ -532,6 +539,27 @@ function App() {
                 ? `${staticInfo.hostname} | ${staticInfo.osName} ${staticInfo.osVersion}`
                 : "读取系统信息…"}
             </Text>
+            <Tooltip
+              title={
+                alertConfig.enabled
+                  ? `连续 ${alertConfig.consecutive} 帧越限才报；本会话 ${alerts.recentCount} 条，含落盘历史共 ${alerts.events.length} 条`
+                  : "告警处于静默：不再判定，也不会补报"
+              }
+            >
+              <Badge count={alerts.events.length} size="small" offset={[-2, 2]}>
+                <Button
+                  icon={<BellOutlined />}
+                  style={{ borderRadius: 6 }}
+                  onClick={() => {
+                    setAlertPanelOpen(true);
+                    // 打开面板才回读落盘文件：告警是低频事件，没必要为此每秒起一次 IPC
+                    alerts.refreshHistory();
+                  }}
+                >
+                  告警阈值
+                </Button>
+              </Badge>
+            </Tooltip>
             <Select
               size="small"
               value={intervalMs}
@@ -585,6 +613,15 @@ function App() {
           onConfirm={doCleanup}
         />
 
+        <AlertSettingsDrawer
+          open={alertPanelOpen}
+          onClose={() => setAlertPanelOpen(false)}
+          config={alertConfig}
+          onChange={setAlertConfig}
+          snapshot={snapshot}
+          alerts={alerts}
+        />
+
         <ProcessDetailDrawer
           pid={detailPid}
           detail={detail}
@@ -601,6 +638,15 @@ function App() {
           onCancel={() => setKillTarget(null)}
           onConfirm={confirmKill}
           afterClose={() => setKillConfirmText("")}
+        />
+
+        <PrefsTransferModal
+          open={prefsPanelOpen}
+          onClose={() => setPrefsPanelOpen(false)}
+          snapshot={prefsSnapshot}
+          tabs={tabItems.map((item) => item.key)}
+          onApply={applyPrefs}
+          onNotice={(level, text) => msgApi[level](text)}
         />
       </Layout>
     </ConfigProvider>

@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use walkdir::WalkDir;
 
 /// 清理与扫描的落地根目录：只有家目录与临时目录之下才允许删除。
-fn allowed_roots() -> Vec<PathBuf> {
+pub(crate) fn allowed_roots() -> Vec<PathBuf> {
     let mut roots = vec![std::env::temp_dir()];
     if let Some(home) = dirs::home_dir() {
         roots.push(home);
@@ -38,7 +38,9 @@ const DENIED_PREFIXES: &[&str] = &[
     "C:\\Program Files",
 ];
 
-fn is_denied(path: &Path) -> bool {
+/// 黑名单判定也供偏好读写复用（T5-11）：能扫描的位置和能落配置文件的位置用的是同一份"受保护"定义，
+/// 两边各写一份必然漂移。
+pub(crate) fn is_denied(path: &Path) -> bool {
     let text = path.to_string_lossy();
     DENIED_PREFIXES.iter().any(|prefix| {
         if prefix.starts_with('/') || prefix.starts_with("C:") {
@@ -50,7 +52,7 @@ fn is_denied(path: &Path) -> bool {
     })
 }
 
-fn under_allowed_root(canonical: &Path) -> bool {
+pub(crate) fn under_allowed_root(canonical: &Path) -> bool {
     allowed_roots().iter().filter_map(|r| r.canonicalize().ok()).any(|root| canonical.starts_with(&root))
 }
 

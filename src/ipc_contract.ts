@@ -238,6 +238,20 @@ export interface AppErrorPayload {
   detail?: string | null;
 }
 
+/**
+ * 后端 `error.rs` 的构造器集合，两边必须一一对应。
+ * 由 `error_codes_match_the_frontend_ipc_contract` 逐条核对（含"后端有构造器但前端没分支"和反向）。
+ */
+export const AppErrorCode = {
+  permissionDenied: "PERMISSION_DENIED",
+  notFound: "NOT_FOUND",
+  processNotFound: "PID_NOT_FOUND",
+  pathDenied: "PATH_DENIED",
+  invalidInput: "INVALID_INPUT",
+  commandFailed: "COMMAND_FAILED",
+  unsupported: "UNSUPPORTED",
+} as const;
+
 export interface DnsFlushResult {
   flushed: boolean;
   message: string;
@@ -245,11 +259,104 @@ export interface DnsFlushResult {
   manualCommand: string | null;
 }
 
+/**
+ * 告警契约（T5-01）。判定全在后端 `alert.rs`：前端只是配置的生产者和事件消费者，
+ * 这样"连续 N 帧"的口径不会因为页面切换 / 前端节流而变形。
+ */
+export type AlertMetric = "cpu" | "memory" | "disk";
+export type AlertLevel = "warning" | "critical";
+
+export interface AlertThresholds {
+  warning: number;
+  critical: number;
+}
+
+/** 阈值配置；`set_alert_config` 返回的是后端夹取后真正生效的值 */
+export interface AlertConfig {
+  enabled: boolean;
+  /** 连续多少帧越限才触发，1 表示第一帧即触发；后端范围 1~60 */
+  consecutive: number;
+  /** 同一告警的最小重复推送间隔（秒）；后端上限 86400 */
+  cooldownSecs: number;
+  cpu: AlertThresholds;
+  memory: AlertThresholds;
+  disk: AlertThresholds;
+}
+
+/** `sys://alert` 载荷 */
+export interface AlertEvent {
+  metric: AlertMetric;
+  level: AlertLevel;
+  /** 触发帧的实际值（百分比） */
+  value: number;
+  /** 被越过的那一档阈值（百分比） */
+  threshold: number;
+  /** 磁盘告警的挂载点；CPU / 内存为 null */
+  target: string | null;
+  /** 触发时的连续越限帧数 */
+  consecutive: number;
+  timestampMs: number;
+}
+
+/**
+ * `get_alert_history` 载荷（T5-03）：已落盘的告警，按时间倒序。
+ *
+ * `storedEvents` 与 `totalEvents` 必须分开看：前者是"这次窗口里有几条"，
+ * 后者是"文件里现存几条"。只给一个数就会让界面把"这条盘只留了 7 天"说成"从来没发生过告警"。
+ * `storedEvents` 可能大于 `events.length` —— 后端对**列表**做了截断（只给最近的若干条），
+ * 但窗口里的真实条数照常报，界面据此说"另有 N 条未列出"。
+ * `oldestMs`/`newestMs` 描述的是**窗口内**的时间戳，窗口为空时是 `null`（不是省略、也不是 0）。
+ */
+export interface AlertHistoryPage {
+  events: AlertEvent[];
+  spanSeconds: number;
+  storedEvents: number;
+  totalEvents: number;
+  oldestMs: number | null;
+  newestMs: number | null;
+  unreadableLines: number;
+}
+
+/**
+ * 偏好导入/导出（T5-11）。后端 `prefs.rs` 只管落盘边界（路径、体积、原子写、格式身份），
+ * 把 `prefs` 当一个不透明对象透传 —— 值的合法性口径仍然只在 `lib/prefs_file.ts` 一处。
+ * 因此这里的 `prefs` 是 `Record<string, unknown>`：文件是用户可编辑的，不能假装它一定合契约。
+ */
+export interface PrefsSnapshot {
+  darkMode: boolean;
+  intervalMs: number;
+  trendRangeSecs: number;
+  activeTab: string;
+  alert: AlertConfig;
+}
+
+/** `export_prefs_file` 载荷：偏好的 5 项，不含任何路径 / 进程 / 主机信息 */
+export interface PrefsExportOutcome {
+  /** 真正写入的路径（`~` 已展开、符号链接已解析） */
+  path: string;
+  bytes: number;
+  keys: number;
+  schemaVersion: number;
+}
+
+/** `import_prefs_file` 载荷：只证明"认得出这份文件"，不代表值可用 */
+export interface PrefsImportOutcome {
+  path: string;
+  bytes: number;
+  schemaVersion: number;
+  exportedAtMs: number | null;
+  prefs: Record<string, unknown>;
+  /** 文件自带的项数（归一化之前），与"实际采纳了几项"对比才能说清"另有 N 项被忽略" */
+  fileKeys: number;
+}
+
 export const MonitorEvent = {
   metrics: "sys://metrics",
   processes: "sys://processes",
   /** 垃圾扫描进度帧，仅 scan_junk_files 运行期间推送 */
   cleanupScanProgress: "sys://cleanup-scan-progress",
+  /** 阈值告警（T5-01），后端只在连续超限那一帧推一次，冷却窗口内不重复 */
+  alert: "sys://alert",
 } as const;
 
 export const Commands = {
@@ -272,6 +379,16 @@ export const Commands = {
   cleanupJunkFiles: "cleanup_junk_files",
   findLargeFiles: "find_large_files_cmd",
   getStartupItems: "get_startup_items_cmd",
+  /** 读取后端真正生效的告警阈值（T5-01） */
+  getAlertConfig: "get_alert_config",
+  /** 下发告警阈值，返回后端夹取后的生效值 */
+  setAlertConfig: "set_alert_config",
+  /** 读已落盘的告警历史（T5-03），返回按时间倒序的一页 */
+  getAlertHistory: "get_alert_history",
+  /** 把当前偏好写成 JSON 文件（T5-11）；路径来自系统保存框，后端只认用户可写位置 */
+  exportPrefsFile: "export_prefs_file",
+  /** 读回一份偏好文件（T5-11）；只校验格式与来源，值仍由前端白名单归一化 */
+  importPrefsFile: "import_prefs_file",
 } as const;
 
 /** 把 invoke/listen 抛出的任意值归一化为可读文案 */
@@ -289,4 +406,13 @@ export function isAppErrorCode(e: unknown, code: string): boolean {
   return (
     !!e && typeof e === "object" && (e as Partial<AppErrorPayload>).code === code
   );
+}
+
+/** 把 invoke 抛出的值认成 AppError；非结构化错误（无 IPC 通道、网络层抛错）返回 null */
+export function asAppError(e: unknown): AppErrorPayload | null {
+  if (!e || typeof e !== "object") return null;
+  const payload = e as Partial<AppErrorPayload>;
+  return typeof payload.code === "string" && typeof payload.message === "string"
+    ? (payload as AppErrorPayload)
+    : null;
 }

@@ -1,13 +1,18 @@
-import { Alert, Card, Col, Row, Statistic } from "antd";
+import { Alert, Button, Card, Col, Divider, Row, Space, Statistic, Typography } from "antd";
 import type { MetricsSnapshot, StaticInfo } from "../../ipc_contract";
 import { formatGb, formatUptime, usageColor } from "../../lib/format";
+
+const { Text } = Typography;
 
 export function SystemInfoTab({
   staticInfo,
   snapshot,
+  onTransferPrefs,
 }: {
   staticInfo: StaticInfo | null;
   snapshot: MetricsSnapshot | null;
+  /** 打开偏好导入/导出弹层（T5-11）。入口放这里，弹层本体在 App 的树尾 */
+  onTransferPrefs: () => void;
 }) {
   const memory = snapshot?.memory;
   return (
@@ -61,6 +66,16 @@ export function SystemInfoTab({
       ) : (
         <Alert type="info" showIcon title="正在读取系统信息…" />
       )}
+
+      <Divider style={{ margin: "16px 0" }} />
+      <Space align="center" wrap>
+        <Text type="secondary">
+          这几项界面设置（主题、采集间隔、趋势窗口、默认页签、告警阈值）可以导成一份 JSON 备份或换机导入。
+        </Text>
+        <Button size="small" onClick={onTransferPrefs}>
+          偏好导入 / 导出
+        </Button>
+      </Space>
     </Card>
   );
 }
