@@ -1065,30 +1065,22 @@ mod tests {
         let mut collector = Collector::new();
         // 只写 64 MiB：本机 Data 卷可用不足 4 GB，探针必须小体量、且结束即删。
         let probe = std::env::temp_dir().join("zsys-iostat-probe.bin");
-        {
-            let mut f = std::fs::File::create(&probe).unwrap();
-            let chunk = vec![7u8; 4 * 1024 * 1024];
-            for _ in 0..16 {
-                f.write_all(&chunk).unwrap();
-                f.sync_all().unwrap();
-            }
-        }
-        std::fs::remove_file(&probe).ok();
-
-        let mut sum_written = 0.0f64;
-        let mut sum_read = 0.0f64;
         for i in 0..8 {
             std::thread::sleep(Duration::from_millis(1000));
-            let frames = collector.disk_metrics(Duration::from_millis(1000));
-            for d in &frames {
-                if d.mount_point == "/" {
-                    sum_read += d.read_bytes_per_sec.unwrap_or(0.0);
-                    sum_written += d.write_bytes_per_sec.unwrap_or(0.0);
+            if i == 3 {
+                let mut f = std::fs::File::create(&probe).unwrap();
+                let chunk = vec![7u8; 4 * 1024 * 1024];
+                for _ in 0..16 {
+                    f.write_all(&chunk).unwrap();
+                    f.sync_all().unwrap();
                 }
+                drop(f);
+                std::fs::remove_file(&probe).ok();
             }
+            let frames = collector.disk_metrics(Duration::from_millis(1000));
             println!(
                 "T={} FRAME {} {}",
-                crate::monitor::epoch_ms(),
+                epoch_ms(),
                 i,
                 frames
                     .iter()
@@ -1106,15 +1098,7 @@ mod tests {
                     .join(" | ")
             );
         }
-        stop.store(true, Ordering::Relaxed);
-        let chunks = writer.join().unwrap();
-        println!(
-            "WROTE_CHUNKS {} = {:.0} MiB ; / frames avg read={:.0} MB/s written={:.0} MB/s",
-            chunks,
-            chunks as f64 * 8.0 / 1024.0,
-            sum_read / 8.0,
-            sum_written / 8.0
-        );
+        std::fs::remove_file(&probe).ok();
     }
 
     #[test]
