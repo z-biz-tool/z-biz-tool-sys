@@ -53,7 +53,58 @@ pub(crate) fn is_denied(path: &Path) -> bool {
 }
 
 pub(crate) fn under_allowed_root(canonical: &Path) -> bool {
-    allowed_roots().iter().filter_map(|r| r.canonicalize().ok()).any(|root| canonical.starts_with(&root))
+    allowed_roots().iter().filter_map(|r| canonicalize_clean(r).ok()).any(|root| canonical.starts_with(&root))
+}
+
+/// Windows 的 canonical 形式（`\\?\C:\Users\...`）会绕过按字符串前缀判定的黑名单：
+/// `\\?\C:\Windows` 并不以 `C:\Windows` 开头，于是"受保护位置"在 Windows 上形同虚设。
+/// 这里把 verbatim 前缀统一剥掉，让黑名单与界面回显都拿到同一种写法。
+/// 只剥盘符式（`\\?\C:\…`）；`\\?\UNC\…` 之类改了会指向别处，原样留着。
+fn strip_verbatim(path: PathBuf) -> PathBuf {
+    let Some(text) = path.to_str() else {
+        // 非 UTF-8 的路径不参与改写：宁可留着前缀，也不要用有损转换重建路径
+        return path;
+    };
+    let Some(rest) = text.strip_prefix(r"\\?\") else {
+        return path;
+    };
+    let bytes = rest.as_bytes();
+    let drive_form = bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'\\';
+    if drive_form {
+        PathBuf::from(rest)
+    } else {
+        path
+    }
+}
+
+/// 生产代码里唯一允许的 canonicalize 入口：结果一律剥掉 verbatim 前缀，
+/// 这样黑名单（按字符串前缀）与白名单（按 `starts_with`）两侧才是同一种形式。
+pub(crate) fn canonicalize_clean(path: &Path) -> std::io::Result<PathBuf> {
+    path.canonicalize().map(strip_verbatim)
+}
+
+#[cfg(test)]
+mod verbatim_tests {
+    use super::strip_verbatim;
+    use std::path::PathBuf;
+
+    /// 纯字符串处理，所以在任何平台上都能验 —— Windows 腿跑的就是这条断言的形状。
+    #[test]
+    fn the_verbatim_drive_prefix_is_stripped_and_nothing_else_moves() {
+        assert_eq!(strip_verbatim(PathBuf::from(r"\\?\C:\Users\a")), PathBuf::from(r"C:\Users\a"));
+        // 只认盘符式
+        assert_eq!(strip_verbatim(PathBuf::from(r"\\?\UNC\srv\share\x")), PathBuf::from(r"\\?\UNC\srv\share\x"));
+        assert_eq!(strip_verbatim(PathBuf::from(r"\\?\Global\x")), PathBuf::from(r"\\?\Global\x"));
+        // 非 verbatim 原样返回
+        assert_eq!(strip_verbatim(PathBuf::from(r"C:\Users\a")), PathBuf::from(r"C:\Users\a"));
+    }
+
+    /// 这条是"黑名单为什么会被绕过"的证据：剥前缀之后才谈得上前缀匹配。
+    #[test]
+    fn a_verbatim_windows_path_still_hits_the_deny_list() {
+        let denied = super::is_denied(&strip_verbatim(PathBuf::from(r"\\?\C:\Windows\System32")));
+        assert!(denied, "剥掉 verbatim 前缀后 C:\\Windows 必须落进黑名单");
+    }
 }
 
 /// 把 `~` / `~/x` 展开为真实家目录；后端是唯一能做这件事的地方。
@@ -83,8 +134,7 @@ pub fn resolve_scan_path(raw: Option<&str>) -> CommandResult<PathBuf> {
     if !candidate.exists() {
         return Err(AppError::not_found(format!("路径不存在: {}", crate::log_sanitize::sanitize(&candidate.to_string_lossy()))));
     }
-    let canonical = candidate
-        .canonicalize()
+    let canonical = canonicalize_clean(&candidate)
         .map_err(|e| AppError::failed(format!("无法解析路径: {}", e)))?;
     if is_denied(&canonical) {
         return Err(AppError::path_denied("该目录属于系统或受保护位置，不允许扫描"));
@@ -103,7 +153,7 @@ fn approved_cleanup_root(declared: &str) -> Option<PathBuf> {
     if !path.exists() {
         return None;
     }
-    let canonical = path.canonicalize().ok()?;
+    let canonical = canonicalize_clean(&path).ok()?;
     if is_denied(&canonical) || !under_allowed_root(&canonical) {
         return None;
     }

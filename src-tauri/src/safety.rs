@@ -374,7 +374,12 @@ mod tests {
 
     #[test]
     fn protection_lists_are_lowercase_free_of_duplicates() {
-        assert!(is_protected("launchd") || cfg!(windows));
+        // 名单本身是**按平台**分的（Windows 侧没有 launchd），所以"大小写不敏感"这件事
+        // 拿本平台必然在册的第一项当探针，而不是把某个平台的名字当成全平台事实。
+        let probe = PROTECTED_NAMES[0];
+        assert!(is_protected(&probe.to_uppercase()), "{probe} 的大写形式必须同样命中");
+        assert!(is_protected(&probe.to_lowercase()), "{probe} 的小写形式必须同样命中");
+        #[cfg(not(windows))]
         assert!(is_protected("LAUNCHD"));
         assert!(is_critical("Finder"));
         assert!(!is_critical("Safari"));

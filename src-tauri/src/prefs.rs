@@ -4,7 +4,7 @@
 //! 写必须是原子的。偏好值的**语义**（哪个值算合法）仍然只在浏览器一侧判 —— `usePrefs`
 //! 已经有一套白名单，后端再实现一套就等于有两个口径，迟早漂移。
 //! 因此 `prefs` 字段对后端是一个不透明的 JSON 对象。
-use crate::cleanup::{expand_tilde, is_denied, under_allowed_root};
+use crate::cleanup::{canonicalize_clean, expand_tilde, is_denied, under_allowed_root};
 use crate::error::{AppError, CommandResult};
 use crate::log_sanitize::sanitize;
 use serde::{Deserialize, Serialize};
@@ -67,7 +67,7 @@ fn extra_writable_roots() -> Vec<PathBuf> {
         .iter()
         .map(PathBuf::from)
         // macOS 的 /tmp 是指向 /private/tmp 的符号链接，比较前先折成真实路径
-        .map(|root| root.canonicalize().unwrap_or(root))
+        .map(|root| canonicalize_clean(&root).unwrap_or(root))
         .filter(|root| root.is_dir())
         .collect()
 }
@@ -102,7 +102,7 @@ fn resolve_json_path(raw: &str, must_exist: bool) -> CommandResult<PathBuf> {
     let parent = expanded
         .parent()
         .ok_or_else(|| AppError::invalid_input("路径缺少所在目录"))?;
-    let canonical_parent = parent.canonicalize().map_err(|_| {
+    let canonical_parent = canonicalize_clean(parent).map_err(|_| {
         AppError::not_found(format!("目录不存在或不可访问: {}", sanitize(&parent.to_string_lossy())))
     })?;
     let canonical = canonical_parent.join(file_name);
@@ -234,7 +234,9 @@ mod tests {
         ));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).expect("临时目录必须建得出来");
-        dir.canonicalize().expect("临时目录要能 canonicalize")
+        // 与生产侧同一个 canonicalize：Windows 上 `\\?\` verbatim 前缀会被命令剥掉，
+        // 夹具留着它只会比出"差一个前缀"的假失败。
+        canonicalize_clean(&dir).expect("临时目录要能 canonicalize")
     }
 
     fn cleanup(dir: &std::path::Path) {

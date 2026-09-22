@@ -672,8 +672,26 @@ mod tests {
             std::thread::sleep(Duration::from_millis(220));
         }
 
-        assert_eq!(fired.len(), 1, "只有内存越限，应恰好一条: {fired:?}");
-        let memory = &fired[0];
+        // 满载机器上 CPU 真的会顶到 100.0，而阈值夹在 1..=100 —— 于是"钉在 100 % 就当它不会触发"
+        // 是错的（本仓并发编译时这条连续三轮都红）。仍然要能抓住串字段：内存恰好一条，
+        // 其它任何一条都只能是"值确实顶到自家阈值"的 CPU 事件，磁盘在 100 % 下永不出场。
+        let memory: Vec<_> = fired
+            .iter()
+            .filter(|e| e.metric == AlertMetric::Memory)
+            .collect();
+        assert_eq!(memory.len(), 1, "内存必然越限，应恰好一条: {fired:?}");
+        for extra in fired.iter().filter(|e| e.metric != AlertMetric::Memory) {
+            assert_eq!(
+                extra.metric,
+                AlertMetric::Cpu,
+                "磁盘阈值钉在 100 % 却出了磁盘事件，说明读串了字段: {extra:?}"
+            );
+            assert!(
+                extra.value >= 100.0,
+                "CPU 事件只有在真实到顶时才允许出现: {extra:?}"
+            );
+        }
+        let memory = &memory[0];
         assert_eq!(memory.metric, AlertMetric::Memory);
         assert_eq!(
             memory.value,
