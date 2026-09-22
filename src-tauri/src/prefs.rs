@@ -10,7 +10,7 @@ use crate::log_sanitize::sanitize;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// 文件里带一个来源标识：拿别的应用导出的 JSON 进来，应当在认文件时就拒掉，
 /// 而不是静默改本应用的行为。
@@ -55,6 +55,29 @@ pub struct ImportOutcome {
     pub file_keys: usize,
 }
 
+/// 偏好读写比 `cleanup::allowed_roots()` 再宽一点点的目录。
+///
+/// macOS 上 `temp_dir()` 拿到的是 per-user 的 `$TMPDIR`（`/var/folders/.../T/`），
+/// 而用户在保存框里很容易落到全局 `/tmp` —— 真机验证时就在这里被自己拦下过。
+/// 这份列表**只给偏好读写用**：清理模块的删除白名单不引它，多一个可写目录
+/// 不等于多一个可删目录。外部卷也不放开（宁可让用户换个位置，也不给渲染进程
+/// 一个能往 U 盘写文件的口子）。
+fn extra_writable_roots() -> Vec<PathBuf> {
+    ["/tmp", "/private/tmp"]
+        .iter()
+        .map(PathBuf::from)
+        // macOS 的 /tmp 是指向 /private/tmp 的符号链接，比较前先折成真实路径
+        .map(|root| root.canonicalize().unwrap_or(root))
+        .filter(|root| root.is_dir())
+        .collect()
+}
+
+fn prefs_root_allowed(dir: &Path) -> bool {
+    under_allowed_root(dir)
+        || dirs::home_dir().map(|home| dir.starts_with(&home)).unwrap_or(false)
+        || extra_writable_roots().iter().any(|root| dir.starts_with(root))
+}
+
 /// 校验并解析一个 `.json` 目标路径。
 ///
 /// 目标文件本身可以还不存在（导出到新文件名），但**所在目录必须能 canonicalize** ——
@@ -87,11 +110,10 @@ fn resolve_json_path(raw: &str, must_exist: bool) -> CommandResult<PathBuf> {
     if is_denied(&canonical) {
         return Err(AppError::path_denied("该位置属于系统或受保护目录，不能读写偏好文件"));
     }
-    let in_home = dirs::home_dir()
-        .map(|home| canonical.starts_with(&home))
-        .unwrap_or(false);
-    if !(under_allowed_root(&canonical_parent) || in_home) {
-        return Err(AppError::path_denied("只能读写用户主目录或临时目录之下的偏好文件"));
+    if !prefs_root_allowed(&canonical_parent) {
+        return Err(AppError::path_denied(
+            "只能在用户主目录或临时目录（含 /tmp）之下读写偏好文件",
+        ));
     }
 
     if must_exist {
@@ -265,6 +287,23 @@ mod tests {
         );
         assert!(PathBuf::from(&out.path).exists());
         cleanup(&dir);
+    }
+
+    /// 真机验证踩到的坑：macOS 的 `temp_dir()` 是 per-user 的 `$TMPDIR`
+    /// （`/var/folders/.../T`），用户在保存框里选 `/tmp/xxx.json` 时会被自己拦成 PATH_DENIED。
+    #[test]
+    fn the_global_tmp_dir_is_writable_even_though_it_is_not_temp_dir() {
+        let dir = match Path::new("/tmp").canonicalize() {
+            Ok(dir) if dir.is_dir() => dir,
+            _ => return, // 没有全局 /tmp 的平台不需要这条豁免
+        };
+        let target = dir.join(format!("zsys-t511-{}.json", std::process::id()));
+        let out = write_prefs_file(&target.to_string_lossy(), json!({ "darkMode": true }))
+            .expect("/tmp 之下的偏好文件必须能写");
+        assert!(PathBuf::from(&out.path).exists(), "返回的路径要就是真正落盘那一条");
+        let back = read_prefs_file(&target.to_string_lossy()).expect("/tmp 之下也要能读回来");
+        assert_eq!(back.prefs, json!({ "darkMode": true }));
+        let _ = fs::remove_file(&target);
     }
 
     #[test]

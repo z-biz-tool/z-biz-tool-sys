@@ -1,3 +1,4 @@
+mod agent;
 mod alert;
 mod cleanup;
 mod commands;
@@ -58,6 +59,7 @@ pub fn run() {
             commands::get_startup_items_cmd,
             commands::export_prefs_file,
             commands::import_prefs_file,
+            commands::agent_query,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

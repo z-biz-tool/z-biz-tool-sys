@@ -350,6 +350,55 @@ export interface PrefsImportOutcome {
   fileKeys: number;
 }
 
+/**
+ * 诊断 Agent（T5-04 / T5-05 / T5-06）。判定全在后端 `agent.rs`，前端只渲染。
+ *
+ * 边界写在类型上（04 文档 S4：Agent 只建议、不执行）：
+ * `AgentSuggestion` 只有"打开页签""定位进程"两种，没有命令 / 参数 / 路径字段可填；
+ * `executed` 恒为 false，前端也不得因为收到回复就调用任何破坏性命令。
+ */
+export type AgentIntent =
+  | "rankProcesses"
+  | "diagnoseSlowness"
+  | "memoryPressure"
+  | "diskSpace"
+  | "networkThroughput"
+  | "startupItems"
+  | "junkFiles"
+  | "temperature"
+  | "unknown";
+export type AgentRankBy = "cpu" | "memory";
+export type AgentSeverity = "info" | "warning" | "critical";
+export type AgentMetric = "cpu" | "memory" | "disk" | "network" | "process";
+
+export interface AgentFinding {
+  metric: AgentMetric;
+  /** 已脱敏的人话结论 */
+  text: string;
+  /** 度量值；后端没有来源时为 null，界面显示 `—` 而不是 0 */
+  value: string | null;
+  level: AgentSeverity;
+}
+
+/** 预定义操作模板的全部种类：`tab` 对应 App.tsx 的页签 key */
+export type AgentSuggestion =
+  | { kind: "openTab"; tab: string; label: string }
+  | { kind: "focusProcess"; pid: number; name: string; label: string };
+
+/** `agent_query` 载荷 */
+export interface AgentReply {
+  query: string;
+  intent: AgentIntent;
+  /** 仅 `intent === "rankProcesses"` 时有值 */
+  rankBy: AgentRankBy | null;
+  /** true 表示这句话被认成"要我代执行"，已拒绝，结论与建议为空 */
+  refused: boolean;
+  findings: AgentFinding[];
+  suggestions: AgentSuggestion[];
+  notes: string[];
+  executed: boolean;
+}
+
 export const MonitorEvent = {
   metrics: "sys://metrics",
   processes: "sys://processes",
@@ -389,6 +438,8 @@ export const Commands = {
   exportPrefsFile: "export_prefs_file",
   /** 读回一份偏好文件（T5-11）；只校验格式与来源，值仍由前端白名单归一化 */
   importPrefsFile: "import_prefs_file",
+  /** 诊断 Agent 问答（T5-04）；只读，返回结论与待确认的导航建议，永不执行 */
+  agentQuery: "agent_query",
 } as const;
 
 /** 把 invoke/listen 抛出的任意值归一化为可读文案 */

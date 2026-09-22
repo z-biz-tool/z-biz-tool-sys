@@ -4,7 +4,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use sysinfo::{
-    CpuRefreshKind, Disks, MemoryRefreshKind, Networks, ProcessesToUpdate, RefreshKind, System,
+    CpuRefreshKind, Disks, MemoryRefreshKind, Networks, ProcessRefreshKind, ProcessesToUpdate,
+    RefreshKind, System, UpdateKind,
 };
 use tauri::{AppHandle, Emitter};
 
@@ -16,6 +17,8 @@ const MAX_PROCESSES_PER_PAGE: usize = 300;
 const DEFAULT_PROCESS_PAGE_SIZE: usize = 50;
 /// 进程表在此时间内视为可信，避免每次 kill 校验都全量枚举。
 const PROCESS_CACHE_TTL: Duration = Duration::from_secs(10);
+/// 一次性采集时两次采样之间的间隔：太短会让空闲进程算成 0，太长拖着 IPC。
+const WARM_SAMPLE_MS: u64 = 260;
 
 // ==================== 契约数据类型 ====================
 
@@ -498,10 +501,73 @@ impl Default for Collector {
 
 // ==================== 进程采集 ====================
 
-/// 进程采集独立于指标采集：枚举成本高，单独低频循环。
+/// 进程表/排行榜的采样项：只要内存和 CPU 占用。
+///
+/// 刻意不取 `cmd` / `environ` / `root` —— `ProcessRefreshKind::everything()` 会把命令行参数与
+/// 环境变量一并读进来（sysinfo 0.33.1 `common/system.rs` 的 `everything()` 里 `cmd`/`environ`
+/// 都是 `UpdateKind::OnlyIfNotSet`），直接违反 04 文档"不采集命令行参数与环境变量"那条口径。
+/// 也不取 `exe` / `cwd`：3 s 一次的进程流用不到路径，全量枚举时能省掉逐进程的路径读取。
+/// 连 sysinfo 自己的默认口径都不要 —— `refresh_processes()` 等价于
+/// `nothing().with_memory().with_cpu().with_disk_usage().with_exe(OnlyIfNotSet)`，多读磁盘 I/O
+/// 与可执行路径，而且那份口径由依赖决定、升级就会变；只有把要读的东西逐条列出来，
+/// "不采集路径/参数/环境"才是可证的，而不是碰巧成立。
+/// 公开是给 `commands.rs` 的兜底路径用 —— 任何走 `refresh_processes()` 的地方都会退回宽口径。
+pub fn process_refresh_kind() -> ProcessRefreshKind {
+    ProcessRefreshKind::nothing().with_memory().with_cpu()
+}
+
+/// 进程详情一次性读取的采样项：抽屉里要展示可执行路径和工作目录，所以在这两项上放宽，
+/// `cmd` / `environ` 仍然一律不读。
+fn detail_refresh_kind() -> ProcessRefreshKind {
+    process_refresh_kind()
+        .with_exe(UpdateKind::Always)
+        .with_cwd(UpdateKind::Always)
+}
+
+/// 进程枚举独立于指标采集：枚举成本高，单独低频循环。
+///
+/// H-06：sysinfo 的进程 CPU 是**跨采样差值**，一个冷 `System` 需要三次触碰才有数
+/// （建表 → 填 `old_*` 基准 → 取差值）。实测：`System::new()` 每 300 ms 刷三次 =
+/// `[0.0, 0.0, 113.2]`，而 `System::new_with_specifics(带进程项)` 的构造本身就完成了
+/// "建表"，同样三次 = `[0.0, 105.6, 110.3]`。此前一次性路径（`get_processes` 兜底、
+/// 进程详情、Agent 排行榜）只 `System::new()` + 刷一两次，于是 CPU 恒为 0；
+/// 排序断言 `>=` 在全 0 上照样成立，所以旧测试一个都没抓到。
+/// 用这个构造器 + 后续两次带间隔的采样即可拿到真实差值。
+pub fn process_system() -> System {
+    System::new_with_specifics(
+        RefreshKind::nothing().with_processes(process_refresh_kind()),
+    )
+}
+
+/// 一次性采集的**唯一**正确姿势：建表（构造）→ 填基准 → 留出间隔 → 取差值。
+/// 三步收在一个函数里，免得每个调用方各自排、排错就成了全 0（H-06）。
+pub fn collect_processes_warmed(raw_query: &ProcessQuery) -> ProcessPage {
+    let mut sys = process_system();
+    sys.refresh_processes_specifics(ProcessesToUpdate::All, true, process_refresh_kind());
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_millis(WARM_SAMPLE_MS) {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    collect_processes(&mut sys, true, raw_query)
+}
+
+/// 全机器排行榜前 N（Agent 用）：走完整三步暖机，不带关键字、不受用户分页影响。
+/// 刻意不复用进程表的缓存页 —— 那一页带着用户当前的关键字和分页，
+/// 拿它排行会把"在当前这 30 条里最高"说成"整台机器最高"。
+pub fn collect_top(by: ProcessSort, limit: usize) -> Vec<ProcessInfo> {
+    let query = ProcessQuery {
+        keyword: String::new(),
+        sort_by: by,
+        desc: true,
+        offset: 0,
+        limit,
+    };
+    collect_processes_warmed(&query).items
+}
+
 pub fn collect_processes(sys: &mut System, warmed: bool, raw_query: &ProcessQuery) -> ProcessPage {
     let query = raw_query.normalized();
-    sys.refresh_processes(ProcessesToUpdate::All, true);
+    sys.refresh_processes_specifics(ProcessesToUpdate::All, true, process_refresh_kind());
 
     let mut rows: Vec<ProcessInfo> = sys
         .processes()
@@ -549,8 +615,9 @@ pub fn lookup_process(pid: u32) -> Option<ProcessSummary> {
         }
     }
 
-    let mut sys = System::new();
-    sys.refresh_processes(ProcessesToUpdate::All, true);
+    // 走窄口径而不是 `refresh_processes()`：后者会逐进程读 exe 路径，这条兜底路径用不到。
+    let mut sys = process_system();
+    sys.refresh_processes_specifics(ProcessesToUpdate::All, true, process_refresh_kind());
     let key = sysinfo::Pid::from_u32(pid);
     sys.processes().get(&key).map(|p| ProcessSummary {
         name: {
@@ -591,8 +658,17 @@ fn non_empty_path(p: Option<&std::path::Path>) -> Option<String> {
 
 /// 详情是一次性读取，不进 3s 事件流：全量枚举一次 ~700 进程约几十毫秒，只在点击时发生。
 pub fn collect_process_detail(pid: u32) -> Option<ProcessDetail> {
-    let mut sys = System::new();
-    sys.refresh_processes(ProcessesToUpdate::All, true);
+    // 详情口径带 exe / cwd（抽屉要展示这两项），仍然不带 cmd / environ。
+    let mut sys = System::new_with_specifics(
+        RefreshKind::nothing().with_processes(detail_refresh_kind()),
+    );
+    // H-06：构造只完成"建表"，CPU 还要一次填基准、一次取差值 —— 只采一次的话抽屉里是 0。
+    sys.refresh_processes_specifics(ProcessesToUpdate::All, true, detail_refresh_kind());
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_millis(WARM_SAMPLE_MS) {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    sys.refresh_processes_specifics(ProcessesToUpdate::All, true, detail_refresh_kind());
     let proc_info = sys.processes().get(&sysinfo::Pid::from_u32(pid))?;
     let raw_name = proc_info.name();
     Some(ProcessDetail {
@@ -902,7 +978,7 @@ async fn run_process_loop(
     process_query_gen: Arc<AtomicUsize>,
     process_page_gen: Arc<AtomicUsize>,
 ) {
-    let mut sys = System::new();
+    let mut sys = process_system();
     let mut warmed = false;
 
     loop {
@@ -918,7 +994,11 @@ async fn run_process_loop(
 
         // 刚开启时先用一个短间隔暖机，让 CPU 列立刻可信。
         if !warmed {
-            sys.refresh_processes(ProcessesToUpdate::All, true);
+            sys.refresh_processes_specifics(
+                ProcessesToUpdate::All,
+                true,
+                process_refresh_kind(),
+            );
             tokio::time::sleep(Duration::from_millis(350)).await;
             warmed = true;
         }
@@ -963,7 +1043,9 @@ async fn run_process_loop(
                 }
             }
             Err(_) => {
-                sys = System::new();
+                // 重建必须走 `process_system()`：`System::new()` 会把 CPU 基准一起丢掉，
+                // 于是此后第一帧又是全 0（H-06 的同一条坑）。
+                sys = process_system();
                 warmed = false;
             }
         }
@@ -1142,8 +1224,8 @@ mod tests {
 
     #[test]
     fn process_collection_is_sorted_and_truncated() {
-        let mut sys = System::new();
-        // 两次采样才能得到真实进程 CPU。
+        let mut sys = process_system();
+        // 第一条是"填基准"的采样，第二条才是取差值的那条（H-06）。
         collect_processes(&mut sys, false, &ProcessQuery::default());
         let page = collect_processes(&mut sys, true, &ProcessQuery::default());
         assert!(page.total > 5);
@@ -1166,6 +1248,50 @@ mod tests {
             },
         );
         assert!(beyond.items.is_empty());
+    }
+
+    /// H-06 回归：进程 CPU 必须采到**真实差值**。
+    /// 冷 `System` 的 CPU 要"建表 → 填基准 → 取差值"三步，少一步就整列 0；
+    /// 而上面那条排序断言 `>=` 在全 0 上照样成立，所以旧测试一个都抓不到 —— 这条用本机负载把它钉住。
+    #[test]
+    fn per_process_cpu_is_actually_sampled() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let burn = {
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let mut acc: u64 = 0;
+                while !stop.load(Ordering::Relaxed) {
+                    acc = acc.wrapping_mul(31).wrapping_add(7);
+                    std::hint::black_box(acc);
+                }
+            })
+        };
+
+        // 关键字是纯数字时 `matches` 按 PID 精确命中，结果里只有自己这一行。
+        let me = std::process::id();
+        let page = collect_processes_warmed(&ProcessQuery {
+            keyword: me.to_string(),
+            sort_by: ProcessSort::Cpu,
+            desc: true,
+            ..Default::default()
+        });
+        stop.store(true, Ordering::Relaxed);
+        let _ = burn.join();
+
+        let mine = page
+            .items
+            .iter()
+            .find(|p| p.pid == me)
+            .unwrap_or_else(|| panic!("按 PID 检索没命中自己 {me}：{:?}", page.items));
+        assert!(
+            mine.cpu_usage > 0.0,
+            "进程 CPU 没采到真实差值（实际 {}）：三步暖机被改坏了",
+            mine.cpu_usage
+        );
+        assert!(mine.memory_bytes > 0, "内存必须同时有来源：{mine:?}");
     }
 
     fn row(pid: u32, name: &str, cpu_usage: f64, memory_bytes: u64) -> ProcessInfo {
@@ -1307,6 +1433,128 @@ mod tests {
         assert!(
             !service.processes_match_query(),
             "查询变更后、采集线程产出新帧之前，缓存必须判为过期，否则 get_processes 会返回上一次的关键字"
+        );
+    }
+
+    /// 取出 `export const NAME = <数字>;` 里的数字（`name` 需自带结尾的 ` =`）。
+    fn ts_number(name: &str, src: &str) -> usize {
+        src.split(name)
+            .nth(1)
+            .unwrap_or_default()
+            .trim_start()
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect::<String>()
+            .parse::<usize>()
+            .unwrap_or_else(|_| panic!("前端 {name} 不是数字"))
+    }
+
+    /// T5-10 把页容量交给用户选，选项表在前端 `lib/ui.ts`、上限在后端。
+    /// 后端会静默夹取越界的 `limit`，于是"前端显示 500 行/页、实际按 300 取"这种错位
+    /// 只能靠这条契约锁住 —— 和前端的 prefs 契约测试同一思路：不改代码就必须在测试里对齐。
+    #[test]
+    fn frontend_page_sizes_stay_inside_the_backend_cap() {
+        let ui_ts = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../src/lib/ui.ts"),
+        )
+        .expect("前端 lib/ui.ts 必须存在");
+        let list = ui_ts
+            .split("PROCESS_PAGE_SIZE_OPTIONS")
+            .nth(1)
+            .and_then(|rest| rest.split('[').nth(1))
+            .and_then(|inner| inner.split(']').next())
+            .expect("PROCESS_PAGE_SIZE_OPTIONS 必须是数字数组");
+        let options: Vec<usize> = list
+            .split(',')
+            .map(|s| s.trim().parse::<usize>().expect("页容量选项必须是整数"))
+            .collect();
+        assert!(!options.is_empty(), "页容量选项不能为空");
+        for size in &options {
+            assert!(
+                *size >= 1 && *size <= MAX_PROCESSES_PER_PAGE,
+                "页容量 {size} 越过后端上限 {MAX_PROCESSES_PER_PAGE}，会被 normalized() 静默夹取"
+            );
+        }
+
+        // 名称以 `= ` 收尾锁定声明处：PROCESS_PAGE_SIZE 是 PROCESS_PAGE_SIZE_OPTIONS 的前缀，
+        // 直接按名字切会先撞上选项表那一行。
+        let default_page_size = ts_number("PROCESS_PAGE_SIZE =", &ui_ts);
+        assert!(
+            options.contains(&default_page_size),
+            "默认页容量 {default_page_size} 不在选项表 {options:?} 里"
+        );
+
+        let virtual_threshold = ts_number("PROCESS_VIRTUAL_THRESHOLD =", &ui_ts);
+        let largest_option = *options.iter().max().unwrap();
+        assert!(
+            virtual_threshold >= default_page_size && virtual_threshold < largest_option,
+            "虚拟滚动阈值 {virtual_threshold} 必须让默认 {default_page_size} 行整页渲染、\
+             又让最大页容量 {largest_option} 行走虚拟窗口"
+        );
+    }
+
+    /// T5-07 的迷你模式只允许是"已有帧的另一种排布"。这条审计钉住三件事：
+    /// ① 组件自己不开任何通路 —— 多一条采集链路就会让同一个指标出现两套节奏，而"再给它加个
+    ///    专用接口"正是这类紧凑视图最自然的膨胀方向；
+    /// ② 不落 localStorage —— 迷你开关刻意只是会话级，不进 T5-11 那份 5 项快照（快照字段
+    ///    由 Rust/TS 契约测试对齐，加第 6 项等于改偏好文件的语义）；
+    /// ③ "哪块盘"与"趋势窗口"复用同一份函数，不在这里复刻第二套口径 —— 后端只按一份规则
+    ///    挑最满的分区，界面就不能自己再算一次，否则会出现"告警报的盘"和"迷你条上的盘"不是一块。
+    #[test]
+    fn mini_menubar_is_a_pure_projection_of_existing_streams() {
+        let mini =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../src/components/MiniMenuBar.tsx");
+        let src = std::fs::read_to_string(&mini).expect("MiniMenuBar.tsx 必须存在");
+        for forbidden in [
+            "invoke(",
+            "@tauri-apps/api",
+            "Commands.",
+            "fetch(",
+            "new EventSource",
+            "localStorage",
+            "d.totalBytes > 0",
+            "getCurrentWindow",
+            "setSize",
+        ] {
+            assert!(
+                !src.contains(forbidden),
+                "迷你模式里出现了不该有的通路 {forbidden}（{}）",
+                mini.display()
+            );
+        }
+        for required in [
+            "busiestDisk(",
+            "windowHistory(",
+            "downsampleHistory(",
+            "onExit",
+        ] {
+            assert!(
+                src.contains(required),
+                "迷你模式应复用同一份口径或出口 {required}"
+            );
+        }
+    }
+
+    /// 迷你模式与主界面共用 `App` 里那份状态。这两个接线断掉都不会报错，只会静默变慢或误触：
+    /// 进程流不在迷你模式下停下，就等于看不见的表还在 3 秒枚举一次全机器进程；
+    /// 快捷键不避开输入焦点，进程表搜索框里打一个 `m` 就会把界面切走。
+    #[test]
+    fn mini_mode_is_wired_into_the_process_stream_and_the_key_guard() {
+        let app = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../src/App.tsx"),
+        )
+        .expect("src/App.tsx 必须存在");
+        assert!(
+            app.contains("activeTab === \"processes\" && !miniMode"),
+            "进入迷你模式时要让进程流停下（useProcessStream 的 active 参数），否则看不见的表仍在 3 秒枚举一次"
+        );
+        assert!(
+            app.contains("isContentEditable"),
+            "键盘切换迷你模式要跳过正在输入的目标"
+        );
+        assert!(
+            app.contains("<ErrorBoundary label=\"迷你模式\">"),
+            "迷你模式要有自己的错误边界，不能让它抛错时整个界面塌掉"
         );
     }
 }

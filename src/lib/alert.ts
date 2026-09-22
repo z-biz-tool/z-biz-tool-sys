@@ -1,4 +1,12 @@
-import type { AlertConfig, AlertEvent, AlertLevel, AlertMetric, AlertThresholds } from "../ipc_contract";
+import type {
+  AlertConfig,
+  AlertEvent,
+  AlertLevel,
+  AlertMetric,
+  AlertThresholds,
+  DiskMetrics,
+  MetricsSnapshot,
+} from "../ipc_contract";
 
 /**
  * 告警阈值的默认值与前端侧归一化（T5-01）。
@@ -29,6 +37,20 @@ export const ALERT_LEVEL_LABELS: Record<AlertLevel, string> = {
 };
 
 export const ALERT_METRIC_ORDER: AlertMetric[] = ["cpu", "memory", "disk"];
+
+/**
+ * 界面上"磁盘"这一项指的是哪一块：只看可用且有容量的分区里最满的那一块。
+ *
+ * 这条规则与后端 `alert.rs` 的判定口径一致，所以告警面板与迷你读数条都从这里取 ——
+ * 两处各写一份 filter+max 迟早会漂移成"告警报的盘"和"界面上显示的盘"不是同一块。
+ * 拿不到时返回 `null`，由调用方显示 `—`，不返回一个 0 % 的假分区。
+ */
+export function busiestDisk(snapshot: MetricsSnapshot | null): DiskMetrics | null {
+  if (!snapshot) return null;
+  const usable = snapshot.disks.filter((d) => d.available && d.totalBytes > 0);
+  if (!usable.length) return null;
+  return usable.reduce((worst, d) => (d.usagePercent > worst.usagePercent ? d : worst));
+}
 
 const num = (value: unknown, fallback: number, min: number, max: number) =>
   typeof value === "number" && Number.isFinite(value) ? Math.min(max, Math.max(min, value)) : fallback;

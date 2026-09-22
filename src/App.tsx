@@ -18,9 +18,11 @@ import {
 import {
   BellOutlined,
   ClearOutlined,
+  CompressOutlined,
   DashboardOutlined,
   FileSearchOutlined,
   RocketOutlined,
+  RobotOutlined,
   SyncOutlined,
 } from "@ant-design/icons";
 import dayjs from "dayjs";
@@ -29,6 +31,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import {
   Commands,
   MonitorEvent,
+  type AgentReply,
   type AlertEvent,
   type CleanupResult,
   type DnsFlushResult,
@@ -53,8 +56,10 @@ import { AlertSettingsDrawer } from "./components/AlertSettingsDrawer";
 import { CleanupConfirmModal } from "./components/CleanupConfirmModal";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import { KillConfirmModal } from "./components/KillConfirmModal";
+import { MiniMenuBar } from "./components/MiniMenuBar";
 import { PrefsTransferModal } from "./components/PrefsTransferModal";
 import { ProcessDetailDrawer } from "./components/ProcessDetailDrawer";
+import { AgentPanel } from "./agent/AgentPanel";
 import { CleanupTab } from "./components/tabs/CleanupTab";
 import { DiskTab } from "./components/tabs/DiskTab";
 import { LargeFileTab } from "./components/tabs/LargeFileTab";
@@ -83,6 +88,10 @@ function App() {
     applyPrefs,
   } = usePrefs();
   const [msgApi, msgContext] = message.useMessage();
+  // 迷你模式（T5-07）：刻意只做会话级开关，不进 `usePrefs` 的那 5 项快照 ——
+  // 加第 6 项要动 `PrefsSnapshot` 的字段与 T5-11 的 Rust/TS 契约测试，而偏好文件的
+  // `schemaVersion` 仍是 1、且明确不做猜测式迁移，老文件里没有这一项反而是对的。
+  const [miniMode, setMiniMode] = useState(false);
 
   // 失败一律经 presentError：按后端 code 决定级别，"进程已退出"这类不该报成红色故障。
   const reportError = useCallback(
@@ -103,11 +112,19 @@ function App() {
     keyword: processKeyword,
     sort: processSort,
     page: processPage,
+    pageSize: processPageSize,
     changeKeyword: changeProcessKeyword,
     changeSort: changeProcessSort,
     changePage: changeProcessPage,
+    changePageSize: changeProcessPageSize,
+    correctPageToRange: correctProcessPage,
   } = useProcessQuery();
-  const processes = useProcessStream(activeTab === "processes", processQuery);
+  const processes = useProcessStream(activeTab === "processes" && !miniMode, processQuery);
+  // 结果集变小或页容量改大时，旧偏移会落到末尾之后 —— 后端只会给空的一页，界面得自己回到范围内
+  useEffect(() => correctProcessPage(processes.page.total), [
+    correctProcessPage,
+    processes.page.total,
+  ]);
 
   // 阈值只有一条链：面板改动 → usePrefs 落盘 → useAlerts 下发 → 后端回夹取后的生效值覆盖输入框
   const alertNotice = useCallback(
@@ -125,6 +142,10 @@ function App() {
   const [alertPanelOpen, setAlertPanelOpen] = useState(false);
   // 偏好导入/导出（T5-11）：入口在"系统信息"页，弹层渲染在树尾，故页签白名单取自 tabItems
   const [prefsPanelOpen, setPrefsPanelOpen] = useState(false);
+  // 诊断 Agent（T5-05）：面板本身零 IPC，问答只经这一条 `agent_query`；
+  // 一次问答一份回复，不轮询 —— 面板是"问一句答一句"，不是又一件事件流。
+  const [agentReply, setAgentReply] = useState<AgentReply | null>(null);
+  const [askingAgent, setAskingAgent] = useState(false);
 
   const [junkReport, setJunkReport] = useState<JunkReport | null>(null);
   const [selectedJunkIds, setSelectedJunkIds] = useState<string[]>([]);
@@ -356,6 +377,56 @@ function App() {
     }
   }, [killTarget, msgApi, processes, reportError]);
 
+  // 诊断 Agent（T5-04）：唯一的 IPC。后端返回的是"结论 + 待确认的导航建议"，
+  // 这里拿到什么就显示什么，不额外触发任何动作。
+  const askAgent = useCallback(
+    async (query: string) => {
+      setAskingAgent(true);
+      try {
+        const reply = await invoke<AgentReply>(Commands.agentQuery, { query });
+        // 后端承诺 executed 恒为 false；真出现 true 说明有一条执行通路漏了出来，直接拒显示。
+        if (reply.executed) {
+          setAgentReply(null);
+          msgApi.error("Agent 返回了\"已执行\"的状态，已拒绝显示这条结果");
+          return;
+        }
+        setAgentReply(reply);
+      } catch (e) {
+        reportError("诊断问答", e);
+      } finally {
+        setAskingAgent(false);
+      }
+    },
+    [msgApi, reportError]
+  );
+  // 建议卡片只有这两个落点：切页签、把 PID 填进进程表关键字（后端按 pid 精确匹配）。
+  const focusAgentProcess = useCallback(
+    (pid: number) => {
+      changeProcessKeyword(String(pid));
+      setActiveTab("processes");
+    },
+    [changeProcessKeyword, setActiveTab]
+  );
+
+  // 迷你模式的键盘入口：`M` 切进/切出，`Esc` 切出。三条守卫都是必要的 ——
+  // 进程表搜索框里打 m 不该换界面；弹层开着时 Esc 该归弹层自己关；带修饰键的组合留给系统。
+  const overlayOpen =
+    alertPanelOpen || prefsPanelOpen || cleanupConfirmOpen || detailPid !== null || killTarget !== null;
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (event.metaKey || event.ctrlKey || event.altKey || overlayOpen) return;
+      const node = event.target as HTMLElement | null;
+      const typing =
+        !!node &&
+        (node.isContentEditable || ["INPUT", "TEXTAREA", "SELECT"].includes(node.tagName));
+      if (typing) return;
+      if (event.key === "Escape") setMiniMode(false);
+      else if (event.key.toLowerCase() === "m") setMiniMode((prev) => !prev);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [overlayOpen]);
+
   const tabItems = [
     {
       key: "overview",
@@ -375,6 +446,25 @@ function App() {
       ),
     },
     {
+      key: "agent",
+      label: (
+        <span>
+          <RobotOutlined /> 诊断助手
+        </span>
+      ),
+      children: (
+        <ErrorBoundary label="诊断助手页">
+          <AgentPanel
+            reply={agentReply}
+            asking={askingAgent}
+            onAsk={askAgent}
+            onOpenTab={setActiveTab}
+            onFocusProcess={focusAgentProcess}
+          />
+        </ErrorBoundary>
+      ),
+    },
+    {
       key: "processes",
       label: `进程${processes.page.total ? ` (${processes.page.total})` : ""}`,
       children: (
@@ -389,6 +479,8 @@ function App() {
             onSortChange={changeProcessSort}
             pageNumber={processPage}
             offset={processQuery.offset}
+            pageSize={processPageSize}
+            onPageSizeChange={changeProcessPageSize}
             onPageChange={changeProcessPage}
             onRefresh={processes.refresh}
             onOpenDetail={setDetailPid}
@@ -499,6 +591,7 @@ function App() {
     >
       {msgContext}
       <Layout style={{ height: "100vh" }}>
+        {!miniMode && (
         <Header
           style={{
             background: cardBgGradient,
@@ -560,6 +653,15 @@ function App() {
                 </Button>
               </Badge>
             </Tooltip>
+            <Tooltip title="只显示关键指标（快捷键 M）。迷你模式不新增采集通路，也不动原生窗口尺寸。">
+              <Button
+                icon={<CompressOutlined />}
+                style={{ borderRadius: 6 }}
+                onClick={() => setMiniMode(true)}
+              >
+                迷你模式
+              </Button>
+            </Tooltip>
             <Select
               size="small"
               value={intervalMs}
@@ -584,8 +686,25 @@ function App() {
             </Popconfirm>
           </Space>
         </Header>
+        )}
 
-        <Content style={{ padding: 16, overflow: "auto" }}>
+        <Content style={{ padding: miniMode ? 0 : 16, overflow: miniMode ? "hidden" : "auto" }}>
+          {miniMode ? (
+            <ErrorBoundary label="迷你模式">
+            <MiniMenuBar
+              snapshot={snapshot}
+              status={status}
+              history={history}
+              trendRange={trendRange}
+              alertConfig={alertConfig}
+              latestAlert={alerts.events[0] ?? null}
+              intervalMs={intervalMs}
+              onIntervalChange={setIntervalMs}
+              onExit={() => setMiniMode(false)}
+            />
+            </ErrorBoundary>
+          ) : (
+            <>
           {status === "stalled" && (
             <Alert
               type="warning"
@@ -602,6 +721,8 @@ function App() {
             style={{ background: cardBgGradient, borderRadius: 16, overflow: "hidden" }}
             items={tabItems}
           />
+            </>
+          )}
         </Content>
 
         <CleanupConfirmModal

@@ -2,6 +2,7 @@ import { Alert, Divider, Drawer, InputNumber, Space, Switch, Typography } from "
 import {
   ALERT_METRIC_LABELS,
   ALERT_METRIC_ORDER,
+  busiestDisk,
   DEFAULT_ALERT_CONFIG,
 } from "../lib/alert";
 import type { AlertConfig, AlertMetric, AlertThresholds, MetricsSnapshot } from "../ipc_contract";
@@ -25,9 +26,7 @@ function currentValue(metric: AlertMetric, snapshot: MetricsSnapshot | null): nu
   if (!snapshot) return null;
   if (metric === "cpu") return snapshot.cpu.total;
   if (metric === "memory") return snapshot.memory.usagePercent;
-  const usable = snapshot.disks.filter((d) => d.available && d.totalBytes > 0);
-  if (!usable.length) return null;
-  return Math.max(...usable.map((d) => d.usagePercent));
+  return busiestDisk(snapshot)?.usagePercent ?? null;
 }
 
 export function AlertSettingsDrawer({ open, onClose, config, onChange, snapshot, alerts }: Props) {
@@ -113,21 +112,26 @@ export function AlertSettingsDrawer({ open, onClose, config, onChange, snapshot,
               <Text type="secondary" style={{ width: 84, display: "inline-block" }}>
                 当前 {value === null ? "—" : `${value.toFixed(1)} %`}
               </Text>
+              {/* antd 6 已废弃 InputNumber 的 addonBefore，标签只能自己摆（探针实测到该条 console error） */}
+              <Text type="secondary" style={{ fontSize: 12 }}>
+                警告 %
+              </Text>
               <InputNumber
                 min={1}
                 max={100}
                 value={config[metric].warning}
                 onChange={(v) => patchThresholds(metric, { warning: v ?? config[metric].warning })}
-                style={{ width: 88 }}
-                addonBefore="警告"
+                style={{ width: 64 }}
               />
+              <Text type="secondary" style={{ fontSize: 12 }}>
+                严重 %
+              </Text>
               <InputNumber
                 min={1}
                 max={100}
                 value={config[metric].critical}
                 onChange={(v) => patchThresholds(metric, { critical: v ?? config[metric].critical })}
-                style={{ width: 88 }}
-                addonBefore="严重"
+                style={{ width: 64 }}
               />
             </Space>
           );

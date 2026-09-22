@@ -1,3 +1,4 @@
+use crate::agent::{self, RankBy};
 use crate::cleanup::{
     cleanup_categories, find_large_files, get_startup_items, junk_scan_flags,
     request_cancel_junk_scan, resolve_scan_path, scan_junk_with_progress, CleanupResult, JunkReport,
@@ -5,12 +6,12 @@ use crate::cleanup::{
 };
 use crate::error::{AppError, CommandResult};
 use crate::monitor::{
-    self, MonitorConfig, MonitorService, ProcessPage, ProcessQuery, StaticInfo,
+    self, MonitorConfig, MonitorService, ProcessPage, ProcessQuery, ProcessSort, StaticInfo,
 };
 use crate::prefs;
 use crate::safety::{self, KillOutcome, KillValidation};
 use serde::Serialize;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tauri::{AppHandle, Emitter, State};
 
 const DEFAULT_KILL_GRACE_MS: u64 = 3000;
@@ -126,13 +127,7 @@ pub fn get_processes(state: State<'_, MonitorService>) -> ProcessPage {
         }
     }
 
-    let mut sys = sysinfo::System::new();
-    sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
-    let started = Instant::now();
-    while started.elapsed() < Duration::from_millis(260) {
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    monitor::collect_processes(&mut sys, true, &query)
+    monitor::collect_processes_warmed(&query)
 }
 
 /// 进程详情（点击进程行时按需读取，不进 3s 事件流）。
@@ -284,6 +279,82 @@ pub fn get_startup_items_cmd() -> Vec<StartupItem> {
     get_startup_items()
 }
 
+// ==================== 诊断 Agent（T5-04 / T5-05 / T5-06）====================
+
+/// 专供 Agent 的一次性采集：三步暖机 + 全量枚举 + 按指定键取前 N。
+/// 代价约 300 ms，只在用户主动点"问一问"时付，且只在结论真的需要排行榜时付。
+fn collect_ranked(by: RankBy) -> Vec<monitor::ProcessInfo> {
+    monitor::collect_top(
+        match by {
+            RankBy::Cpu => ProcessSort::Cpu,
+            RankBy::Memory => ProcessSort::Memory,
+        },
+        agent::MAX_RANK,
+    )
+}
+
+/// 两个榜一起取：并发跑，让"为什么这么卡"这类要双榜的意图不必付两份 300 ms。
+fn collect_ranks(need_cpu: bool, need_mem: bool) -> (Vec<monitor::ProcessInfo>, Vec<monitor::ProcessInfo>) {
+    match (need_cpu, need_mem) {
+        (true, true) => std::thread::scope(|s| {
+            let cpu = s.spawn(|| collect_ranked(RankBy::Cpu));
+            let mem = s.spawn(|| collect_ranked(RankBy::Memory));
+            (
+                cpu.join().unwrap_or_default(),
+                mem.join().unwrap_or_default(),
+            )
+        }),
+        (true, false) => (collect_ranked(RankBy::Cpu), Vec::new()),
+        (false, true) => (Vec::new(), collect_ranked(RankBy::Memory)),
+        (false, false) => (Vec::new(), Vec::new()),
+    }
+}
+
+/// 哪个意图要付哪个榜的采集成本 —— 磁盘/网速这类意图一行进程都不用枚举。
+fn rank_needs(parsed: &agent::Parsed) -> (bool, bool) {
+    match parsed.intent {
+        agent::Intent::RankProcesses => match parsed.rank_by {
+            Some(RankBy::Memory) => (false, true),
+            _ => (true, false),
+        },
+        agent::Intent::DiagnoseSlowness => (true, true),
+        agent::Intent::MemoryPressure => (false, true),
+        _ => (false, false),
+    }
+}
+
+/// 只读的诊断问答：输入自由文本，输出结论 + **待确认的导航建议**，不执行任何东西。
+/// 边界由 `agent` 模块的类型保证（无命令/参数/路径字段），这里也只调 `answer`。
+/// 采集是同步且要等采样窗口的，所以放到 `spawn_blocking`，别把窗口线程拖住。
+#[tauri::command]
+pub async fn agent_query(
+    state: State<'_, MonitorService>,
+    alert_state: State<'_, crate::alert::AlertState>,
+    query: String,
+) -> CommandResult<agent::Reply> {
+    let parsed = agent::parse(&query);
+    let snapshot = state.latest_metrics();
+    let alert = alert_state.get();
+    let (need_cpu, need_mem) = rank_needs(&parsed);
+    let (cpu_ranked, mem_ranked) = if need_cpu || need_mem {
+        tauri::async_runtime::spawn_blocking(move || collect_ranks(need_cpu, need_mem))
+            .await
+            .unwrap_or_else(|_| (Vec::new(), Vec::new()))
+    } else {
+        (Vec::new(), Vec::new())
+    };
+
+    Ok(agent::answer(
+        &query,
+        &agent::Input {
+            snapshot: snapshot.as_ref(),
+            cpu_ranked: &cpu_ranked,
+            mem_ranked: &mem_ranked,
+            alert: &alert,
+        },
+    ))
+}
+
 // ==================== 偏好导入/导出（T5-11）====================
 
 #[tauri::command]
@@ -374,5 +445,71 @@ mod tests {
             cleanup_junk_files(vec![]).unwrap_err().code,
             "INVALID_INPUT"
         );
+    }
+
+    /// Agent 的采集侧（T5-04）：真实机器上取一次排行榜，验证"独立采集 + 按键降序 + 条数上限"。
+    /// `agent.rs` 的测试用的是手搓切片，这里补的是"真的去 sysinfo 拿数据"那一段。
+    #[test]
+    fn agent_ranking_collection_returns_ordered_rows() {
+        let cpu = collect_ranked(crate::agent::RankBy::Cpu);
+        assert_eq!(cpu.len(), crate::agent::MAX_RANK, "应正好取回一页排行榜");
+        assert!(
+            cpu.windows(2).all(|w| w[0].cpu_usage >= w[1].cpu_usage),
+            "CPU 榜必须降序：{:?}",
+            cpu.iter().map(|p| (p.pid, p.cpu_usage)).collect::<Vec<_>>()
+        );
+        assert!(
+            cpu.iter().all(|p| !p.name.is_empty() && p.pid > 0),
+            "每一行都要有真实 PID 与名字"
+        );
+
+        let mem = collect_ranked(crate::agent::RankBy::Memory);
+        assert!(
+            mem.windows(2).all(|w| w[0].memory_bytes >= w[1].memory_bytes),
+            "内存榜必须降序：{:?}",
+            mem.iter()
+                .map(|p| (p.pid, p.memory_bytes))
+                .collect::<Vec<_>>()
+        );
+        // 两个榜的取样口径不同：内存榜首名的内存不应低于 CPU 榜首名的内存（同机器同量级）
+        assert!(mem[0].memory_bytes >= mem.last().unwrap().memory_bytes);
+    }
+
+    /// SEC-V10：命令层的 Agent 分节不许出现任何执行通路。
+    /// `agent.rs` 自己已经扫过一遍，这条补上另一头 —— 命令层拿得到 `kill_process`，
+    /// 所以它必须在源码层面就只调引擎的只读入口，而不是"看起来没调"。
+    #[test]
+    fn agent_command_section_has_no_execution_path() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/commands.rs"),
+        )
+        .unwrap();
+        let head = "// ==================== 诊断 Agent";
+        let start = src.find(head).expect("找不到 Agent 分节");
+        let rest = &src[start + head.len()..];
+        // 只扫到下一节标题为止：后面那些分节里本来就该有破坏性命令。
+        let section = match rest.find("// ====================") {
+            Some(offset) => &rest[..offset],
+            None => rest,
+        };
+        for forbidden in [
+            "kill_process",
+            "cleanup_junk_files",
+            "cancel_junk_scan",
+            "flush_dns_cache",
+            "Command::new",
+            "std::process::",
+            "std::fs::remove",
+            "std::fs::write",
+            "sudo",
+        ] {
+            assert!(
+                !section.contains(forbidden),
+                "Agent 分节里出现了执行通路 {forbidden}"
+            );
+        }
+        assert!(section.contains("agent::answer"), "Agent 分节没有转调引擎");
+        // 采集只允许走 monitor 的只读入口
+        assert!(section.contains("monitor::collect_top"));
     }
 }

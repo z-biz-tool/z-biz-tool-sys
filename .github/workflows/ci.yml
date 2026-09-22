@@ -1,0 +1,85 @@
+name: CI
+
+# 只做跨平台门禁（typecheck / 前端构建 / 测试 / clippy），不产出发布物 —— 发布仍由 build.yml 负责。
+# 刻意只在 pull_request 与手动触发上跑：本仓有直接向 main 推 WIP 的习惯，加 push 触发会让每次 WIP
+# 都占满三个 runner。
+on:
+  pull_request:
+  workflow_dispatch:
+
+# 这个 job 不写任何东西（不建 release、不传产物），所以权限收到最小。
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-latest
+            label: macOS-ARM
+          - platform: ubuntu-22.04
+            label: Linux
+          - platform: windows-latest
+            label: Windows
+
+    runs-on: ${{ matrix.platform }}
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies (Linux)
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libssl-dev libgtk-3-dev
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install npm dependencies
+        # npm ci 而非 npm install：package-lock.json 的 236 条 resolved 已全部指向 npmmirror，
+        # 锁文件自己就能定住源；install 允许与锁文件漂移，那样"CI 绿"就不对应任何一份确定的依赖树。
+        run: npm ci
+
+      - name: Typecheck
+        run: npx tsc --noEmit
+
+      - name: Build frontend
+        # 必须排在任何 cargo 步骤之前：dist 在 .gitignore 里，而 tauri-codegen 见
+        # tauri-codegen/src/context.rs —— frontendDist 目录不存在时直接 panic，
+        # 于是 `cargo test --lib` 在展开 `tauri::generate_context!()` 时就编不过。
+        run: npm run build
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+          targets: ${{ matrix.platform == 'macos-latest' && 'x86_64-apple-darwin' || '' }}
+
+      # 与 build.yml 里同一条 workaround：runner 上新版 token 会破坏 rust-toolchain 写出的 cargo config。
+      - name: Reset broken cargo config
+        run: rm -f "$HOME/.cargo/config.toml" "${USERPROFILE:-$HOME}/.cargo/config.toml"
+
+      - name: Run backend tests
+        run: cargo test --lib --manifest-path src-tauri/Cargo.toml
+
+      - name: Clippy
+        # 不加 `-D warnings`：只有 macOS 一侧实测过 0 warning，Linux/Windows 会有平台特有的
+        # （例如只在 cfg(unix) 下被调用的 helper 在 Windows 上算 dead_code）。在本机看不到那些
+        # 输出的情况下把 warning 升级成失败，等于交一条永远红、且没人能从本地开始查的 CI。
+        run: cargo clippy --all-targets --manifest-path src-tauri/Cargo.toml
+
+      # Intel 腿用交叉 check 而不是 macos-13 这台 Intel runner：镜像标签会被下线，且 check 不需要链接。
+      # 覆盖的是"能不能编过"，不含 Intel 上的运行时行为。
+      - name: Typecheck for x86_64-apple-darwin (Intel)
+        if: matrix.platform == 'macos-latest'
+        run: cargo check --target x86_64-apple-darwin --manifest-path src-tauri/Cargo.toml
