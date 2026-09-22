@@ -1,589 +1,773 @@
-import { useState, useEffect } from "react";
-import { ConfigProvider, theme, Layout, Card, Row, Col, Statistic, Switch, Space, Typography, Tabs, Table, Progress, Button, message, Tag, Popconfirm, Tooltip, InputNumber } from "antd";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import {
-  DashboardOutlined,
-  DesktopOutlined,
-  CloudOutlined,
-  HddOutlined,
-  WifiOutlined,
-  ReloadOutlined,
-  SettingOutlined,
-  DeleteOutlined,
-  SearchOutlined,
-  RocketOutlined,
+  Alert,
+  Badge,
+  Button,
+  Card,
+  Col,
+  ConfigProvider,
+  Input,
+  InputNumber,
+  Layout,
+  Modal,
+  Popconfirm,
+  Progress,
+  Row,
+  Select,
+  Space,
+  Statistic,
+  Switch,
+  Table,
+  Tabs,
+  Tag,
+  Tooltip,
+  Typography,
+  message,
+  theme,
+} from "antd";
+import {
   ClearOutlined,
+  CloudOutlined,
+  DashboardOutlined,
+  DeleteOutlined,
+  DesktopOutlined,
+  FileSearchOutlined,
+  HddOutlined,
+  ReloadOutlined,
+  RocketOutlined,
+  SearchOutlined,
   StopOutlined,
   SyncOutlined,
-  FileSearchOutlined,
+  WifiOutlined,
 } from "@ant-design/icons";
-import { XAxis, YAxis, CartesianGrid, Tooltip as ChartTooltip, ResponsiveContainer, AreaChart, Area } from "recharts";
-import { invoke } from "@tauri-apps/api/core";
+import {
+  Area,
+  AreaChart,
+  CartesianGrid,
+  ResponsiveContainer,
+  Tooltip as ChartTooltip,
+  XAxis,
+  YAxis,
+} from "recharts";
 import dayjs from "dayjs";
+import { invoke } from "@tauri-apps/api/core";
+import {
+  Commands,
+  describeError,
+  type CleanupResult,
+  type DnsFlushResult,
+  type JunkCategory,
+  type JunkReport,
+  type KillValidation,
+  type LargeFile,
+  type ProcessInfo,
+  type StartupItem,
+} from "./ipc_contract";
+import { useProcessStream } from "./hooks/useProcessStream";
+import { useSystemMonitor } from "./hooks/useSystemMonitor";
+import {
+  formatBytes,
+  formatGb,
+  formatPercent,
+  formatRate,
+  formatUptime,
+  usageColor,
+} from "./lib/format";
 
-// 渐变色主题常量
 const brandGradient = "linear-gradient(135deg, #667eea 0%, #764ba2 100%)";
-const cardBgGradient = "linear-gradient(135deg, rgba(102,126,234,0.04) 0%, rgba(118,75,162,0.04) 100%)";
+const cardBgGradient =
+  "linear-gradient(135deg, rgba(102,126,234,0.04) 0%, rgba(118,75,162,0.04) 100%)";
 
 const { Header, Content } = Layout;
 const { Title, Text } = Typography;
 
-// 类型定义
-interface JunkCategory {
-  id: string;
-  name: string;
-  description: string;
-  paths: string[];
-  size: number;
-  file_count: number;
-  risk_level: string;
-}
+const INTERVAL_OPTIONS = [
+  { value: 500, label: "0.5 秒" },
+  { value: 1000, label: "1 秒" },
+  { value: 2000, label: "2 秒" },
+  { value: 5000, label: "5 秒" },
+];
 
-interface JunkReport {
-  total_size: number;
-  total_files: number;
-  categories: JunkCategory[];
-  scan_time_ms: number;
-}
-
-interface CleanupResult {
-  freed_bytes: number;
-  deleted_files: number;
-  failed_files: number;
-  errors: string[];
-}
-
-interface LargeFile {
-  path: string;
-  size: number;
-  modified: number;
-  is_dir: boolean;
-}
-
-interface StartupItem {
-  id: string;
-  name: string;
-  command: string;
-  source: string;
-  enabled: boolean;
-  location: string;
-}
-
-// 工具函数：格式化字节
-const formatBytes = (bytes: number): string => {
-  if (bytes === 0) return "0 B";
-  const k = 1024;
-  const sizes = ["B", "KB", "MB", "GB", "TB"];
-  const i = Math.floor(Math.log(bytes) / Math.log(k));
-  return `${(bytes / Math.pow(k, i)).toFixed(2)} ${sizes[i]}`;
+const RISK_LABELS: Record<string, string> = {
+  safe: "安全",
+  moderate: "中等",
+  risky: "高风险",
 };
 
-// 模拟数据生成（CPU/内存趋势图）
-const generateMockData = (count: number) => {
-  const data = [];
-  const now = dayjs();
-  for (let i = count - 1; i >= 0; i--) {
-    data.push({
-      time: now.subtract(i, "second").format("HH:mm:ss"),
-      cpu: Math.random() * 100,
-      memory: 40 + Math.random() * 30,
-      disk: 60 + Math.random() * 10,
-      network: Math.random() * 1000,
-    });
-  }
-  return data;
+const gradientText = {
+  background: brandGradient,
+  WebkitBackgroundClip: "text",
+  WebkitTextFillColor: "transparent",
+} as const;
+
+const monitorCardStyle = {
+  borderRadius: 12,
+  background: cardBgGradient,
+  transition: "all 0.3s cubic-bezier(0.4, 0, 0.2, 1)",
 };
 
-// 模拟系统信息
-const mockSystemInfo = {
-  hostname: "zifang-macbook",
-  os: "macOS 15.0.1",
-  kernel: "Darwin 24.0.0",
-  uptime: "3天 12小时 45分钟",
-  cpuModel: "Apple M3 Pro",
-  cpuCores: 12,
-  totalMemory: 18.0,
-  usedMemory: 12.5,
-  diskTotal: 512.0,
-  diskUsed: 280.0,
-  networkInterfaces: [
-    { name: "en0", ip: "192.168.1.100", mac: "AA:BB:CC:DD:EE:FF", speed: 1000 },
-    { name: "en1", ip: "10.0.0.1", mac: "11:22:33:44:55:66", speed: 1000 },
-  ],
-};
+function riskColor(level: string): string {
+  if (level === "safe") return "green";
+  if (level === "moderate") return "orange";
+  if (level === "risky") return "red";
+  return "default";
+}
+
+function MetricCard({
+  icon,
+  title,
+  value,
+  unit,
+  percent,
+  footer,
+}: {
+  icon: React.ReactNode;
+  title: string;
+  value: string;
+  unit?: string;
+  percent?: number;
+  footer: React.ReactNode;
+}) {
+  return (
+    <Card size="small" className="monitor-card" style={monitorCardStyle}>
+      <div className="monitor-card-title" style={gradientText}>
+        {icon} {title}
+      </div>
+      <div className="monitor-card-value">
+        {value}
+        {unit ? <span className="monitor-card-unit">{unit}</span> : null}
+      </div>
+      {percent === undefined ? (
+        <div style={{ height: "8px" }} />
+      ) : (
+        <Progress
+          percent={Math.min(percent, 100)}
+          strokeColor={usageColor(percent, 80)}
+          showInfo={false}
+        />
+      )}
+      <Text type="secondary" style={{ fontSize: 12 }}>
+        {footer}
+      </Text>
+    </Card>
+  );
+}
+
+function TrendChart({
+  title,
+  data,
+  dataKey,
+  color,
+  gradientId,
+  yMax,
+  unitFormatter,
+}: {
+  title: string;
+  data: Array<Record<string, number | string>>;
+  dataKey: string;
+  color: string;
+  gradientId: string;
+  yMax?: number | "auto";
+  unitFormatter: (v: number) => string;
+}) {
+  return (
+    <Card
+      size="small"
+      className="monitor-card"
+      style={{ ...monitorCardStyle }}
+      title={<span style={{ ...gradientText, fontWeight: 600 }}>{title}</span>}
+    >
+      <ResponsiveContainer width="100%" height={200}>
+        <AreaChart data={data}>
+          <defs>
+            <linearGradient id={gradientId} x1="0" y1="0" x2="0" y2="1">
+              <stop offset="5%" stopColor={color} stopOpacity={0.8} />
+              <stop offset="95%" stopColor={color} stopOpacity={0} />
+            </linearGradient>
+          </defs>
+          <CartesianGrid strokeDasharray="3 3" />
+          <XAxis dataKey="time" tick={{ fontSize: 12 }} minTickGap={24} />
+          <YAxis domain={[0, yMax ?? "auto"]} tick={{ fontSize: 12 }} width={64} />
+          <ChartTooltip formatter={(v) => unitFormatter(Number(v))} />
+          <Area
+            type="monotone"
+            dataKey={dataKey}
+            stroke={color}
+            fill={`url(#${gradientId})`}
+            isAnimationActive={false}
+          />
+        </AreaChart>
+      </ResponsiveContainer>
+    </Card>
+  );
+}
 
 function App() {
   const [darkMode, setDarkMode] = useState(false);
-  const [systemInfo] = useState(mockSystemInfo);
-  const [monitorData, setMonitorData] = useState(generateMockData(60));
-const [refreshInterval] = useState(1);
+  const [intervalMs, setIntervalMs] = useState(1000);
   const [activeTab, setActiveTab] = useState("overview");
   const [msgApi, msgContext] = message.useMessage();
 
-  // 系统清理状态
+  const { staticInfo, snapshot, history, status } = useSystemMonitor(120, intervalMs);
+  const processes = useProcessStream(activeTab === "processes");
+
   const [junkReport, setJunkReport] = useState<JunkReport | null>(null);
   const [selectedJunkIds, setSelectedJunkIds] = useState<string[]>([]);
   const [scanning, setScanning] = useState(false);
   const [cleaning, setCleaning] = useState(false);
 
-  // 大文件状态
   const [largeFiles, setLargeFiles] = useState<LargeFile[]>([]);
   const [largeFileMinSize, setLargeFileMinSize] = useState<number>(100);
   const [scanningLarge, setScanningLarge] = useState(false);
 
-  // 启动项状态
   const [startupItems, setStartupItems] = useState<StartupItem[]>([]);
   const [loadingStartup, setLoadingStartup] = useState(false);
 
-  // 模拟实时数据更新
+  const [processFilter, setProcessFilter] = useState("");
+  const [killTarget, setKillTarget] = useState<KillValidation | null>(null);
+  const [killConfirmText, setKillConfirmText] = useState("");
+  const [killing, setKilling] = useState(false);
+
+  // 采集频率交给后端，避免前后端两套节奏。
   useEffect(() => {
-    const interval = setInterval(() => {
-      setMonitorData((prev) => {
-        const newData = [...prev.slice(1)];
-        const now = dayjs();
-        newData.push({
-          time: now.format("HH:mm:ss"),
-          cpu: Math.random() * 100,
-          memory: 40 + Math.random() * 30,
-          disk: 60 + Math.random() * 10,
-          network: Math.random() * 1000,
-        });
-        return newData;
-      });
-    }, refreshInterval * 1000);
+    invoke(Commands.setMonitorConfig, {
+      config: {
+        intervalMs,
+        processIntervalMs: 3000,
+        diskIntervalMs: 10000,
+        paused: false,
+      },
+    }).catch((e) => msgApi.warning(`设置采集频率失败：${describeError(e)}`));
+  }, [intervalMs, msgApi]);
 
-    return () => clearInterval(interval);
-  }, [refreshInterval]);
+  const cpu = snapshot?.cpu;
+  const memory = snapshot?.memory;
+  const networkTotal = useMemo(() => {
+    if (!snapshot) return { rx: 0, tx: 0, ipv4: null as string | null };
+    const active = snapshot.networks.filter((n) => n.status === "up" && n.ipv4);
+    const pool = active.length ? active : snapshot.networks;
+    return {
+      rx: pool.reduce((a, n) => a + n.rxBytesPerSec, 0),
+      tx: pool.reduce((a, n) => a + n.txBytesPerSec, 0),
+      ipv4: pool.find((n) => n.ipv4)?.ipv4 ?? null,
+    };
+  }, [snapshot]);
 
-  // 获取状态颜色
-  const getStatusColor = (value: number, threshold: number) => {
-    if (value >= threshold) return "#ff4d4f";
-    if (value >= threshold * 0.8) return "#faad14";
-    return "#52c41a";
-  };
+  const diskTotals = useMemo(() => {
+    const internal = snapshot?.disks.filter((d) => d.mountPoint === "/" || d.totalBytes > 0) ?? [];
+    const total = internal.reduce((a, d) => a + d.totalBytes, 0);
+    const used = internal.reduce((a, d) => a + d.usedBytes, 0);
+    return { total, used, percent: total > 0 ? (used / total) * 100 : 0 };
+  }, [snapshot]);
 
-  // 风险等级颜色
-  const getRiskColor = (level: string) => {
-    switch (level) {
-      case "safe":
-        return "green";
-      case "moderate":
-        return "orange";
-      case "risky":
-        return "red";
-      default:
-        return "default";
-    }
-  };
+  const chartData = useMemo(
+    () =>
+      history.map((p) => ({
+        time: dayjs(p.t).format("HH:mm:ss"),
+        cpu: Number(p.cpu.toFixed(2)),
+        memory: Number(p.memory.toFixed(2)),
+        network: Number(((p.rxBytesPerSec + p.txBytesPerSec) / 1024).toFixed(2)),
+        diskIo: 0,
+      })),
+    [history]
+  );
 
-  // 扫描垃圾文件
-  const scanJunk = async () => {
+  const visibleProcesses = useMemo(() => {
+    const keyword = processFilter.trim().toLowerCase();
+    const items = processes.page.items;
+    if (!keyword) return items;
+    return items.filter(
+      (p) => p.name.toLowerCase().includes(keyword) || String(p.pid) === keyword
+    );
+  }, [processes.page.items, processFilter]);
+
+  const scanJunk = useCallback(async () => {
     setScanning(true);
     try {
-      const report = await invoke<JunkReport>("scan_junk_files");
+      const report = await invoke<JunkReport>(Commands.scanJunkFiles);
       setJunkReport(report);
-      // 默认选中 safe 类别
       setSelectedJunkIds(
-        report.categories.filter((c) => c.risk_level === "safe").map((c) => c.id)
+        report.categories.filter((c) => c.riskLevel === "safe").map((c) => c.id)
       );
-      msgApi.success(`扫描完成：发现 ${formatBytes(report.total_size)} 垃圾文件`);
-    } catch (e: any) {
-      msgApi.warning(`扫描失败：${e}，显示模拟数据`);
-      // 提供模拟数据
-      const mockReport: JunkReport = {
-        total_size: 2.4 * 1024 * 1024 * 1024,
-        total_files: 8421,
-        scan_time_ms: 1234,
-        categories: [
-          { id: "user_cache", name: "用户缓存", description: "用户级缓存目录", paths: ["~/.cache"], size: 850 * 1024 * 1024, file_count: 3241, risk_level: "safe" },
-          { id: "browser_cache", name: "浏览器缓存", description: "Chrome/Brave 缓存", paths: ["~/.cache/google-chrome"], size: 620 * 1024 * 1024, file_count: 1820, risk_level: "moderate" },
-          { id: "npm_cache", name: "NPM 缓存", description: "NPM 包缓存", paths: ["~/.npm"], size: 480 * 1024 * 1024, file_count: 2103, risk_level: "moderate" },
-          { id: "macos_xcode", name: "Xcode 派生数据", description: "Xcode 编译缓存", paths: ["~/Library/Developer/Xcode/DerivedData"], size: 320 * 1024 * 1024, file_count: 845, risk_level: "moderate" },
-          { id: "trash", name: "回收站", description: "已删除文件", paths: ["~/.local/share/Trash"], size: 156 * 1024 * 1024, file_count: 412, risk_level: "moderate" },
-        ],
-      };
-      setJunkReport(mockReport);
-      setSelectedJunkIds(mockReport.categories.filter((c) => c.risk_level === "safe").map((c) => c.id));
+      msgApi.success(
+        `扫描完成：发现 ${formatBytes(report.totalSizeBytes)} / ${report.totalFiles} 个文件`
+      );
+    } catch (e) {
+      msgApi.error(`扫描失败：${describeError(e)}`);
     } finally {
       setScanning(false);
     }
-  };
+  }, [msgApi]);
 
-  // 执行清理
-  const doCleanup = async () => {
+  const doCleanup = useCallback(async () => {
     if (selectedJunkIds.length === 0) {
       msgApi.warning("请至少选择一个清理项");
       return;
     }
     setCleaning(true);
     try {
-      const result = await invoke<CleanupResult>("cleanup_junk_files", { ids: selectedJunkIds });
-      msgApi.success(`清理完成：释放 ${formatBytes(result.freed_bytes)}，删除 ${result.deleted_files} 个文件`);
-      await scanJunk(); // 重新扫描
-    } catch (e: any) {
-      msgApi.warning(`清理失败：${e}`);
+      const result = await invoke<CleanupResult>(Commands.cleanupJunkFiles, {
+        ids: selectedJunkIds,
+      });
+      const skipped =
+        result.skippedPaths > 0 ? `，跳过 ${result.skippedPaths} 个受保护目录` : "";
+      msgApi.success(
+        `清理完成：释放 ${formatBytes(result.freedBytes)}，删除 ${result.deletedFiles} 个文件${skipped}`
+      );
+      if (result.failedFiles > 0) {
+        msgApi.warning(
+          `${result.failedFiles} 个文件未能删除：${result.errors[0] ?? "详见日志"}`
+        );
+      }
+      await scanJunk();
+    } catch (e) {
+      msgApi.error(`清理失败：${describeError(e)}`);
     } finally {
       setCleaning(false);
     }
-  };
+  }, [msgApi, scanJunk, selectedJunkIds]);
 
-  // 扫描大文件
-  const scanLargeFiles = async () => {
+  const scanLargeFiles = useCallback(async () => {
     setScanningLarge(true);
     try {
-      const home = "~";
-      const files = await invoke<LargeFile[]>("find_large_files_cmd", {
-        path: home,
+      const files = await invoke<LargeFile[]>(Commands.findLargeFiles, {
+        path: "~",
         minSizeMb: largeFileMinSize,
         limit: 50,
       });
       setLargeFiles(files);
-      msgApi.success(`找到 ${files.length} 个大文件`);
-    } catch (e: any) {
-      msgApi.warning(`扫描失败：${e}，显示模拟数据`);
-      // 模拟数据
-      const mock: LargeFile[] = [
-        { path: "/Users/zifang/Downloads/ubuntu-22.04.iso", size: 4.7 * 1024 * 1024 * 1024, modified: Date.now() / 1000 - 86400 * 3, is_dir: false },
-        { path: "/Users/zifang/Movies/sample.mp4", size: 2.1 * 1024 * 1024 * 1024, modified: Date.now() / 1000 - 86400 * 7, is_dir: false },
-        { path: "/Users/zifang/Library/Developer/Xcode/DerivedData", size: 1.8 * 1024 * 1024 * 1024, modified: Date.now() / 1000 - 86400, is_dir: true },
-        { path: "/Users/zifang/Videos/screen-recording.mov", size: 950 * 1024 * 1024, modified: Date.now() / 1000 - 86400 * 14, is_dir: false },
-        { path: "/Users/zifang/Documents/backup.zip", size: 680 * 1024 * 1024, modified: Date.now() / 1000 - 86400 * 30, is_dir: false },
-        { path: "/Applications/Xcode.app", size: 32 * 1024 * 1024 * 1024, modified: Date.now() / 1000 - 86400 * 60, is_dir: true },
-      ].filter((f) => f.size >= largeFileMinSize * 1024 * 1024);
-      setLargeFiles(mock);
+      if (files.length === 0) {
+        msgApi.info(`主目录之下没有大于 ${largeFileMinSize} MB 的文件`);
+      } else {
+        msgApi.success(`找到 ${files.length} 个大文件`);
+      }
+    } catch (e) {
+      setLargeFiles([]);
+      msgApi.error(`扫描失败：${describeError(e)}`);
     } finally {
       setScanningLarge(false);
     }
-  };
+  }, [largeFileMinSize, msgApi]);
 
-  // 加载启动项
-  const loadStartupItems = async () => {
+  const loadStartupItems = useCallback(async () => {
     setLoadingStartup(true);
     try {
-      const items = await invoke<StartupItem[]>("get_startup_items_cmd");
-      setStartupItems(items);
-    } catch (e: any) {
-      msgApi.warning(`加载失败：${e}`);
-      // 模拟数据
-      setStartupItems([
-        { id: "1", name: "iTerm2", command: "/Applications/iTerm2.app", source: "Login Items", enabled: true, location: "macOS System Preferences" },
-        { id: "2", name: "Docker Desktop", command: "/Applications/Docker.app", source: "LaunchAgent", enabled: true, location: "~/Library/LaunchAgents" },
-        { id: "3", name: "Spotify", command: "/Applications/Spotify.app", source: "Login Items", enabled: true, location: "macOS System Preferences" },
-        { id: "4", name: "Raycast", command: "/Applications/Raycast.app", source: "Login Items", enabled: true, location: "macOS System Preferences" },
-      ]);
+      setStartupItems(await invoke<StartupItem[]>(Commands.getStartupItems));
+    } catch (e) {
+      setStartupItems([]);
+      msgApi.error(`加载失败：${describeError(e)}`);
     } finally {
       setLoadingStartup(false);
     }
-  };
+  }, [msgApi]);
 
-  // 杀进程
-  const handleKillProcess = async (pid: number) => {
+  const flushDns = useCallback(async () => {
     try {
-      await invoke("kill_process", { pid });
-      msgApi.success(`已结束进程 ${pid}`);
-    } catch (e: any) {
-      msgApi.warning(`结束失败：${e}`);
+      const result = await invoke<DnsFlushResult>(Commands.flushDns);
+      if (result.flushed) {
+        msgApi.success(result.message);
+      } else {
+        msgApi.warning(
+          `${result.message}${result.manualCommand ? `；可在终端执行：${result.manualCommand}` : ""}`
+        );
+      }
+    } catch (e) {
+      msgApi.error(`刷新失败：${describeError(e)}`);
     }
-  };
+  }, [msgApi]);
 
-  // 刷新 DNS
-  const flushDns = async () => {
+  // 结束进程：先向后端要真实进程名与风险级别，再决定确认强度。
+  const requestKill = useCallback(
+    async (pid: number) => {
+      try {
+        const validation = await invoke<KillValidation>(Commands.validateKill, { pid });
+        if (!validation.allowed) {
+          msgApi.error(validation.deniedReason ?? `PID ${pid} 不允许结束`);
+          return;
+        }
+        setKillConfirmText("");
+        setKillTarget(validation);
+      } catch (e) {
+        msgApi.error(`校验失败：${describeError(e)}`);
+      }
+    },
+    [msgApi]
+  );
+
+  const confirmKill = useCallback(async () => {
+    if (!killTarget) return;
+    setKilling(true);
     try {
-      const result = await invoke<string>("flush_dns_cache");
-      msgApi.success(result);
-    } catch (e: any) {
-      msgApi.warning(`刷新失败：${e}（可能需要管理员权限）`);
+      const outcome = await invoke<{ pid: number; terminatedGracefully: boolean }>(
+        Commands.killProcess,
+        { pid: killTarget.pid, graceMs: 3000 }
+      );
+      msgApi.success(
+        outcome.terminatedGracefully
+          ? `${killTarget.processName} 已退出（SIGTERM）`
+          : `${killTarget.processName} 未响应 SIGTERM，已升级为 SIGKILL`
+      );
+      setKillTarget(null);
+      processes.refresh();
+    } catch (e) {
+      msgApi.error(`结束失败：${describeError(e)}`);
+    } finally {
+      setKilling(false);
     }
-  };
+  }, [killTarget, msgApi, processes]);
 
-  // 进程数据
   const processColumns = [
-    { title: "PID", dataIndex: "pid", key: "pid", width: 80 },
-    { title: "进程名", dataIndex: "name", key: "name" },
+    { title: "PID", dataIndex: "pid", key: "pid", width: 90 },
+    {
+      title: "进程名",
+      dataIndex: "name",
+      key: "name",
+      ellipsis: true,
+      render: (name: string) => <Text strong>{name}</Text>,
+    },
     {
       title: "CPU",
-      dataIndex: "cpu",
-      key: "cpu",
-      render: (value: number) => (
-        <span style={{ color: getStatusColor(value, 80) }}>{value.toFixed(1)}%</span>
-      ),
+      dataIndex: "cpuUsage",
+      key: "cpuUsage",
+      width: 110,
+      sorter: (a: ProcessInfo, b: ProcessInfo) => a.cpuUsage - b.cpuUsage,
+      render: (value: number) =>
+        processes.page.warming ? (
+          <Text type="secondary">采样中…</Text>
+        ) : (
+          <span style={{ color: usageColor(value, 80) }}>{formatPercent(value)}</span>
+        ),
     },
     {
       title: "内存",
-      dataIndex: "memory",
-      key: "memory",
-      render: (value: number) => (
-        <span style={{ color: getStatusColor(value, 500) }}>{value.toFixed(1)} MB</span>
-      ),
+      dataIndex: "memoryBytes",
+      key: "memoryBytes",
+      width: 130,
+      sorter: (a: ProcessInfo, b: ProcessInfo) => a.memoryBytes - b.memoryBytes,
+      render: (value: number) => formatBytes(value, 1),
     },
-    { title: "线程", dataIndex: "threads", key: "threads" },
+    {
+      title: "运行时长",
+      dataIndex: "runTimeSeconds",
+      key: "runTimeSeconds",
+      width: 140,
+      render: (value: number | null) => formatUptime(value ?? 0),
+    },
     {
       title: "操作",
       key: "action",
       width: 100,
-      render: (_: any, record: any) => (
-        <Popconfirm
-          title="确认结束此进程?"
-          description={`将强制结束 PID ${record.pid}`}
-          onConfirm={() => handleKillProcess(record.pid)}
+      render: (_: unknown, record: ProcessInfo) => (
+        <Button
+          type="link"
+          danger
+          icon={<StopOutlined />}
+          size="small"
+          onClick={() => requestKill(record.pid)}
         >
-          <Button type="link" danger icon={<StopOutlined />} size="small">
-            结束
-          </Button>
-        </Popconfirm>
+          结束
+        </Button>
       ),
     },
   ];
 
-  const processData = [
-    { pid: 1234, name: "z-biz-tool-sys", cpu: 2.5, memory: 120.5, threads: 12 },
-    { pid: 2345, name: "Google Chrome", cpu: 15.2, memory: 1250.8, threads: 45 },
-    { pid: 3456, name: "VSCode", cpu: 8.7, memory: 850.2, threads: 28 },
-    { pid: 4567, name: "Docker Desktop", cpu: 5.3, memory: 650.5, threads: 32 },
-  ];
-
   return (
-    <ConfigProvider
-      theme={{
-        algorithm: darkMode ? theme.darkAlgorithm : theme.defaultAlgorithm,
-      }}
-    >
+    <ConfigProvider theme={{ algorithm: darkMode ? theme.darkAlgorithm : theme.defaultAlgorithm }}>
       {msgContext}
       <Layout style={{ height: "100vh" }}>
         <Header
           style={{
             background: cardBgGradient,
             padding: "0 24px",
-            borderBottom: `1px solid var(--ant-color-border-secondary)`,
+            borderBottom: "1px solid var(--ant-color-border-secondary)",
             display: "flex",
             justifyContent: "space-between",
             alignItems: "center",
           }}
         >
           <Space>
-            <DashboardOutlined style={{ fontSize: "24px", background: brandGradient, WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent" }} />
-            <Title level={4} style={{ margin: 0, background: brandGradient, WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent" }}>
+            <DashboardOutlined style={{ fontSize: 24, ...gradientText }} />
+            <Title level={4} style={{ margin: 0, ...gradientText }}>
               系统监控仪表盘
             </Title>
           </Space>
-          <Space>
+          <Space size="middle">
+            <Tooltip
+              title={
+                status === "live"
+                  ? `后端采集正常，最近帧 ${snapshot ? dayjs(snapshot.timestampMs).format("HH:mm:ss") : "—"}`
+                  : status === "stalled"
+                    ? "超过 3 个周期未收到采集帧"
+                    : "正在连接后端采集器"
+              }
+            >
+              <Badge
+                status={status === "live" ? "success" : status === "stalled" ? "error" : "processing"}
+                text={status === "live" ? "实时采集" : status === "stalled" ? "采集停滞" : "连接中"}
+              />
+            </Tooltip>
             <Text type="secondary">
-              {systemInfo.hostname} | {systemInfo.os}
+              {staticInfo
+                ? `${staticInfo.hostname} | ${staticInfo.osName} ${staticInfo.osVersion}`
+                : "读取系统信息…"}
             </Text>
+            <Select
+              size="small"
+              value={intervalMs}
+              style={{ width: 96 }}
+              options={INTERVAL_OPTIONS}
+              onChange={setIntervalMs}
+            />
             <Switch
               checked={darkMode}
               onChange={setDarkMode}
               checkedChildren="🌙"
               unCheckedChildren="☀️"
             />
-            <Tooltip title="刷新 DNS 缓存">
-              <Button 
-                icon={<SyncOutlined />} 
-                onClick={flushDns}
-                style={{ 
-                  borderRadius: 6,
-                  transition: "all 0.2s cubic-bezier(0.4, 0, 0.2, 1)",
-                }}
-              >
+            <Popconfirm
+              title="刷新 DNS 缓存?"
+              description="只会执行用户态命令，失败时会给出手动命令"
+              onConfirm={flushDns}
+            >
+              <Button icon={<SyncOutlined />} style={{ borderRadius: 6 }}>
                 刷新 DNS
               </Button>
-            </Tooltip>
-            <SettingOutlined style={{ fontSize: "16px", cursor: "pointer" }} />
+            </Popconfirm>
           </Space>
         </Header>
-        <Content style={{ padding: "16px", overflow: "auto" }}>
+
+        <Content style={{ padding: 16, overflow: "auto" }}>
+          {status === "stalled" && (
+            <Alert
+              type="warning"
+              showIcon
+              style={{ marginBottom: 16 }}
+              message="采集已停滞"
+              description="后端在多个周期内没有推送新数据，当前数值停留在最后一帧；不会显示模拟数据。"
+            />
+          )}
           <Tabs activeKey={activeTab} onChange={setActiveTab} size="large" style={{ background: cardBgGradient, borderRadius: 16, overflow: "hidden" }}>
             {/* ============ 概览 ============ */}
             <Tabs.TabPane tab="概览" key="overview">
-              <Row gutter={[16, 16]} style={{ marginBottom: "16px" }}>
+              <Row gutter={[16, 16]} style={{ marginBottom: 16 }}>
                 <Col span={6}>
-                  <Card 
-                    size="small" 
-                    className="monitor-card"
-                    style={{ 
-                      borderRadius: 12,
-                      background: cardBgGradient,
-                      transition: "all 0.3s cubic-bezier(0.4, 0, 0.2, 1)",
-                    }}
-                  >
-                    <div className="monitor-card-title" style={{ background: brandGradient, WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent" }}>
-                      <DesktopOutlined /> CPU 使用率
-                    </div>
-                    <div className="monitor-card-value">
-                      {monitorData[monitorData.length - 1]?.cpu.toFixed(1)}
-                      <span className="monitor-card-unit">%</span>
-                    </div>
-                    <Progress
-                      percent={monitorData[monitorData.length - 1]?.cpu}
-                      strokeColor={getStatusColor(monitorData[monitorData.length - 1]?.cpu, 80)}
-                      showInfo={false}
-                    />
-                    <Text type="secondary" style={{ fontSize: "12px" }}>
-                      {systemInfo.cpuModel} ({systemInfo.cpuCores} 核心)
-                    </Text>
-                  </Card>
+                  <MetricCard
+                    icon={<DesktopOutlined />}
+                    title="CPU 使用率"
+                    value={cpu ? formatPercent(cpu.total) : "—"}
+                    percent={cpu?.total}
+                    footer={
+                      staticInfo
+                        ? `${staticInfo.cpuModel} (${staticInfo.coreCount} 核心)`
+                        : "读取中…"
+                    }
+                  />
                 </Col>
                 <Col span={6}>
-                  <Card 
-                    size="small" 
-                    className="monitor-card"
-                    style={{ 
-                      borderRadius: 12,
-                      background: cardBgGradient,
-                      transition: "all 0.3s cubic-bezier(0.4, 0, 0.2, 1)",
-                    }}
-                  >
-                    <div className="monitor-card-title" style={{ background: brandGradient, WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent" }}>
-                      <CloudOutlined /> 内存使用
-                    </div>
-                    <div className="monitor-card-value">
-                      {systemInfo.usedMemory.toFixed(1)}
-                      <span className="monitor-card-unit">GB</span>
-                    </div>
-                    <Progress
-                      percent={(systemInfo.usedMemory / systemInfo.totalMemory) * 100}
-                      strokeColor={getStatusColor((systemInfo.usedMemory / systemInfo.totalMemory) * 100, 80)}
-                      showInfo={false}
-                    />
-                    <Text type="secondary" style={{ fontSize: "12px" }}>
-                      共 {systemInfo.totalMemory.toFixed(1)} GB
-                    </Text>
-                  </Card>
+                  <MetricCard
+                    icon={<CloudOutlined />}
+                    title="内存使用"
+                    value={memory ? formatGb(memory.usedBytes) : "—"}
+                    unit="GB"
+                    percent={memory?.usagePercent}
+                    footer={
+                      memory
+                        ? `共 ${formatGb(memory.totalBytes)} · ${memory.pressure}`
+                        : "等待首帧…"
+                    }
+                  />
                 </Col>
                 <Col span={6}>
-                  <Card 
-                    size="small" 
-                    className="monitor-card"
-                    style={{ 
-                      borderRadius: 12,
-                      background: cardBgGradient,
-                      transition: "all 0.3s cubic-bezier(0.4, 0, 0.2, 1)",
-                    }}
-                  >
-                    <div className="monitor-card-title" style={{ background: brandGradient, WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent" }}>
-                      <HddOutlined /> 磁盘使用
-                    </div>
-                    <div className="monitor-card-value">
-                      {systemInfo.diskUsed.toFixed(0)}
-                      <span className="monitor-card-unit">GB</span>
-                    </div>
-                    <Progress
-                      percent={(systemInfo.diskUsed / systemInfo.diskTotal) * 100}
-                      strokeColor={getStatusColor((systemInfo.diskUsed / systemInfo.diskTotal) * 100, 90)}
-                      showInfo={false}
-                    />
-                    <Text type="secondary" style={{ fontSize: "12px" }}>
-                      共 {systemInfo.diskTotal.toFixed(0)} GB
-                    </Text>
-                  </Card>
+                  <MetricCard
+                    icon={<HddOutlined />}
+                    title="磁盘使用"
+                    value={snapshot ? formatGb(diskTotals.used) : "—"}
+                    unit="GB"
+                    percent={snapshot ? diskTotals.percent : undefined}
+                    footer={snapshot ? `共 ${formatGb(diskTotals.total)}` : "等待首帧…"}
+                  />
                 </Col>
                 <Col span={6}>
-                  <Card 
-                    size="small" 
-                    className="monitor-card"
-                    style={{ 
-                      borderRadius: 12,
-                      background: cardBgGradient,
-                      transition: "all 0.3s cubic-bezier(0.4, 0, 0.2, 1)",
-                    }}
-                  >
-                    <div className="monitor-card-title" style={{ background: brandGradient, WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent" }}>
-                      <WifiOutlined /> 网络流量
-                    </div>
-                    <div className="monitor-card-value">
-                      {monitorData[monitorData.length - 1]?.network.toFixed(0)}
-                      <span className="monitor-card-unit">KB/s</span>
-                    </div>
-                    <div style={{ height: "8px" }} />
-                    <Text type="secondary" style={{ fontSize: "12px" }}>
-                      {systemInfo.networkInterfaces[0]?.ip}
-                    </Text>
-                  </Card>
+                  <MetricCard
+                    icon={<WifiOutlined />}
+                    title="网络流量"
+                    value={
+                      snapshot
+                        ? `${formatBytes(networkTotal.rx, 0)}/s`
+                        : "—"
+                    }
+                    footer={
+                      snapshot
+                        ? `↓ ${formatRate(networkTotal.rx)} · ↑ ${formatRate(networkTotal.tx)} · ${networkTotal.ipv4 ?? "无 IPv4"}`
+                        : "等待首帧…"
+                    }
+                  />
                 </Col>
               </Row>
 
               <Row gutter={[16, 16]}>
                 <Col span={12}>
-                  <Card 
-                    size="small" 
-                    title={
-                      <span style={{ 
-                        fontWeight: 600,
-                        background: brandGradient,
-                        WebkitBackgroundClip: "text",
-                        WebkitTextFillColor: "transparent",
-                      }}>CPU 使用率趋势</span>
-                    }
-                    className="monitor-card"
-                    style={{ 
-                      borderRadius: 12,
-                      background: cardBgGradient,
-                    }}
-                  >
-                    <ResponsiveContainer width="100%" height={200}>
-                      <AreaChart data={monitorData}>
-                        <CartesianGrid strokeDasharray="3 3" />
-                        <XAxis dataKey="time" tick={{ fontSize: 12 }} />
-                        <YAxis domain={[0, 100]} tick={{ fontSize: 12 }} />
-                        <ChartTooltip />
-                        <Area
-                          type="monotone"
-                          dataKey="cpu"
-                          stroke="#667eea"
-                          fill="url(#cpuGradient)"
-                        />
-                        <defs id="cpuGradient">
-                          <linearGradient id="colorCpu" x1="0" y1="0" x2="0" y2="1">
-                            <stop offset="5%" stopColor="#667eea" stopOpacity={0.8}/>
-                            <stop offset="95%" stopColor="#667eea" stopOpacity={0}/>
-                          </linearGradient>
-                        </defs>
-                      </AreaChart>
-                    </ResponsiveContainer>
-                  </Card>
+                  <TrendChart
+                    title="CPU 使用率趋势"
+                    data={chartData}
+                    dataKey="cpu"
+                    color="#667eea"
+                    gradientId="colorCpu"
+                    yMax={100}
+                    unitFormatter={(v) => `${v.toFixed(1)}%`}
+                  />
                 </Col>
                 <Col span={12}>
-                  <Card 
-                    size="small" 
-                    title={
-                      <span style={{ 
-                        fontWeight: 600,
-                        background: brandGradient,
-                        WebkitBackgroundClip: "text",
-                        WebkitTextFillColor: "transparent",
-                      }}>内存使用趋势</span>
-                    }
-                    className="monitor-card"
-                    style={{ 
-                      borderRadius: 12,
-                      background: cardBgGradient,
-                    }}
-                  >
-                    <ResponsiveContainer width="100%" height={200}>
-                      <AreaChart data={monitorData}>
-                        <CartesianGrid strokeDasharray="3 3" />
-                        <XAxis dataKey="time" tick={{ fontSize: 12 }} />
-                        <YAxis domain={[0, 100]} tick={{ fontSize: 12 }} />
-                        <ChartTooltip />
-                        <Area
-                          type="monotone"
-                          dataKey="memory"
-                          stroke="#764ba2"
-                          fill="url(#memoryGradient)"
-                        />
-                        <defs id="memoryGradient">
-                          <linearGradient id="colorMemory" x1="0" y1="0" x2="0" y2="1">
-                            <stop offset="5%" stopColor="#764ba2" stopOpacity={0.8}/>
-                            <stop offset="95%" stopColor="#764ba2" stopOpacity={0}/>
-                          </linearGradient>
-                        </defs>
-                      </AreaChart>
-                    </ResponsiveContainer>
-                  </Card>
+                  <TrendChart
+                    title="内存使用趋势"
+                    data={chartData}
+                    dataKey="memory"
+                    color="#764ba2"
+                    gradientId="colorMemory"
+                    yMax={100}
+                    unitFormatter={(v) => `${v.toFixed(1)}%`}
+                  />
                 </Col>
               </Row>
             </Tabs.TabPane>
 
-            {/* ============ 系统清理 🆕 ============ */}
+            {/* ============ 进程 ============ */}
+            <Tabs.TabPane tab={`进程${processes.page.total ? ` (${processes.page.total})` : ""}`} key="processes">
+              <Card
+                title="进程列表"
+                className="monitor-card"
+                extra={
+                  <Space>
+                    <Input
+                      allowClear
+                      prefix={<SearchOutlined />}
+                      placeholder="按名称或 PID 过滤"
+                      value={processFilter}
+                      onChange={(e) => setProcessFilter(e.target.value)}
+                      style={{ width: 220 }}
+                    />
+                    <Button icon={<ReloadOutlined />} onClick={processes.refresh}>
+                      刷新
+                    </Button>
+                  </Space>
+                }
+              >
+                {!processes.streaming && chartData.length === 0 ? (
+                  <Alert type="info" showIcon message="正在建立进程采集…" />
+                ) : null}
+                <Table<ProcessInfo>
+                  rowKey="pid"
+                  columns={processColumns}
+                  dataSource={visibleProcesses}
+                  size="small"
+                  loading={visibleProcesses.length === 0 && processes.streaming}
+                  pagination={{ pageSize: 20, showSizeChanger: true }}
+                  locale={{ emptyText: "尚未收到进程数据" }}
+                />
+              </Card>
+            </Tabs.TabPane>
+
+            {/* ============ 网络 ============ */}
+            <Tabs.TabPane tab="网络" key="network">
+              <Card title="网络接口" className="monitor-card">
+                <Table
+                  rowKey="interface"
+                  columns={[
+                    { title: "接口", dataIndex: "interface", key: "interface", width: 120 },
+                    {
+                      title: "状态",
+                      dataIndex: "status",
+                      key: "status",
+                      width: 90,
+                      render: (s: string) => (
+                        <Tag color={s === "up" ? "success" : s === "down" ? "error" : "default"}>
+                          {s === "up" ? "在线" : s === "down" ? "离线" : "未知"}
+                        </Tag>
+                      ),
+                    },
+                    {
+                      title: "IPv4",
+                      dataIndex: "ipv4",
+                      key: "ipv4",
+                      render: (v: string | null) => v ?? "—",
+                    },
+                    {
+                      title: "IPv6",
+                      dataIndex: "ipv6",
+                      key: "ipv6",
+                      ellipsis: true,
+                      render: (v: string | null) => v ?? "—",
+                    },
+                    {
+                      title: "MAC",
+                      dataIndex: "mac",
+                      key: "mac",
+                      width: 160,
+                      render: (v: string | null) => (v ? <Text code>{v}</Text> : "—"),
+                    },
+                    {
+                      title: "下行",
+                      dataIndex: "rxBytesPerSec",
+                      key: "rx",
+                      width: 120,
+                      render: (v: number) => formatRate(v),
+                    },
+                    {
+                      title: "上行",
+                      dataIndex: "txBytesPerSec",
+                      key: "tx",
+                      width: 120,
+                      render: (v: number) => formatRate(v),
+                    },
+                  ]}
+                  dataSource={snapshot?.networks ?? []}
+                  size="small"
+                  pagination={false}
+                  locale={{ emptyText: "等待采集首帧…" }}
+                />
+              </Card>
+            </Tabs.TabPane>
+
+            {/* ============ 磁盘 ============ */}
+            <Tabs.TabPane tab="磁盘" key="disk">
+              <Card title="分区" className="monitor-card">
+                <Table
+                  rowKey="mountPoint"
+                  columns={[
+                    { title: "名称", dataIndex: "name", key: "name" },
+                    {
+                      title: "挂载点",
+                      dataIndex: "mountPoint",
+                      key: "mountPoint",
+                      render: (v: string) => <Text code>{v}</Text>,
+                    },
+                    { title: "文件系统", dataIndex: "fileSystem", key: "fileSystem", width: 140 },
+                    { title: "容量", dataIndex: "totalBytes", key: "total", width: 120, render: (v: number) => formatBytes(v, 0) },
+                    { title: "已用", dataIndex: "usedBytes", key: "used", width: 120, render: (v: number) => formatBytes(v, 0) },
+                    { title: "可用", dataIndex: "availableBytes", key: "free", width: 120, render: (v: number) => formatBytes(v, 0) },
+                    {
+                      title: "使用率",
+                      dataIndex: "usagePercent",
+                      key: "usagePercent",
+                      width: 160,
+                      render: (v: number) => (
+                        <Progress
+                          percent={Number(v.toFixed(1))}
+                          size="small"
+                          strokeColor={usageColor(v, 90)}
+                        />
+                      ),
+                    },
+                  ]}
+                  dataSource={snapshot?.disks ?? []}
+                  size="small"
+                  pagination={false}
+                  locale={{ emptyText: "等待采集首帧…" }}
+                />
+              </Card>
+            </Tabs.TabPane>
+
+            {/* ============ 系统清理 ============ */}
             <Tabs.TabPane
               tab={
                 <span>
@@ -601,39 +785,32 @@ const [refreshInterval] = useState(1);
                 }
                 extra={
                   <Space>
-                    <Button
-                      type="primary"
-                      icon={<SearchOutlined />}
-                      onClick={scanJunk}
-                      loading={scanning}
-                    >
+                    <Button type="primary" icon={<SearchOutlined />} onClick={scanJunk} loading={scanning}>
                       扫描垃圾
                     </Button>
-                    <Button
-                      danger
-                      icon={<DeleteOutlined />}
-                      onClick={doCleanup}
-                      loading={cleaning}
+                    <Popconfirm
+                      title="确认清理选中项?"
+                      description="文件删除后不可恢复"
+                      onConfirm={doCleanup}
                       disabled={!junkReport || selectedJunkIds.length === 0}
                     >
-                      清理选中 ({selectedJunkIds.length})
-                    </Button>
+                      <Button
+                        danger
+                        icon={<DeleteOutlined />}
+                        loading={cleaning}
+                        disabled={!junkReport || selectedJunkIds.length === 0}
+                      >
+                        清理选中 ({selectedJunkIds.length})
+                      </Button>
+                    </Popconfirm>
                   </Space>
                 }
               >
                 {!junkReport ? (
-                  <div
-                    style={{
-                      textAlign: "center",
-                      padding: "60px 0",
-                      color: "var(--ant-color-text-secondary)",
-                    }}
-                  >
+                  <div style={{ textAlign: "center", padding: "60px 0", color: "var(--ant-color-text-secondary)" }}>
                     <ClearOutlined style={{ fontSize: 64, marginBottom: 16 }} />
-                    <div style={{ fontSize: 16, marginBottom: 8 }}>点击"扫描垃圾"开始分析</div>
-                    <div style={{ fontSize: 12 }}>
-                      扫描缓存文件、临时文件、回收站等，识别可清理空间
-                    </div>
+                    <div style={{ fontSize: 16, marginBottom: 8 }}>点击“扫描垃圾”开始分析</div>
+                    <div style={{ fontSize: 12 }}>扫描缓存、临时文件、回收站等；受保护目录会被自动跳过</div>
                   </div>
                 ) : (
                   <>
@@ -641,27 +818,20 @@ const [refreshInterval] = useState(1);
                       <Col span={8}>
                         <Statistic
                           title="可清理空间"
-                          value={formatBytes(junkReport.total_size)}
+                          value={formatBytes(junkReport.totalSizeBytes)}
                           valueStyle={{ color: "#52c41a", fontSize: 28 }}
                         />
                       </Col>
                       <Col span={8}>
-                        <Statistic
-                          title="可清理文件数"
-                          value={junkReport.total_files.toLocaleString()}
-                          prefix={<FileSearchOutlined />}
-                        />
+                        <Statistic title="可清理文件数" value={junkReport.totalFiles.toLocaleString()} prefix={<FileSearchOutlined />} />
                       </Col>
                       <Col span={8}>
-                        <Statistic
-                          title="扫描耗时"
-                          value={`${junkReport.scan_time_ms} ms`}
-                          valueStyle={{ color: "#1890ff" }}
-                        />
+                        <Statistic title="扫描耗时" value={`${junkReport.scanTimeMs} ms`} valueStyle={{ color: "#1890ff" }} />
                       </Col>
                     </Row>
 
-                    <Table
+                    <Table<JunkCategory>
+                      rowKey="id"
                       rowSelection={{
                         selectedRowKeys: selectedJunkIds,
                         onChange: (keys) => setSelectedJunkIds(keys as string[]),
@@ -670,7 +840,7 @@ const [refreshInterval] = useState(1);
                         {
                           title: "类别",
                           dataIndex: "name",
-                          render: (name: string, record: JunkCategory) => (
+                          render: (name: string, record) => (
                             <Space direction="vertical" size={0}>
                               <strong>{name}</strong>
                               <Text type="secondary" style={{ fontSize: 12 }}>
@@ -681,31 +851,17 @@ const [refreshInterval] = useState(1);
                         },
                         {
                           title: "风险等级",
-                          dataIndex: "risk_level",
+                          dataIndex: "riskLevel",
                           width: 100,
-                          render: (level: string) => {
-                            const labels: Record<string, string> = {
-                              safe: "安全",
-                              moderate: "中等",
-                              risky: "高风险",
-                            };
-                            return <Tag color={getRiskColor(level)}>{labels[level] || level}</Tag>;
-                          },
+                          render: (level: string) => <Tag color={riskColor(level)}>{RISK_LABELS[level] ?? level}</Tag>,
                         },
-                        {
-                          title: "文件数",
-                          dataIndex: "file_count",
-                          width: 120,
-                          render: (n: number) => n.toLocaleString(),
-                        },
+                        { title: "文件数", dataIndex: "fileCount", width: 120, render: (n: number) => n.toLocaleString() },
                         {
                           title: "占用空间",
-                          dataIndex: "size",
+                          dataIndex: "sizeBytes",
                           width: 150,
                           render: (size: number) => (
-                            <span style={{ fontWeight: 600, color: "#52c41a" }}>
-                              {formatBytes(size)}
-                            </span>
+                            <span style={{ fontWeight: 600, color: "#52c41a" }}>{formatBytes(size)}</span>
                           ),
                         },
                         {
@@ -720,14 +876,14 @@ const [refreshInterval] = useState(1);
                               ))}
                               {paths.length > 2 && (
                                 <Text type="secondary" style={{ fontSize: 11 }}>
-                                  ...等 {paths.length} 个
+                                  …等 {paths.length} 个
                                 </Text>
                               )}
                             </Space>
                           ),
                         },
                       ]}
-                      dataSource={junkReport.categories.map((c) => ({ ...c, key: c.id }))}
+                      dataSource={junkReport.categories}
                       pagination={false}
                       size="middle"
                     />
@@ -736,7 +892,7 @@ const [refreshInterval] = useState(1);
               </Card>
             </Tabs.TabPane>
 
-            {/* ============ 大文件扫描 🆕 ============ */}
+            {/* ============ 大文件 ============ */}
             <Tabs.TabPane
               tab={
                 <span>
@@ -749,63 +905,42 @@ const [refreshInterval] = useState(1);
                 title={
                   <Space>
                     <FileSearchOutlined style={{ color: "#faad14" }} />
-                    <span>大文件扫描</span>
+                    <span>大文件扫描（用户主目录之下）</span>
                   </Space>
                 }
                 extra={
                   <Space>
                     <span>最小大小 (MB):</span>
-                    <InputNumber
-                      min={1}
-                      value={largeFileMinSize}
-                      onChange={(v) => setLargeFileMinSize(v || 100)}
-                      style={{ width: 120 }}
-                    />
-                    <Button
-                      type="primary"
-                      icon={<SearchOutlined />}
-                      onClick={scanLargeFiles}
-                      loading={scanningLarge}
-                    >
+                    <InputNumber min={1} value={largeFileMinSize} onChange={(v) => setLargeFileMinSize(v || 100)} style={{ width: 120 }} />
+                    <Button type="primary" icon={<SearchOutlined />} onClick={scanLargeFiles} loading={scanningLarge}>
                       扫描
                     </Button>
                   </Space>
                 }
               >
                 {largeFiles.length === 0 ? (
-                  <div
-                    style={{
-                      textAlign: "center",
-                      padding: "60px 0",
-                      color: "var(--ant-color-text-secondary)",
-                    }}
-                  >
+                  <div style={{ textAlign: "center", padding: "60px 0", color: "var(--ant-color-text-secondary)" }}>
                     <FileSearchOutlined style={{ fontSize: 64, marginBottom: 16 }} />
-                    <div>点击"扫描"开始查找大文件</div>
+                    <div>点击“扫描”开始查找大文件</div>
                   </div>
                 ) : (
-                  <Table
+                  <Table<LargeFile>
                     rowKey="path"
                     columns={[
-                      {
-                        title: "文件路径",
-                        dataIndex: "path",
-                        render: (p: string) => <Text code style={{ fontSize: 12 }}>{p}</Text>,
-                      },
+                      { title: "文件路径", dataIndex: "path", ellipsis: true, render: (p: string) => <Text code style={{ fontSize: 12 }}>{p}</Text> },
                       {
                         title: "大小",
-                        dataIndex: "size",
+                        dataIndex: "sizeBytes",
                         width: 150,
-                        render: (s: number) => (
-                          <span style={{ fontWeight: 600 }}>{formatBytes(s)}</span>
-                        ),
-                        sorter: (a: LargeFile, b: LargeFile) => a.size - b.size,
+                        sorter: (a, b) => a.sizeBytes - b.sizeBytes,
+                        defaultSortOrder: "descend" as const,
+                        render: (s: number) => <span style={{ fontWeight: 600 }}>{formatBytes(s)}</span>,
                       },
                       {
                         title: "修改时间",
-                        dataIndex: "modified",
+                        dataIndex: "modifiedSeconds",
                         width: 180,
-                        render: (t: number) => dayjs.unix(t).format("YYYY-MM-DD HH:mm"),
+                        render: (t: number) => (t > 0 ? dayjs.unix(t).format("YYYY-MM-DD HH:mm") : "—"),
                       },
                     ]}
                     dataSource={largeFiles}
@@ -815,7 +950,7 @@ const [refreshInterval] = useState(1);
               </Card>
             </Tabs.TabPane>
 
-            {/* ============ 启动项 🆕 ============ */}
+            {/* ============ 启动项 ============ */}
             <Tabs.TabPane
               tab={
                 <span>
@@ -828,104 +963,49 @@ const [refreshInterval] = useState(1);
                 title={
                   <Space>
                     <RocketOutlined style={{ color: "#722ed1" }} />
-                    <span>开机启动项管理</span>
+                    <span>开机启动项（只读枚举）</span>
                   </Space>
                 }
                 extra={
-                  <Button
-                    icon={<ReloadOutlined />}
-                    onClick={loadStartupItems}
-                    loading={loadingStartup}
-                  >
+                  <Button icon={<ReloadOutlined />} onClick={loadStartupItems} loading={loadingStartup}>
                     刷新
                   </Button>
                 }
               >
-                <Table
+                <Table<StartupItem>
                   rowKey="id"
                   columns={[
-                    {
-                      title: "名称",
-                      dataIndex: "name",
-                      render: (n: string) => <strong>{n}</strong>,
-                    },
-                    {
-                      title: "来源",
-                      dataIndex: "source",
-                      width: 150,
-                      render: (s: string) => <Tag color="blue">{s}</Tag>,
-                    },
-                    {
-                      title: "命令/路径",
-                      dataIndex: "command",
-                      render: (c: string) => (
-                        <Text code style={{ fontSize: 12 }}>{c}</Text>
-                      ),
-                    },
+                    { title: "名称", dataIndex: "name", render: (n: string) => <strong>{n}</strong> },
+                    { title: "来源", dataIndex: "source", width: 150, render: (s: string) => <Tag color="blue">{s}</Tag> },
+                    { title: "命令/路径", dataIndex: "command", render: (c: string) => <Text code style={{ fontSize: 12 }}>{c}</Text> },
                     {
                       title: "状态",
                       dataIndex: "enabled",
                       width: 100,
-                      render: (e: boolean) =>
-                        e ? (
-                          <Tag color="success">已启用</Tag>
-                        ) : (
-                          <Tag>已禁用</Tag>
-                        ),
+                      render: (e: boolean) => (e ? <Tag color="success">已启用</Tag> : <Tag>已禁用</Tag>),
                     },
                     {
                       title: "操作",
                       key: "action",
-                      width: 120,
+                      width: 140,
                       render: () => (
-                        <Space size="small">
-                          <Button size="small" disabled>
-                            禁用
-                          </Button>
-                          <Button size="small" danger disabled>
-                            删除
-                          </Button>
-                        </Space>
+                        <Tooltip title="禁用/删除启动项尚未实现（Phase 3），不会执行任何写操作">
+                          <Space size="small">
+                            <Button size="small" disabled>
+                              禁用
+                            </Button>
+                            <Button size="small" danger disabled>
+                              删除
+                            </Button>
+                          </Space>
+                        </Tooltip>
                       ),
                     },
                   ]}
                   dataSource={startupItems}
                   loading={loadingStartup}
                   pagination={false}
-                />
-              </Card>
-            </Tabs.TabPane>
-
-            {/* ============ 进程 ============ */}
-            <Tabs.TabPane tab="进程" key="processes">
-              <Card title="进程列表" className="monitor-card">
-                <Table
-                  columns={processColumns}
-                  dataSource={processData}
-                  size="small"
-                  pagination={{ pageSize: 20 }}
-                />
-              </Card>
-            </Tabs.TabPane>
-
-            {/* ============ 网络 ============ */}
-            <Tabs.TabPane tab="网络" key="network">
-              <Card title="网络接口" className="monitor-card">
-                <Table
-                  columns={[
-                    { title: "接口", dataIndex: "name", key: "name" },
-                    { title: "IP 地址", dataIndex: "ip", key: "ip" },
-                    { title: "MAC 地址", dataIndex: "mac", key: "mac" },
-                    {
-                      title: "速率",
-                      dataIndex: "speed",
-                      key: "speed",
-                      render: (value: number) => `${value} Mbps`,
-                    },
-                  ]}
-                  dataSource={systemInfo.networkInterfaces}
-                  size="small"
-                  pagination={false}
+                  locale={{ emptyText: "点击“刷新”读取系统启动项" }}
                 />
               </Card>
             </Tabs.TabPane>
@@ -933,50 +1013,85 @@ const [refreshInterval] = useState(1);
             {/* ============ 系统信息 ============ */}
             <Tabs.TabPane tab="系统信息" key="system">
               <Card title="系统信息" className="monitor-card">
-                <Row gutter={[16, 16]}>
-                  <Col span={12}>
-                    <Statistic title="主机名" value={systemInfo.hostname} />
-                  </Col>
-                  <Col span={12}>
-                    <Statistic title="操作系统" value={systemInfo.os} />
-                  </Col>
-                  <Col span={12}>
-                    <Statistic title="内核版本" value={systemInfo.kernel} />
-                  </Col>
-                  <Col span={12}>
-                    <Statistic title="运行时间" value={systemInfo.uptime} />
-                  </Col>
-                  <Col span={12}>
-                    <Statistic title="CPU 型号" value={systemInfo.cpuModel} />
-                  </Col>
-                  <Col span={12}>
-                    <Statistic title="CPU 核心数" value={systemInfo.cpuCores} />
-                  </Col>
-                  <Col span={12}>
-                    <Statistic
-                      title="总内存"
-                      value={systemInfo.totalMemory}
-                      suffix="GB"
-                    />
-                  </Col>
-                  <Col span={12}>
-                    <Statistic
-                      title="已用内存"
-                      value={systemInfo.usedMemory}
-                      suffix="GB"
-                      valueStyle={{
-                        color: getStatusColor(
-                          (systemInfo.usedMemory / systemInfo.totalMemory) * 100,
-                          80
-                        ),
-                      }}
-                    />
-                  </Col>
-                </Row>
+                {staticInfo ? (
+                  <Row gutter={[16, 16]}>
+                    <Col span={12}>
+                      <Statistic title="主机名" value={staticInfo.hostname} />
+                    </Col>
+                    <Col span={12}>
+                      <Statistic title="操作系统" value={`${staticInfo.osName} ${staticInfo.osVersion}`} />
+                    </Col>
+                    <Col span={12}>
+                      <Statistic title="内核版本" value={staticInfo.kernelVersion} />
+                    </Col>
+                    <Col span={12}>
+                      <Statistic title="运行时间" value={snapshot ? formatUptime(snapshot.uptimeSeconds) : "—"} />
+                    </Col>
+                    <Col span={12}>
+                      <Statistic title="CPU 型号" value={staticInfo.cpuModel} />
+                    </Col>
+                    <Col span={12}>
+                      <Statistic title="CPU 核心数" value={staticInfo.coreCount} />
+                    </Col>
+                    <Col span={12}>
+                      <Statistic title="总内存" value={formatGb(staticInfo.totalMemoryBytes)} />
+                    </Col>
+                    <Col span={12}>
+                      <Statistic
+                        title="已用内存"
+                        value={memory ? formatGb(memory.usedBytes) : "—"}
+                        valueStyle={{ color: memory ? usageColor(memory.usagePercent, 80) : undefined }}
+                      />
+                    </Col>
+                    <Col span={12}>
+                      <Statistic title="平台 / 架构" value={`${staticInfo.platform} / ${staticInfo.arch}`} />
+                    </Col>
+                    <Col span={12}>
+                      <Statistic title="当前用户" value={staticInfo.currentUserName ?? "—"} />
+                    </Col>
+                  </Row>
+                ) : (
+                  <Alert type="info" showIcon message="正在读取系统信息…" />
+                )}
               </Card>
             </Tabs.TabPane>
           </Tabs>
         </Content>
+
+        <Modal
+          open={!!killTarget}
+          title={`结束进程 ${killTarget?.processName ?? ""}`}
+          onCancel={() => setKillTarget(null)}
+          onOk={confirmKill}
+          okText="确认结束"
+          okButtonProps={{
+            danger: true,
+            loading: killing,
+            disabled: killTarget?.riskLevel === "critical" && killConfirmText !== killTarget?.processName,
+          }}
+          afterClose={() => setKillConfirmText("")}
+        >
+          {killTarget ? (
+            <Space direction="vertical" size="small" style={{ width: "100%" }}>
+              <Text>
+                PID <Text code>{killTarget.pid}</Text> · 内存 {formatBytes(killTarget.memoryBytes, 1)}
+                {killTarget.userName ? ` · 属主 ${killTarget.userName}` : ""}
+              </Text>
+              <Text type="danger">
+                {killTarget.riskLevel === "critical"
+                  ? "该进程中断会立刻影响图形会话，请输入进程名以确认。"
+                  : "结束该进程可能丢失未保存的数据。"}
+              </Text>
+              {killTarget.riskLevel === "critical" && (
+                <Input
+                  placeholder={`输入 ${killTarget.processName} 以确认`}
+                  value={killConfirmText}
+                  onChange={(e) => setKillConfirmText(e.target.value)}
+                />
+              )}
+            </Space>
+          ) : null}
+        </Modal>
       </Layout>
     </ConfigProvider>
   );

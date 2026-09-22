@@ -1,65 +1,167 @@
 // 系统清理模块：垃圾文件扫描、清理、大文件查找等
+use crate::error::{AppError, CommandResult};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
+/// 清理与扫描的落地根目录：只有家目录与临时目录之下才允许删除。
+fn allowed_roots() -> Vec<PathBuf> {
+    let mut roots = vec![std::env::temp_dir()];
+    if let Some(home) = dirs::home_dir() {
+        roots.push(home);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // $TMPDIR 常是 /var/folders/xx/.../T/，与 temp_dir() 一致，这里补上 /private 真实路径。
+        if let Some(tmp) = std::env::var_os("TMPDIR") {
+            roots.push(PathBuf::from(tmp));
+        }
+    }
+    roots
+}
+
+/// 任何删除入口都要先过黑名单：系统目录、凭据目录不允许被扫描或清空。
+const DENIED_PREFIXES: &[&str] = &[
+    "/System",
+    "/usr",
+    "/bin",
+    "/sbin",
+    "/etc",
+    "/var/db",
+    "/Library",
+    "/Applications",
+    ".ssh",
+    ".gnupg",
+    "C:\\Windows",
+    "C:\\Program Files",
+];
+
+fn is_denied(path: &Path) -> bool {
+    let text = path.to_string_lossy();
+    DENIED_PREFIXES.iter().any(|prefix| {
+        if prefix.starts_with('/') || prefix.starts_with("C:") {
+            text.starts_with(prefix)
+        } else {
+            // 组件级黑名单（如 ~/.ssh）按路径片段匹配，避免误伤 my.ssh-notes 之类目录。
+            text.split(['/', '\\']).any(|seg| seg.eq_ignore_ascii_case(prefix))
+        }
+    })
+}
+
+fn under_allowed_root(canonical: &Path) -> bool {
+    allowed_roots().iter().filter_map(|r| r.canonicalize().ok()).any(|root| canonical.starts_with(&root))
+}
+
+/// 把 `~` / `~/x` 展开为真实家目录；后端是唯一能做这件事的地方。
+pub fn expand_tilde(raw: &str) -> Option<PathBuf> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed == "~" || trimmed == "~/" {
+        return dirs::home_dir();
+    }
+    if let Some(rest) = trimmed.strip_prefix("~/").or_else(|| trimmed.strip_prefix("~\\")) {
+        return dirs::home_dir().map(|home| home.join(rest));
+    }
+    Some(PathBuf::from(trimmed))
+}
+
+/// 解析大文件扫描根目录：展开 `~`、canonicalize、拒绝系统目录。
+pub fn resolve_scan_path(raw: Option<&str>) -> CommandResult<PathBuf> {
+    let home = dirs::home_dir();
+    let candidate = match raw {
+        None | Some("") => home.clone().ok_or_else(|| AppError::failed("无法定位用户主目录"))?,
+        Some(input) => expand_tilde(input)
+            .ok_or_else(|| AppError::invalid_input("扫描路径不能为空"))?,
+    };
+
+    if !candidate.exists() {
+        return Err(AppError::not_found(format!("路径不存在: {}", crate::log_sanitize::sanitize(&candidate.to_string_lossy()))));
+    }
+    let canonical = candidate
+        .canonicalize()
+        .map_err(|e| AppError::failed(format!("无法解析路径: {}", e)))?;
+    if is_denied(&canonical) {
+        return Err(AppError::path_denied("该目录属于系统或受保护位置，不允许扫描"));
+    }
+    if !(under_allowed_root(&canonical) || home.map(|h| canonical.starts_with(&h)).unwrap_or(false)) {
+        return Err(AppError::path_denied(
+            "仅允许扫描用户主目录或临时目录之下的路径",
+        ));
+    }
+    Ok(canonical)
+}
+
+/// 清理入口：确认声明目录 canonicalize 之后仍落在允许范围内，否则跳过。
+fn approved_cleanup_root(declared: &str) -> Option<PathBuf> {
+    let path = PathBuf::from(declared);
+    if !path.exists() {
+        return None;
+    }
+    let canonical = path.canonicalize().ok()?;
+    if is_denied(&canonical) || !under_allowed_root(&canonical) {
+        return None;
+    }
+    Some(canonical)
+}
+
 // 垃圾清理类别
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct JunkCategory {
     pub id: String,
     pub name: String,
     pub description: String,
     pub paths: Vec<String>,
-    pub size: u64,
+    pub size_bytes: u64,
     pub file_count: usize,
     pub risk_level: RiskLevel,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
 pub enum RiskLevel {
     Safe,      // 可安全清理 (临时文件、缓存)
     Moderate,  // 中等风险 (缩略图、最近文档)
     Risky,     // 高风险 (日志、数据库)
 }
 
-impl RiskLevel {
-    fn as_str(&self) -> &'static str {
-        match self {
-            RiskLevel::Safe => "safe",
-            RiskLevel::Moderate => "moderate",
-            RiskLevel::Risky => "risky",
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct JunkReport {
-    pub total_size: u64,
+    pub total_size_bytes: u64,
     pub total_files: usize,
     pub categories: Vec<JunkCategory>,
     pub scan_time_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CleanupResult {
     pub freed_bytes: u64,
     pub deleted_files: usize,
     pub failed_files: usize,
+    /// 命中黑名单而整目录跳过的数量。
+    pub skipped_paths: usize,
     pub errors: Vec<String>,
 }
 
 // 大文件项
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct LargeFile {
     pub path: String,
-    pub size: u64,
-    pub modified: i64,        // unix timestamp
+    pub size_bytes: u64,
+    /// unix 秒级时间戳
+    pub modified_seconds: i64,
     pub is_dir: bool,
 }
 
 // 启动项
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct StartupItem {
     pub id: String,
     pub name: String,
@@ -231,7 +333,9 @@ pub fn scan_junk() -> JunkReport {
     let mut grouped: HashMap<String, JunkCategory> = HashMap::new();
 
     for (id, name, path_str, risk) in raw_paths {
-        let path = PathBuf::from(&path_str);
+        let Some(path) = approved_cleanup_root(&path_str) else {
+            continue;
+        };
         let (size, count) = dir_size(&path);
 
         if size == 0 {
@@ -243,12 +347,12 @@ pub fn scan_junk() -> JunkReport {
             name: name.clone(),
             description: format!("自动检测到的 {} 目录", name),
             paths: Vec::new(),
-            size: 0,
+            size_bytes: 0,
             file_count: 0,
             risk_level: risk.clone(),
         });
-        entry.paths.push(path_str);
-        entry.size += size;
+        entry.paths.push(path.to_string_lossy().into_owned());
+        entry.size_bytes += size;
         entry.file_count += count;
     }
 
@@ -257,13 +361,13 @@ pub fn scan_junk() -> JunkReport {
     }
 
     // 按大小降序
-    categories.sort_by(|a, b| b.size.cmp(&a.size));
+    categories.sort_by(|a, b| b.size_bytes.cmp(&a.size_bytes));
 
-    let total_size: u64 = categories.iter().map(|c| c.size).sum();
+    let total_size_bytes: u64 = categories.iter().map(|c| c.size_bytes).sum();
     let total_files: usize = categories.iter().map(|c| c.file_count).sum();
 
     JunkReport {
-        total_size,
+        total_size_bytes,
         total_files,
         categories,
         scan_time_ms: start.elapsed().as_millis() as u64,
@@ -276,21 +380,28 @@ pub fn cleanup_categories(ids: &[String]) -> CleanupResult {
         freed_bytes: 0,
         deleted_files: 0,
         failed_files: 0,
+        skipped_paths: 0,
         errors: Vec::new(),
     };
 
     let raw_paths = get_junk_paths();
-    let target_paths: Vec<String> = raw_paths
+    let target_paths: Vec<PathBuf> = raw_paths
         .into_iter()
         .filter(|(id, _, _, _)| ids.contains(id))
-        .map(|(_, _, path, _)| path)
+        .filter_map(|(_, _, path, _)| match approved_cleanup_root(&path) {
+            Some(root) => Some(root),
+            None => {
+                result.errors.push(crate::log_sanitize::sanitize(&format!(
+                    "已跳过受保护目录: {}",
+                    path
+                )));
+                result.skipped_paths += 1;
+                None
+            }
+        })
         .collect();
 
-    for path_str in target_paths {
-        let path = PathBuf::from(&path_str);
-        if !path.exists() {
-            continue;
-        }
+    for path in target_paths {
 
         let (size_before, _count_before) = dir_size(&path);
 
@@ -299,7 +410,11 @@ pub fn cleanup_categories(ids: &[String]) -> CleanupResult {
                 if let Err(e) = fs::remove_file(entry.path()) {
                     result.failed_files += 1;
                     if result.errors.len() < 10 {
-                        result.errors.push(format!("{}: {}", entry.path().display(), e));
+                        result.errors.push(crate::log_sanitize::sanitize(&format!(
+                            "{}: {}",
+                            entry.path().display(),
+                            e
+                        )));
                     }
                 } else {
                     result.deleted_files += 1;
@@ -324,15 +439,11 @@ pub fn cleanup_categories(ids: &[String]) -> CleanupResult {
 }
 
 // 扫描大文件
-pub fn find_large_files(path: &str, min_size: u64, limit: usize) -> Vec<LargeFile> {
+pub fn find_large_files(path: &Path, min_size: u64, limit: usize) -> Vec<LargeFile> {
     let mut results = Vec::new();
-    let path_buf = PathBuf::from(path);
 
-    if !path_buf.exists() {
-        return results;
-    }
-
-    for entry in WalkDir::new(&path_buf)
+    for entry in WalkDir::new(path)
+        .max_depth(12)
         .into_iter()
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().is_file())
@@ -349,15 +460,15 @@ pub fn find_large_files(path: &str, min_size: u64, limit: usize) -> Vec<LargeFil
 
                 results.push(LargeFile {
                     path: entry.path().to_string_lossy().to_string(),
-                    size,
-                    modified,
+                    size_bytes: size,
+                    modified_seconds: modified,
                     is_dir: false,
                 });
             }
         }
     }
 
-    results.sort_by(|a, b| b.size.cmp(&a.size));
+    results.sort_by(|a, b| b.size_bytes.cmp(&a.size_bytes));
     results.truncate(limit);
     results
 }
