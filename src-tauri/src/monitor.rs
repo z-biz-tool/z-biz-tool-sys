@@ -1202,6 +1202,10 @@ mod tests {
         // macOS 走 IOKit 块设备计数，内部盘必然有来源；其它平台允许全为 None（如拿不到计数）。
         #[cfg(target_os = "macos")]
         assert!(known > 0, "macOS 上应至少有一个挂载点报出真实 I/O 计数");
+        // 非 macOS 上这个计数没有可断言的下界（拿不到 I/O 计数是合法结果），显式丢弃，
+        // 免得 Windows/Linux 腿报 "assigned to, but never used" 把真 warning 淹掉。
+        #[cfg(not(target_os = "macos"))]
+        let _ = known;
     }
 
     #[test]

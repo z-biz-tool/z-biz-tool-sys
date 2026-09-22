@@ -1341,11 +1341,16 @@ mod tests {
 
     /// 只按 unix 权限位制造"文件存在但打不开"。以 root 跑测试时权限位不生效，
     /// 调用方须先探测再断言，免得把"没触发到这条路径"记成"测过了"。
+    /// Windows 上没有这套语义（要制造读失败得用文件占用/只读属性，代价与覆盖面都不同），
+    /// 所以整个 helper 连它的两条用例一起 `cfg(unix)` —— "读不开时不得修剪"这条守卫在
+    /// Windows 侧仍然**存在但未被自动化验证**，别把这里的门控当成"该平台不需要守卫"。
+    #[cfg(unix)]
     fn chmod(file: &Path, mode: u32) {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(file, fs::Permissions::from_mode(mode)).unwrap();
     }
 
+    #[cfg(unix)]
     fn open_blocked(file: &Path) -> bool {
         chmod(file, 0o000);
         let blocked = fs::File::open(file).is_err();
@@ -1354,6 +1359,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn a_history_file_that_cannot_be_read_is_not_overwritten_by_pruning() {
         let dir = fixture("history-unreadable");
         let store = HistoryStore::new(&dir);
@@ -1385,6 +1391,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn an_alert_file_that_cannot_be_read_leaves_the_counter_and_the_file_alone() {
         let dir = fixture("alerts-unreadable");
         let store = AlertStore::new(&dir);
