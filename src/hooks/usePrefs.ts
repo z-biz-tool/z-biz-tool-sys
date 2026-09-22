@@ -51,14 +51,15 @@ export function usePrefs() {
 
   /**
    * 导出用的当前快照（T5-11）。就是这几项，不含任何路径、进程或主机信息。
+   * 页签一项由调用方按界面上真正生效的那个 key 覆盖（见 App 里的 `activeKey`）。
    */
   const snapshot = useMemo<PrefsSnapshot>(
-    () => buildPrefsSnapshot({ darkMode, intervalMs, trendRangeSecs, activeTab, alertConfig }),
-    [darkMode, intervalMs, trendRangeSecs, activeTab, alertConfig]
+    () => buildPrefsSnapshot({ darkMode, intervalMs, trendRangeSecs: trendRange, activeTab, alertConfig }),
+    [darkMode, intervalMs, trendRange, activeTab, alertConfig]
   );
 
   /**
-   * 整份替换（导入的第二步）。刻意走回同一批 setter：下面的 useEffect 会把五项一起落盘，
+   * 整份替换（导入的第二步）。刻意走回同一批 setter：上面的 useEffect 会把五项一起落盘，
    * 不存在"界面变了、localStorage 还是旧的"的中间态。告警阈值变了还会由 `useAlerts` 再下发给后端。
    */
   const applyPrefs = useCallback((next: PrefsSnapshot) => {

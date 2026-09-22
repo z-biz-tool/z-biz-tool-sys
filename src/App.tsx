@@ -643,7 +643,8 @@ function App() {
         <PrefsTransferModal
           open={prefsPanelOpen}
           onClose={() => setPrefsPanelOpen(false)}
-          snapshot={prefsSnapshot}
+          /* 导出的是界面上真正生效的那个页签，不是 localStorage 里可能已过期的原值 */
+          snapshot={{ ...prefsSnapshot, activeTab: activeKey }}
           tabs={tabItems.map((item) => item.key)}
           onApply={applyPrefs}
           onNotice={(level, text) => msgApi[level](text)}

@@ -71,9 +71,6 @@ export interface PrefsInterpretation {
   changed: number;
 }
 
-/** 页签白名单由 App 的真实 `tabItems` 传入：这里不另写一份列表，否则迟早漂移。 */
-export type TabWhitelist = string[];
-
 const DEFAULT_INTERVAL_MS = 1000;
 const DEFAULT_TREND_SECS = 60;
 const DEFAULT_TAB = "overview";
@@ -145,7 +142,8 @@ export function buildPrefsSnapshot(input: {
 export function interpretImportedPrefs(
   filePrefs: unknown,
   current: PrefsSnapshot,
-  tabs: TabWhitelist[]
+  /** 真实页签 key 列表：由 App 的 `tabItems` 传入，这里不另写一份，否则迟早漂移 */
+  tabs: string[]
 ): PrefsInterpretation {
   const source = (
     typeof filePrefs === "object" && filePrefs !== null ? filePrefs : {}
