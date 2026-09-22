@@ -1,9 +1,11 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
-use sysinfo::{CpuRefreshKind, Disks, MemoryRefreshKind, Networks, RefreshKind, System};
+use sysinfo::{
+    CpuRefreshKind, Disks, MemoryRefreshKind, Networks, ProcessesToUpdate, RefreshKind, System,
+};
 use tauri::{AppHandle, Emitter};
 
 pub const METRICS_EVENT: &str = "sys://metrics";
@@ -11,6 +13,7 @@ pub const PROCESSES_EVENT: &str = "sys://processes";
 
 const MIN_INTERVAL_MS: u64 = 200;
 const MAX_PROCESSES_PER_PAGE: usize = 300;
+const DEFAULT_PROCESS_PAGE_SIZE: usize = 50;
 /// 进程表在此时间内视为可信，避免每次 kill 校验都全量枚举。
 const PROCESS_CACHE_TTL: Duration = Duration::from_secs(10);
 
@@ -117,6 +120,89 @@ pub struct ProcessPage {
     pub warming: bool,
 }
 
+/// 进程表排序键。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ProcessSort {
+    #[default]
+    Cpu,
+    Memory,
+    Pid,
+    Name,
+}
+
+/// 进程查询：过滤/排序/分页都在后端做，前端只拿到当前页。
+/// 否则搜索只能在 CPU 头部若干行里做，冷进程根本搜不到。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ProcessQuery {
+    pub keyword: String,
+    pub sort_by: ProcessSort,
+    pub desc: bool,
+    pub offset: usize,
+    pub limit: usize,
+}
+
+impl Default for ProcessQuery {
+    fn default() -> Self {
+        Self {
+            keyword: String::new(),
+            sort_by: ProcessSort::default(),
+            desc: true,
+            offset: 0,
+            limit: DEFAULT_PROCESS_PAGE_SIZE,
+        }
+    }
+}
+
+impl ProcessQuery {
+    /// 归一化外部输入：关键字去空白转小写，分页规模限制在安全区间。
+    pub fn normalized(&self) -> Self {
+        Self {
+            keyword: self.keyword.trim().to_lowercase(),
+            sort_by: self.sort_by,
+            desc: self.desc,
+            offset: self.offset,
+            limit: self.limit.clamp(1, MAX_PROCESSES_PER_PAGE),
+        }
+    }
+
+    fn matches(&self, proc: &ProcessInfo) -> bool {
+        if self.keyword.is_empty() {
+            return true;
+        }
+        proc.name.to_lowercase().contains(&self.keyword)
+            || proc.pid.to_string() == self.keyword
+    }
+
+    fn compare(&self, a: &ProcessInfo, b: &ProcessInfo) -> std::cmp::Ordering {
+        use ProcessSort::*;
+        // 统一按升序比较，方向由 desc 一次翻转，避免每个分支各写一遍。
+        let ord = match self.sort_by {
+            Cpu => a
+                .cpu_usage
+                .partial_cmp(&b.cpu_usage)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.memory_bytes.cmp(&b.memory_bytes)),
+            Memory => a
+                .memory_bytes
+                .cmp(&b.memory_bytes)
+                .then(a.cpu_usage.total_cmp(&b.cpu_usage)),
+            Pid => a.pid.cmp(&b.pid),
+            Name => a
+                .name
+                .to_lowercase()
+                .cmp(&b.name.to_lowercase())
+                .then(a.pid.cmp(&b.pid)),
+        };
+        if self.desc {
+            ord.reverse()
+        } else {
+            ord
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StaticInfo {
@@ -184,25 +270,32 @@ pub struct Collector {
     last_cpu_sample: Instant,
     last_network_sample: Instant,
     last_disk_sample: Instant,
+    /// mount_point -> (读 B/s, 写 B/s)。只在真正刷新磁盘的那一帧更新，
+    /// 因为 sysinfo 的 `Disk::usage()` 是"自上次 refresh 的增量"，重复读取会让
+    /// 分子冻结、分母继续长大，把速率算成越来越小的假值。
+    disk_rates: HashMap<String, (Option<f64>, Option<f64>)>,
 }
 
 impl Collector {
     pub fn new() -> Self {
         let mut sys = System::new_with_specifics(
-            RefreshKind::new()
+            RefreshKind::nothing()
                 .with_cpu(CpuRefreshKind::everything())
                 .with_memory(MemoryRefreshKind::everything()),
         );
         // 型号与核心数只在首次采样时填充，之后 refresh_cpu_usage 只更新百分比。
-        sys.refresh_cpu();
+        sys.refresh_cpu_all();
 
         Self {
             sys,
             networks: Networks::new_with_refreshed_list(),
+            // `new_with_refreshed_list` 已按 `DiskRefreshKind::everything()` 取过 IOKit 计数，
+            // 因此第一次 refresh 的增量就是真实区间吞吐，不会把开机至今的总量当成一帧。
             disks: Disks::new_with_refreshed_list(),
             last_cpu_sample: Instant::now(),
             last_network_sample: Instant::now(),
             last_disk_sample: Instant::now(),
+            disk_rates: HashMap::new(),
         }
     }
 
@@ -214,7 +307,7 @@ impl Collector {
     pub fn cpu_metrics(&self) -> CpuMetrics {
         let per_core: Vec<f64> = self.sys.cpus().iter().map(|c| c.cpu_usage() as f64).collect();
         let total = if per_core.is_empty() {
-            self.sys.global_cpu_info().cpu_usage() as f64
+            self.sys.global_cpu_usage() as f64
         } else {
             per_core.iter().sum::<f64>() / per_core.len() as f64
         };
@@ -229,7 +322,9 @@ impl Collector {
         self.sys.refresh_memory();
         let total = self.sys.total_memory();
         let used = self.sys.used_memory();
-        let available = self.sys.available_memory();
+        // sysinfo 0.30 在 macOS 上按 free+inactive+purgeable-compressor 计算可用量，
+        // 压缩内存吃紧时会 saturating_sub 归零；未使用的部分至少是可回收的下限。
+        let available = self.sys.available_memory().max(total.saturating_sub(used));
         let usage_percent = if total > 0 {
             (used as f64 / total as f64) * 100.0
         } else {
@@ -247,7 +342,7 @@ impl Collector {
     }
 
     pub fn network_metrics(&mut self) -> Vec<NetworkMetrics> {
-        self.networks.refresh();
+        self.networks.refresh(true);
         let elapsed = self.last_network_sample.elapsed().as_secs_f64().max(0.001);
         self.last_network_sample = Instant::now();
 
@@ -283,14 +378,33 @@ impl Collector {
         out
     }
 
-    /// 磁盘容量按 `disk_interval_ms` 慢刷，I/O 速率每次算增量。
+    /// 磁盘容量按 `disk_interval_ms` 慢刷；I/O 速率是该刷新窗口的均值，
+    /// 窗口内各帧沿用同一份缓存值（速率本身就是"这一段平均多少 B/s"，无需每帧重算）。
     pub fn disk_metrics(&mut self, disk_interval: Duration) -> Vec<DiskMetrics> {
         if self.last_disk_sample.elapsed() >= disk_interval {
-            self.disks.refresh();
+            let window = self.last_disk_sample.elapsed().as_secs_f64().max(0.001);
+            self.disks.refresh(true);
+            self.disk_rates = self
+                .disks
+                .iter()
+                .map(|disk| {
+                    let usage = disk.usage();
+                    let rate = if usage.total_read_bytes == 0 && usage.total_written_bytes == 0 {
+                        // 平台拿不到块设备计数（累计量恒为 0）时不给值；
+                        // 反过来，有累计量而本窗口增量为 0 是真·空闲，应当显示 0 而不是"—"。
+                        (None, None)
+                    } else {
+                        (
+                            Some(round2(usage.read_bytes as f64 / window)),
+                            Some(round2(usage.written_bytes as f64 / window)),
+                        )
+                    };
+                    (disk.mount_point().to_string_lossy().into_owned(), rate)
+                })
+                .collect();
             self.last_disk_sample = Instant::now();
         }
 
-        let elapsed = self.last_cpu_sample.elapsed().as_secs_f64().max(0.001);
         let mut out = Vec::new();
         for disk in self.disks.iter() {
             let total = disk.total_space();
@@ -298,9 +412,8 @@ impl Collector {
             let used = total.saturating_sub(available);
             let key = disk.mount_point().to_string_lossy().into_owned();
 
-            // sysinfo 0.30 的 Disk 不暴露 read_bytes/written_bytes，速率留空由 UI 显示为“—”。
-            let _ = elapsed;
-            let (read_rate, write_rate) = (None, None);
+            // 首个刷新窗口到来之前没有任何增量可说，保持 None。
+            let (read_rate, write_rate) = self.disk_rates.get(&key).copied().unwrap_or((None, None));
 
             out.push(DiskMetrics {
                 name: disk.name().to_string_lossy().into_owned(),
@@ -319,7 +432,7 @@ impl Collector {
                 write_bytes_per_sec: write_rate,
             });
         }
-        out.sort_by(|a, b| b.total_bytes.cmp(&a.total_bytes));
+        out.sort_by_key(|b| std::cmp::Reverse(b.total_bytes));
         out
     }
 
@@ -347,11 +460,11 @@ impl Collector {
 pub fn collect_static_info() -> StaticInfo {
     {
         let mut sys = System::new_with_specifics(
-            RefreshKind::new()
+            RefreshKind::nothing()
                 .with_cpu(CpuRefreshKind::everything())
                 .with_memory(MemoryRefreshKind::everything()),
         );
-        sys.refresh_cpu();
+        sys.refresh_cpu_all();
         sys.refresh_memory();
         let uptime = System::uptime();
         StaticInfo {
@@ -386,10 +499,11 @@ impl Default for Collector {
 // ==================== 进程采集 ====================
 
 /// 进程采集独立于指标采集：枚举成本高，单独低频循环。
-pub fn collect_processes(sys: &mut System, warmed: bool) -> ProcessPage {
-    sys.refresh_processes();
+pub fn collect_processes(sys: &mut System, warmed: bool, raw_query: &ProcessQuery) -> ProcessPage {
+    let query = raw_query.normalized();
+    sys.refresh_processes(ProcessesToUpdate::All, true);
 
-    let mut items: Vec<ProcessInfo> = sys
+    let mut rows: Vec<ProcessInfo> = sys
         .processes()
         .iter()
         .map(|(pid, proc_info)| ProcessInfo {
@@ -399,7 +513,7 @@ pub fn collect_processes(sys: &mut System, warmed: bool) -> ProcessPage {
                 if raw.is_empty() {
                     "(unknown)".to_string()
                 } else {
-                    raw.to_string()
+                    raw.to_string_lossy().into_owned()
                 }
             },
             cpu_usage: round2(proc_info.cpu_usage() as f64),
@@ -410,21 +524,18 @@ pub fn collect_processes(sys: &mut System, warmed: bool) -> ProcessPage {
             parent_pid: proc_info.parent().map(|p| p.as_u32()),
             run_time_seconds: Some(proc_info.run_time()),
         })
+        .filter(|p| query.matches(p))
         .collect();
 
-    items.sort_by(|a, b| {
-        b.cpu_usage
-            .partial_cmp(&a.cpu_usage)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then(b.memory_bytes.cmp(&a.memory_bytes))
-    });
+    rows.sort_by(|a, b| query.compare(a, b));
 
-    let total = items.len();
-    items.truncate(MAX_PROCESSES_PER_PAGE);
+    let total = rows.len();
+    let start = query.offset.min(total);
+    let end = start.saturating_add(query.limit).min(total);
 
     ProcessPage {
         total,
-        items,
+        items: rows[start..end].to_vec(),
         timestamp_ms: epoch_ms(),
         warming: !warmed,
     }
@@ -439,7 +550,7 @@ pub fn lookup_process(pid: u32) -> Option<ProcessSummary> {
     }
 
     let mut sys = System::new();
-    sys.refresh_processes();
+    sys.refresh_processes(ProcessesToUpdate::All, true);
     let key = sysinfo::Pid::from_u32(pid);
     sys.processes().get(&key).map(|p| ProcessSummary {
         name: {
@@ -447,10 +558,59 @@ pub fn lookup_process(pid: u32) -> Option<ProcessSummary> {
             if raw.is_empty() {
                 "(unknown)".to_string()
             } else {
-                raw.to_string()
+                raw.to_string_lossy().into_owned()
             }
         },
         memory_bytes: p.memory(),
+    })
+}
+
+/// 单个进程的详情：可执行路径 / 工作目录 / 父进程 / 启动时刻，供点击进程行后展示。
+/// 刻意不含命令行参数与环境变量（见 04 数据安全约束）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProcessDetail {
+    pub pid: u32,
+    pub name: String,
+    pub parent_pid: Option<u32>,
+    pub exe_path: Option<String>,
+    pub cwd: Option<String>,
+    pub status: String,
+    /// Unix 时间戳（秒），sysinfo 在权限不足时为 0。
+    pub start_time: u64,
+    pub run_time_seconds: u64,
+    pub cpu_usage: f64,
+    pub memory_bytes: u64,
+    pub is_self: bool,
+}
+
+fn non_empty_path(p: Option<&std::path::Path>) -> Option<String> {
+    p.filter(|path| !path.as_os_str().is_empty())
+        .map(|path| path.to_string_lossy().into_owned())
+}
+
+/// 详情是一次性读取，不进 3s 事件流：全量枚举一次 ~700 进程约几十毫秒，只在点击时发生。
+pub fn collect_process_detail(pid: u32) -> Option<ProcessDetail> {
+    let mut sys = System::new();
+    sys.refresh_processes(ProcessesToUpdate::All, true);
+    let proc_info = sys.processes().get(&sysinfo::Pid::from_u32(pid))?;
+    let raw_name = proc_info.name();
+    Some(ProcessDetail {
+        pid,
+        name: if raw_name.is_empty() {
+            "(unknown)".to_string()
+        } else {
+            raw_name.to_string_lossy().into_owned()
+        },
+        parent_pid: proc_info.parent().map(|p| p.as_u32()),
+        exe_path: non_empty_path(proc_info.exe()),
+        cwd: non_empty_path(proc_info.cwd()),
+        status: format!("{:?}", proc_info.status()),
+        start_time: proc_info.start_time(),
+        run_time_seconds: proc_info.run_time(),
+        cpu_usage: round2(proc_info.cpu_usage() as f64),
+        memory_bytes: proc_info.memory(),
+        is_self: pid == std::process::id(),
     })
 }
 
@@ -462,6 +622,10 @@ pub struct MonitorService {
     latest: Arc<RwLock<Option<MetricsSnapshot>>>,
     latest_processes: Arc<RwLock<Option<ProcessPage>>>,
     process_stream: Arc<AtomicBool>,
+    process_query: Arc<RwLock<ProcessQuery>>,
+    process_query_gen: Arc<AtomicUsize>,
+    /// 缓存帧是在哪个 `process_query_gen` 值下产出的，用于判断缓存是否已落后于查询。
+    process_page_gen: Arc<AtomicUsize>,
 }
 
 static SERVICE: std::sync::OnceLock<RwLock<Option<MonitorService>>> = std::sync::OnceLock::new();
@@ -481,6 +645,9 @@ impl Clone for MonitorService {
             latest: self.latest.clone(),
             latest_processes: self.latest_processes.clone(),
             process_stream: self.process_stream.clone(),
+            process_query: self.process_query.clone(),
+            process_query_gen: self.process_query_gen.clone(),
+            process_page_gen: self.process_page_gen.clone(),
         }
     }
 }
@@ -492,6 +659,9 @@ impl MonitorService {
             latest: Arc::new(RwLock::new(None)),
             latest_processes: Arc::new(RwLock::new(None)),
             process_stream: Arc::new(AtomicBool::new(false)),
+            process_query: Arc::new(RwLock::new(ProcessQuery::default())),
+            process_query_gen: Arc::new(AtomicUsize::new(0)),
+            process_page_gen: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -518,12 +688,46 @@ impl MonitorService {
         self.latest_processes.read().ok().and_then(|g| g.clone())
     }
 
+    /// 缓存帧是否已反映当前查询；落后时调用方应自行重采集，否则 `get_processes` 会返回上一次的关键字/分页。
+    pub fn processes_match_query(&self) -> bool {
+        self.process_page_gen.load(Ordering::Relaxed) >= self.process_query_gen.load(Ordering::Relaxed)
+    }
+
     pub fn set_process_stream(&self, enabled: bool) {
         self.process_stream.store(enabled, Ordering::Relaxed);
     }
 
     pub fn process_stream_enabled(&self) -> bool {
         self.process_stream.load(Ordering::Relaxed)
+    }
+
+    /// 设置进程查询（关键字/排序/分页），返回归一化后真正生效的值。
+    pub fn set_process_query(&self, query: ProcessQuery) -> ProcessQuery {
+        let normalized = query.normalized();
+        let changed = self
+            .process_query
+            .read()
+            .map(|guard| *guard != normalized)
+            .unwrap_or(true);
+        if let Ok(mut guard) = self.process_query.write() {
+            *guard = normalized.clone();
+        }
+        if changed {
+            self.process_query_gen.fetch_add(1, Ordering::Relaxed);
+            #[cfg(debug_assertions)]
+            eprintln!(
+                "[monitor] 进程查询变更: 关键字={:?} 排序={:?} desc={} offset={} limit={}",
+                normalized.keyword, normalized.sort_by, normalized.desc, normalized.offset, normalized.limit
+            );
+        }
+        normalized
+    }
+
+    pub fn current_process_query(&self) -> ProcessQuery {
+        self.process_query
+            .read()
+            .map(|g| g.clone())
+            .unwrap_or_default()
     }
 
     fn cached_process(&self, pid: u32) -> Option<ProcessSummary> {
@@ -539,21 +743,34 @@ impl MonitorService {
     }
 
     /// 启动两个采集循环。前端未 listen 时 emit 失败会被静默丢弃。
-    pub fn spawn(&self, app: AppHandle) {
+    /// `history` 为 `None` 时（应用数据目录不可用）只关掉落盘，实时链路不受影响。
+    pub fn spawn(&self, app: AppHandle, history: Option<crate::history::HistoryStore>) {
         let config = self.config.clone();
         let latest = self.latest.clone();
         {
             let app = app.clone();
             tauri::async_runtime::spawn(async move {
-                run_metrics_loop(app, config, latest).await;
+                run_metrics_loop(app, config, latest, history).await;
             });
         }
 
         let config = self.config.clone();
         let stream = self.process_stream.clone();
         let latest_processes = self.latest_processes.clone();
+        let process_query = self.process_query.clone();
+        let process_query_gen = self.process_query_gen.clone();
+        let process_page_gen = self.process_page_gen.clone();
         tauri::async_runtime::spawn(async move {
-            run_process_loop(app, config, stream, latest_processes).await;
+            run_process_loop(
+                app,
+                config,
+                stream,
+                latest_processes,
+                process_query,
+                process_query_gen,
+                process_page_gen,
+            )
+            .await;
         });
     }
 }
@@ -568,8 +785,10 @@ async fn run_metrics_loop(
     app: AppHandle,
     config: Arc<RwLock<MonitorConfig>>,
     latest: Arc<RwLock<Option<MetricsSnapshot>>>,
+    history: Option<crate::history::HistoryStore>,
 ) {
     let mut collector = Collector::new();
+    let mut recorder = history.map(crate::history::HistoryRecorder::open);
     // 首个采样点只建立基线，不推送（CPU 增量需要前一次采样）。
     collector.refresh_cpu();
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -590,7 +809,33 @@ async fn run_metrics_loop(
         match frame {
             Ok(snapshot) => {
                 store(&latest, snapshot.clone());
-                let _ = app.emit(METRICS_EVENT, &snapshot);
+                if let Err(e) = app.emit(METRICS_EVENT, &snapshot) {
+                    static EMIT_WARNED: std::sync::Once = std::sync::Once::new();
+                    EMIT_WARNED.call_once(|| {
+                        eprintln!("[monitor] 事件 {} 推送失败: {}", METRICS_EVENT, e)
+                    });
+                }
+                #[cfg(debug_assertions)]
+                {
+                    static FIRST_FRAME_LOGGED: std::sync::Once = std::sync::Once::new();
+                    FIRST_FRAME_LOGGED.call_once(|| {
+                        eprintln!(
+                            "[monitor] {} 首帧: cpu={:.1}% cores={} 内存={}/{} 分区={} 网卡={}",
+                            METRICS_EVENT,
+                            snapshot.cpu.total,
+                            snapshot.cpu.core_count,
+                            snapshot.memory.used_bytes,
+                            snapshot.memory.total_bytes,
+                            snapshot.disks.len(),
+                            snapshot.networks.len(),
+                        )
+                    });
+                }
+
+                // 历史落盘（T3-07）：间隔节流在 recorder 内部，这里是每帧都调用。
+                if let Some(recorder) = recorder.as_mut() {
+                    recorder.observe(crate::history::HistoryPoint::from_snapshot(&snapshot));
+                }
             }
             Err(_) => {
                 // 采集器 panic 后重建，保证循环不退出。
@@ -612,6 +857,9 @@ async fn run_process_loop(
     config: Arc<RwLock<MonitorConfig>>,
     stream: Arc<AtomicBool>,
     latest_processes: Arc<RwLock<Option<ProcessPage>>>,
+    process_query: Arc<RwLock<ProcessQuery>>,
+    process_query_gen: Arc<AtomicUsize>,
+    process_page_gen: Arc<AtomicUsize>,
 ) {
     let mut sys = System::new();
     let mut warmed = false;
@@ -629,19 +877,49 @@ async fn run_process_loop(
 
         // 刚开启时先用一个短间隔暖机，让 CPU 列立刻可信。
         if !warmed {
-            sys.refresh_processes();
+            sys.refresh_processes(ProcessesToUpdate::All, true);
             tokio::time::sleep(Duration::from_millis(350)).await;
             warmed = true;
         }
 
+        // 先取代数再读查询：两者之间发生的变更才不会被漏掉。
+        let seen_gen = process_query_gen.load(Ordering::Relaxed);
+        let query = process_query
+            .read()
+            .map(|g| g.clone())
+            .unwrap_or_default();
+
         let frame = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            collect_processes(&mut sys, warmed)
+            collect_processes(&mut sys, warmed, &query)
         }));
 
         match frame {
             Ok(page) => {
                 store(&latest_processes, page.clone());
+                // 帧入库后才推进页号，避免读侧看到"号已新、页还旧"。
+                process_page_gen.store(seen_gen, Ordering::Relaxed);
                 let _ = app.emit(PROCESSES_EVENT, &page);
+                #[cfg(debug_assertions)]
+                {
+                    static FIRST_FRAME_LOGGED: std::sync::Once = std::sync::Once::new();
+                    FIRST_FRAME_LOGGED.call_once(|| {
+                        let head = page
+                            .items
+                            .first()
+                            .map(|p| format!("{}(pid={})", p.name, p.pid))
+                            .unwrap_or_else(|| "无".to_string());
+                        eprintln!(
+                            "[monitor] {} 首帧: 命中 {} 进程 / 返回 {} 行 / 排序={:?} / 关键字={:?} / warming={} / 首位={}",
+                            PROCESSES_EVENT,
+                            page.total,
+                            page.items.len(),
+                            query.sort_by,
+                            query.keyword,
+                            page.warming,
+                            head,
+                        )
+                    });
+                }
             }
             Err(_) => {
                 sys = System::new();
@@ -649,7 +927,14 @@ async fn run_process_loop(
             }
         }
 
-        tokio::time::sleep(Duration::from_millis(interval)).await;
+        // 等满周期，但查询一变就提前出帧，搜索/排序不必等下一个 3s。
+        let deadline = Instant::now() + Duration::from_millis(interval);
+        while Instant::now() < deadline {
+            if process_query_gen.load(Ordering::Relaxed) != seen_gen {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(80)).await;
+        }
     }
 }
 
@@ -730,6 +1015,10 @@ mod tests {
         assert!(memory.total_bytes > 0);
         assert!(memory.usage_percent > 0.0);
         assert!(memory.available_bytes > 0);
+        assert!(
+            memory.used_bytes + memory.available_bytes <= memory.total_bytes * 101 / 100,
+            "used+available 不应显著超过 total: {memory:?}"
+        );
     }
 
     #[test]
@@ -753,35 +1042,225 @@ mod tests {
     }
 
     #[test]
-    fn disk_metrics_have_no_fake_io_when_unsupported() {
+    fn disk_metrics_have_no_io_before_the_first_refresh_window() {
+        // 窗口未到 = 没有任何增量可说，必须给 None，不能拿 0 冒充"空闲"。
         let mut collector = Collector::new();
         let mut seen_total = false;
         for _ in 0..2 {
-            let disks = collector.disk_metrics(Duration::from_secs(10));
+            let disks = collector.disk_metrics(Duration::from_secs(300));
+            assert!(!disks.is_empty(), "至少应枚举到一个磁盘");
             for d in &disks {
                 seen_total |= d.total_bytes > 0;
-                if let Some(read) = d.read_bytes_per_sec {
-                    assert!(read >= 0.0);
-                }
+                assert_eq!(d.read_bytes_per_sec, None, "未刷新窗口不得给出读速 {:?}", d);
+                assert_eq!(d.write_bytes_per_sec, None, "未刷新窗口不得给出写速 {:?}", d);
             }
-            std::thread::sleep(Duration::from_millis(220));
+            std::thread::sleep(Duration::from_millis(50));
         }
         assert!(seen_total);
+    }
+
+    #[test]
+    fn tmp_measure_disk_io_for_iostat_reconciliation() {
+        use std::io::Write;
+        let mut collector = Collector::new();
+        // 只写 64 MiB：本机 Data 卷可用不足 4 GB，探针必须小体量、且结束即删。
+        let probe = std::env::temp_dir().join("zsys-iostat-probe.bin");
+        {
+            let mut f = std::fs::File::create(&probe).unwrap();
+            let chunk = vec![7u8; 4 * 1024 * 1024];
+            for _ in 0..16 {
+                f.write_all(&chunk).unwrap();
+                f.sync_all().unwrap();
+            }
+        }
+        std::fs::remove_file(&probe).ok();
+
+        let mut sum_written = 0.0f64;
+        let mut sum_read = 0.0f64;
+        for i in 0..8 {
+            std::thread::sleep(Duration::from_millis(1000));
+            let frames = collector.disk_metrics(Duration::from_millis(1000));
+            for d in &frames {
+                if d.mount_point == "/" {
+                    sum_read += d.read_bytes_per_sec.unwrap_or(0.0);
+                    sum_written += d.write_bytes_per_sec.unwrap_or(0.0);
+                }
+            }
+            println!(
+                "T={} FRAME {} {}",
+                crate::monitor::epoch_ms(),
+                i,
+                frames
+                    .iter()
+                    .map(|d| format!(
+                        "{} r={} w={}",
+                        d.mount_point,
+                        d.read_bytes_per_sec
+                            .map(|v| (v / 1e6).round() as i64)
+                            .unwrap_or(-1),
+                        d.write_bytes_per_sec
+                            .map(|v| (v / 1e6).round() as i64)
+                            .unwrap_or(-1),
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(" | ")
+            );
+        }
+        stop.store(true, Ordering::Relaxed);
+        let chunks = writer.join().unwrap();
+        println!(
+            "WROTE_CHUNKS {} = {:.0} MiB ; / frames avg read={:.0} MB/s written={:.0} MB/s",
+            chunks,
+            chunks as f64 * 8.0 / 1024.0,
+            sum_read / 8.0,
+            sum_written / 8.0
+        );
+    }
+
+    #[test]
+    fn disk_io_rates_come_from_a_real_refresh_window() {
+        let mut collector = Collector::new();
+        std::thread::sleep(Duration::from_millis(220));
+        let disks = collector.disk_metrics(Duration::from_millis(200));
+        let mut known = 0usize;
+        for d in &disks {
+            match (d.read_bytes_per_sec, d.write_bytes_per_sec) {
+                (Some(r), Some(w)) => {
+                    known += 1;
+                    assert!(r.is_finite() && r >= 0.0, "读速率失真 {:?}", d);
+                    assert!(w.is_finite() && w >= 0.0, "写速率失真 {:?}", d);
+                }
+                (None, None) => {}
+                mixed => panic!("读写速率必须同时有值或同时为空：{:?}", mixed),
+            }
+        }
+        // macOS 走 IOKit 块设备计数，内部盘必然有来源；其它平台允许全为 None（如拿不到计数）。
+        #[cfg(target_os = "macos")]
+        assert!(known > 0, "macOS 上应至少有一个挂载点报出真实 I/O 计数");
+    }
+
+    #[test]
+    fn disk_io_rate_is_window_average_and_does_not_decay_between_frames() {
+        let mut collector = Collector::new();
+        std::thread::sleep(Duration::from_millis(220));
+        let first = collector.disk_metrics(Duration::from_millis(200));
+        // 同一窗口内再取两帧：速率必须原样沿用，不能因分母继续长大而越显示越小。
+        let second = collector.disk_metrics(Duration::from_millis(200));
+        let third = collector.disk_metrics(Duration::from_millis(200));
+        let pick = |frames: &[DiskMetrics]| {
+            frames
+                .iter()
+                .map(|d| (d.mount_point.clone(), d.read_bytes_per_sec, d.write_bytes_per_sec))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(pick(&first), pick(&second));
+        assert_eq!(pick(&second), pick(&third));
     }
 
     #[test]
     fn process_collection_is_sorted_and_truncated() {
         let mut sys = System::new();
         // 两次采样才能得到真实进程 CPU。
-        collect_processes(&mut sys, false);
-        let page = collect_processes(&mut sys, true);
+        collect_processes(&mut sys, false, &ProcessQuery::default());
+        let page = collect_processes(&mut sys, true, &ProcessQuery::default());
         assert!(page.total > 5);
         assert!(!page.warming);
-        assert!(page.items.len() <= MAX_PROCESSES_PER_PAGE);
+        // 默认一页 50 行：不再是"全量返回后截断"
+        assert!(page.items.len() <= DEFAULT_PROCESS_PAGE_SIZE);
+        assert!(page.total >= page.items.len());
         for w in page.items.windows(2) {
             assert!(w[0].cpu_usage >= w[1].cpu_usage, "not sorted by cpu");
         }
         assert!(page.items.iter().all(|p| !p.name.is_empty()));
+
+        // 越界 offset 只给空页，不能 panic。
+        let beyond = collect_processes(
+            &mut sys,
+            true,
+            &ProcessQuery {
+                offset: page.total + 1000,
+                ..Default::default()
+            },
+        );
+        assert!(beyond.items.is_empty());
+    }
+
+    fn row(pid: u32, name: &str, cpu_usage: f64, memory_bytes: u64) -> ProcessInfo {
+        ProcessInfo {
+            pid,
+            name: name.to_string(),
+            cpu_usage,
+            memory_bytes,
+            threads: None,
+            user_name: None,
+            parent_pid: None,
+            run_time_seconds: None,
+        }
+    }
+
+    /// 过滤/排序/夹紧都是纯逻辑，用固定行集断言，避免依赖本机进程抖动。
+    #[test]
+    fn process_query_filters_sorts_and_normalizes() {
+        let rows = vec![
+            row(10, "Finder", 1.0, 500),
+            row(20, "Google Chrome", 9.0, 100),
+            row(30, "terminal", 5.0, 900),
+        ];
+
+        let chrome = ProcessQuery {
+            keyword: "chrome".to_string(),
+            ..Default::default()
+        };
+        assert!(chrome.matches(&rows[1]));
+        assert!(!chrome.matches(&rows[0]));
+        // 关键字命中 PID 同样有效
+        assert!(ProcessQuery {
+            keyword: "30".to_string(),
+            ..Default::default()
+        }
+        .matches(&rows[2]));
+
+        let by_memory = ProcessQuery {
+            sort_by: ProcessSort::Memory,
+            desc: true,
+            ..Default::default()
+        };
+        let mut sorted = rows.clone();
+        sorted.sort_by(|a, b| by_memory.compare(a, b));
+        assert_eq!(
+            sorted.iter().map(|p| p.pid).collect::<Vec<_>>(),
+            vec![30, 10, 20]
+        );
+
+        let by_pid_asc = ProcessQuery {
+            sort_by: ProcessSort::Pid,
+            desc: false,
+            ..Default::default()
+        };
+        let mut asc = rows.clone();
+        asc.sort_by(|a, b| by_pid_asc.compare(a, b));
+        assert_eq!(
+            asc.iter().map(|p| p.pid).collect::<Vec<_>>(),
+            vec![10, 20, 30]
+        );
+
+        let q = ProcessQuery {
+            keyword: "  CHROME ".to_string(),
+            limit: 100_000,
+            ..Default::default()
+        }
+        .normalized();
+        assert_eq!(q.keyword, "chrome");
+        assert_eq!(q.limit, MAX_PROCESSES_PER_PAGE);
+        assert_eq!(
+            ProcessQuery {
+                limit: 0,
+                ..Default::default()
+            }
+            .normalized()
+            .limit,
+            1
+        );
     }
 
     #[test]
@@ -791,5 +1270,60 @@ mod tests {
         assert!(!found.name.is_empty());
         assert!(found.memory_bytes > 0);
         assert!(lookup_process(u32::MAX - 1).is_none());
+    }
+
+    #[test]
+    fn process_detail_exposes_paths_but_never_command_line_or_env() {
+        let me = std::process::id();
+        let detail = collect_process_detail(me).expect("self pid must resolve");
+        assert_eq!(detail.pid, me);
+        assert!(detail.is_self);
+        assert!(!detail.name.is_empty());
+        assert!(detail.memory_bytes > 0);
+        assert!(detail.start_time > 1_700_000_000);
+        // 测试进程刚被 cargo 拉起，run_time 因秒级精度可能为 0，只要求它不离谱。
+        assert!(detail.run_time_seconds < 3_600);
+        assert!(detail.parent_pid.is_some(), "测试进程必然有父进程");
+        assert!(
+            detail.exe_path.as_deref().unwrap_or("").contains("target"),
+            "自身 exe 路径应可读取，实际 {:?}",
+            detail.exe_path
+        );
+        assert!(!detail.status.is_empty());
+
+        // 04 数据安全：详情面板只给路径与时间，命令行参数与环境变量一律不出后端。
+        let keys: Vec<String> = serde_json::to_value(&detail)
+            .expect("serializable")
+            .as_object()
+            .expect("object")
+            .keys()
+            .cloned()
+            .collect();
+        assert!(
+            !keys.iter().any(|k| k.contains("cmd") || k.contains("env")),
+            "详情字段泄漏命令行/环境变量: {keys:?}"
+        );
+
+        assert!(collect_process_detail(u32::MAX - 1).is_none());
+    }
+
+    #[test]
+    fn process_cache_is_treated_as_stale_right_after_a_query_change() {
+        let service = MonitorService::new();
+        assert!(service.processes_match_query());
+
+        // 与当前生效值相同的查询不推进代数，缓存继续可用（前端每次挂载都会重发一次查询）。
+        service.set_process_query(ProcessQuery::default());
+        assert!(service.processes_match_query());
+
+        let applied = service.set_process_query(ProcessQuery {
+            keyword: " Chrome ".into(),
+            ..Default::default()
+        });
+        assert_eq!(applied.keyword, "chrome");
+        assert!(
+            !service.processes_match_query(),
+            "查询变更后、采集线程产出新帧之前，缓存必须判为过期，否则 get_processes 会返回上一次的关键字"
+        );
     }
 }

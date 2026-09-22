@@ -1,13 +1,16 @@
 use crate::cleanup::{
-    cleanup_categories, find_large_files, get_startup_items, resolve_scan_path, scan_junk,
-    CleanupResult, JunkReport, LargeFile, StartupItem,
+    cleanup_categories, find_large_files, get_startup_items, junk_scan_flags,
+    request_cancel_junk_scan, resolve_scan_path, scan_junk_with_progress, CleanupResult, JunkReport,
+    LargeFile, StartupItem,
 };
 use crate::error::{AppError, CommandResult};
-use crate::monitor::{self, MonitorConfig, MonitorService, ProcessPage, StaticInfo};
+use crate::monitor::{
+    self, MonitorConfig, MonitorService, ProcessPage, ProcessQuery, StaticInfo,
+};
 use crate::safety::{self, KillOutcome, KillValidation};
 use serde::Serialize;
 use std::time::{Duration, Instant};
-use tauri::State;
+use tauri::{AppHandle, Emitter, State};
 
 const DEFAULT_KILL_GRACE_MS: u64 = 3000;
 
@@ -40,6 +43,20 @@ pub fn set_monitor_config(
     state.set_config(config)
 }
 
+/// 历史趋势（T3-07）：读已落盘的 10 s 采样点，跨度超过保留窗口时按上限夹取。
+/// 存储不可用时返回错误而不是空页 —— 前端需要能区分"没有历史"和"存不了历史"。
+#[tauri::command]
+pub fn get_history(
+    state: State<'_, crate::history::HistoryState>,
+    span_seconds: Option<u64>,
+) -> CommandResult<crate::history::HistoryPage> {
+    let Some(store) = state.0.as_ref() else {
+        return Err(AppError::failed("历史存储不可用：应用数据目录无法写入"));
+    };
+    let span = span_seconds.unwrap_or(crate::history::DEFAULT_SPAN_SECS);
+    Ok(crate::history::query(store, crate::history::now_ms(), span))
+}
+
 #[tauri::command]
 pub fn start_process_stream(state: State<'_, MonitorService>) -> bool {
     state.set_process_stream(true);
@@ -52,20 +69,41 @@ pub fn stop_process_stream(state: State<'_, MonitorService>) -> bool {
     state.process_stream_enabled()
 }
 
+/// 前端改动过滤/排序/分页时调用；下一帧（≤ process_interval）生效。
+/// 返回归一化后的查询，前端据此校正越界的 limit/offset。
+#[tauri::command]
+pub fn set_process_query(
+    state: State<'_, MonitorService>,
+    query: ProcessQuery,
+) -> ProcessQuery {
+    state.set_process_query(query)
+}
+
 /// 优先读采集循环的缓存；冷启动时做一次两次采样的兜底枚举。
 #[tauri::command]
 pub fn get_processes(state: State<'_, MonitorService>) -> ProcessPage {
-    if let Some(page) = state.latest_processes() {
-        return page;
+    let query = state.current_process_query();
+    // 缓存可能还是上一次查询（关键字/分页）的帧，落后时必须重采集。
+    if state.processes_match_query() {
+        if let Some(page) = state.latest_processes() {
+            return page;
+        }
     }
 
     let mut sys = sysinfo::System::new();
-    sys.refresh_processes();
+    sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
     let started = Instant::now();
     while started.elapsed() < Duration::from_millis(260) {
         std::thread::sleep(Duration::from_millis(20));
     }
-    monitor::collect_processes(&mut sys, true)
+    monitor::collect_processes(&mut sys, true, &query)
+}
+
+/// 进程详情（点击进程行时按需读取，不进 3s 事件流）。
+#[tauri::command]
+pub fn get_process_detail(pid: u32) -> CommandResult<monitor::ProcessDetail> {
+    monitor::collect_process_detail(pid)
+        .ok_or_else(|| AppError::process_not_found(format!("PID {pid} 不存在或已退出")))
 }
 
 // ==================== 危险操作 ====================
@@ -150,9 +188,34 @@ pub fn flush_dns_cache() -> DnsFlushResult {
 
 // ==================== 系统维护 ====================
 
+/// 扫描在 blocking 线程上跑，逐目录把进度推给前端（T3-09）。
+/// 之前它是同步 command：整段目录遍历期间前端只能看着按钮转圈，也无法取消。
 #[tauri::command]
-pub fn scan_junk_files() -> JunkReport {
-    scan_junk()
+pub async fn scan_junk_files(app: AppHandle) -> CommandResult<JunkReport> {
+    // 认领放在 spawn 之前：否则从"命令下发"到"扫描线程真正起跑"之间的窗口里，
+    // 用户点取消会因为这一轮还没被认领而落空，扫描照旧跑完。
+    let Some(guard) = junk_scan_flags().begin() else {
+        return Err(AppError::invalid_input("已有一轮扫描在进行中，请先取消它"));
+    };
+    let joined = tauri::async_runtime::spawn_blocking(move || {
+        scan_junk_with_progress(
+            &mut |frame| {
+                let _ = app.emit(crate::cleanup::SCAN_PROGRESS_EVENT, frame);
+            },
+            &guard,
+        )
+    })
+    .await;
+    match joined {
+        Ok(report) => Ok(report),
+        Err(e) => Err(AppError::failed(format!("扫描线程异常退出：{e}"))),
+    }
+}
+
+/// 取消进行中的扫描；返回 false 表示当前根本没有扫描在跑。
+#[tauri::command]
+pub fn cancel_junk_scan() -> bool {
+    request_cancel_junk_scan()
 }
 
 #[tauri::command]
@@ -194,8 +257,27 @@ mod tests {
         let result = flush_dns_cache();
         if let Some(cmd) = &result.manual_command {
             assert!(!result.flushed, "自动刷新成功时不应再给手动命令");
+            assert!(!cmd.is_empty(), "手动兜底命令不应为空");
         }
         assert!(!result.message.contains("sudo: a terminal is required"));
+    }
+
+    /// SEC-V06：后端不得以提权方式执行命令，失败时只能返回供用户复制的手动命令。
+    #[test]
+    fn backend_never_constructs_a_sudo_command() {
+        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut offenders = Vec::new();
+        for entry in std::fs::read_dir(&src_dir).expect("src 目录应存在") {
+            let path = entry.expect("可读目录项").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).expect("源码可读");
+            if text.contains("Command::new(\"sudo\")") || text.contains("Command::new(\"su\")") {
+                offenders.push(path.file_name().unwrap().to_string_lossy().into_owned());
+            }
+        }
+        assert!(offenders.is_empty(), "发现提权调用：{offenders:?}");
     }
 
     #[test]
@@ -211,9 +293,28 @@ mod tests {
     }
 
     #[test]
-    fn large_file_scan_expands_home_alias() {
-        let files = find_large_files_cmd(Some("~".to_string()), 4_096, Some(1)).unwrap();
-        assert!(files.iter().all(|f| !f.path.starts_with('~')));
+    fn home_alias_expands_to_a_real_path() {
+        let expanded = resolve_scan_path(Some("~")).unwrap();
+        assert_eq!(expanded, dirs::home_dir().expect("测试机应有用户目录"));
+    }
+
+    #[test]
+    fn large_file_scan_returns_only_files_over_threshold() {
+        // 用临时目录验证，避免遍历真实用户目录拖慢测试
+        let dir = std::env::temp_dir().join(format!("zsys-large-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("big.bin"), vec![7u8; 3 * 1024 * 1024]).unwrap();
+        std::fs::write(dir.join("small.bin"), vec![7u8; 1024]).unwrap();
+
+        let files = find_large_files(&dir, 1024 * 1024, 10);
+        let names: Vec<&str> = files.iter().map(|f| f.path.as_str()).map(|p| {
+            std::path::Path::new(p).file_name().and_then(|n| n.to_str()).unwrap_or("")
+        }).collect();
+        assert!(names.contains(&"big.bin"), "应找到 big.bin，实际 {names:?}");
+        assert!(!names.contains(&"small.bin"), "小文件不应出现在结果中");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
