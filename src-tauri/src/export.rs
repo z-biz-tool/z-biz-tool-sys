@@ -234,13 +234,23 @@ mod tests {
         let err = write_history_csv(&store, &dir.to_string_lossy(), 1_700_000_000_000 + 10, 3_600).unwrap_err();
         assert_eq!(err.code, "INVALID_INPUT", "指向目录必须被拒：{err:?}");
 
-        let denied = if cfg!(windows) {
-            "C:\\Windows\\Temp\\history.csv".to_string()
+        // 受保护位置分两种：本机真有的目录，和"这个平台上根本不存在"的目录。
+        // 第二种正是 Linux 腿红过的形状 —— /System/Volumes/Data 只有 macOS 有，守卫先去
+        // canonicalize 父目录，就把 PATH_DENIED 降级成了 NOT_FOUND，结论取决于文件系统运气。
+        let present_dir = if cfg!(windows) {
+            "C:\\Windows\\Temp\\history.csv"
         } else {
-            "/System/Volumes/Data/history.csv".to_string()
+            "/System/Volumes/Data/history.csv"
         };
-        let err = write_history_csv(&store, &denied, 1_700_000_000_000 + 10, 3_600).unwrap_err();
-        assert_eq!(err.code, "PATH_DENIED", "受保护位置不该被写：{err:?}");
+        let missing_dir = if cfg!(windows) {
+            "C:\\Windows\\Nonexistent-Zsys\\history.csv"
+        } else {
+            "/usr/local/share/zsys-missing-dir/history.csv"
+        };
+        for denied in [present_dir, missing_dir] {
+            let err = write_history_csv(&store, denied, 1_700_000_000_000 + 10, 3_600).unwrap_err();
+            assert_eq!(err.code, "PATH_DENIED", "受保护位置不该被写（{denied}）：{err:?}");
+        }
 
         let missing_parent = std::env::temp_dir()
             .join(format!("zsys-csv-不存在-{}", std::process::id()))

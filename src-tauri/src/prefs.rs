@@ -78,6 +78,29 @@ fn prefs_root_allowed(dir: &Path) -> bool {
         || extra_writable_roots().iter().any(|root| dir.starts_with(root))
 }
 
+/// "受保护与否"要能在目录还不存在时就判出来：从叶子往上找到第一个能 canonicalize 的祖先，
+/// 把剩下的段原样拼回去。拿不到任何可解析的祖先就退回原路径 —— 原路径的字符串前缀仍然能
+/// 命中黑名单，而真正的 canonical 判定在后面还要再走一遍（拦符号链接逃逸）。
+fn deny_probe(path: &Path) -> PathBuf {
+    if let Ok(canonical) = canonicalize_clean(path) {
+        return canonical;
+    }
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    let mut cursor = path;
+    while let (Some(name), Some(parent)) = (cursor.file_name(), cursor.parent()) {
+        tail.push(name.to_os_string());
+        cursor = parent;
+        if let Ok(base) = canonicalize_clean(cursor) {
+            let mut out = base;
+            for seg in tail.iter().rev() {
+                out.push(seg);
+            }
+            return out;
+        }
+    }
+    path.to_path_buf()
+}
+
 /// 校验并解析一个 `.json` 目标路径。
 ///
 /// 目标文件本身可以还不存在（导出到新文件名），但**所在目录必须能 canonicalize** ——
@@ -108,6 +131,15 @@ pub(crate) fn resolve_target_path(
         != Some(true)
     {
         return Err(AppError::invalid_input(format!("{kind}必须是一个 .{extension} 文件")));
+    }
+
+    // 拒判排在存在性之前：一个位置受不受保护只取决于路径本身。原先先 canonicalize 父目录，
+    // 于是"这个目录在本平台不存在"会先返回 NOT_FOUND —— 同一条守卫在 macOS 上给 PATH_DENIED、
+    // 在 Linux 上给 NOT_FOUND（/System/Volumes/Data 只有 macOS 有），守卫的结论取决于文件系统运气。
+    if is_denied(&deny_probe(&expanded)) {
+        return Err(AppError::path_denied(format!(
+            "该位置属于系统或受保护目录，不能读写{kind}"
+        )));
     }
 
     let parent = expanded
