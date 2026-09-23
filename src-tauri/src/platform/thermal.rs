@@ -453,15 +453,22 @@ mod tests {
         assert!((temp.value - 52.34).abs() < 1e-9, "毫摄氏度要除以 1000：{}", temp.value);
         assert_eq!(temp.critical, Some(95.0), "传感器自己声明的上限要带出去");
         assert_eq!(temp.kind, SensorKind::Temperature);
-        // 期望值按产品同一串 join 顺序拼（probe_at 是 root.join("class/hwmon") 再逐段 join），
-        // 写成 `format!("{root}/class/hwmon/...")` 在 Windows 上会得到另一种分隔符混排：
-        // 该字段是界面上"这块数据从哪来"的凭据，测试要钉的是节点位置，不是字符串拼法。
-        let expected_source = tree
-            .root
-            .join("class/hwmon")
-            .join("hwmon0")
-            .join("temp1_input");
-        assert_eq!(temp.source, expected_source.to_string_lossy(), "读数要指回它真正来自的节点");
+        // Windows 上 std 的 read_dir 会把短路径名展成对应的长路径（runner 的 TEMP 环境变量写作
+        // `C:\Users\RUNNER~1\...`，目录实际叫 `...\runneradmin\...`），`source` 里 root 那一段的
+        // 字面拼写因此由 OS 决定，不是产品能选的。这条断言要钉的是"读的是哪个节点"：
+        // 按路径组件比尾部，再单独确认它落在本测试这棵唯一命名的临时树里。
+        let node = Path::new("class").join("hwmon").join("hwmon0").join("temp1_input");
+        assert!(
+            Path::new(&temp.source).ends_with(&node),
+            "读数要指回它真正来自的节点，实际：{}",
+            temp.source
+        );
+        let tree_name = tree.root.file_name().unwrap().to_string_lossy().to_string();
+        assert!(
+            temp.source.contains(&tree_name),
+            "读数不该指到别的临时树：{}",
+            temp.source
+        );
 
         let fan = tree.sensor(&report, "CPU FAN");
         assert_eq!(fan.value, 2410.0, "风扇已经是 RPM，不能再除 1000");
