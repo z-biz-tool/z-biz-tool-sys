@@ -14,6 +14,7 @@ mod notify;
 mod platform;
 mod prefs;
 mod safety;
+mod startup;
 use tauri::Manager;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -69,6 +70,9 @@ pub fn run() {
             commands::cleanup_junk_files,
             commands::find_large_files_cmd,
             commands::get_startup_items_cmd,
+            commands::disable_startup_item,
+            commands::remove_startup_item,
+            commands::restore_startup_item,
             commands::export_prefs_file,
             commands::import_prefs_file,
             commands::agent_query,

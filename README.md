@@ -36,7 +36,7 @@
 
 - 🚀 **跨平台支持** — macOS Login Items（`osascript`）/ LaunchAgents plist、Linux XDG autostart / systemd user 目录、Windows 当前用户注册表 `HKCU\...\CurrentVersion\Run`（`reg query`，不含机器级启动项）
 - ⚙️ **状态查看** — 显示每个启动项的来源、命令路径
-- 🚫 **禁用 / 删除** — 尚未实现，界面按钮已置灰并标注原因（会移动/删除用户真实文件，需单独授权后才做）
+- 🚫 **禁用 / 删除 / 恢复** — 只操作文件型来源（macOS `~/Library/LaunchAgents/*.plist`、Linux `~/.config/autostart/*.desktop`）：每一项都要**逐字输入启动项名称**确认，执行是一次 `fs::rename` 把原件移进应用数据目录下的 `startup-backup/`（删除再深一层 `out/`），**不做物理删除**，禁用项仍在列表里可一键恢复。需要提权或没有文件可移的来源（Login Items 自动化、Windows 注册表、systemd 用户单元）照旧枚举，但标 `operable=false`，界面只给"不支持在此操作"标签而不给按钮
 
 ### 网络工具
 
@@ -101,7 +101,8 @@
 
 | 项 | 现状 |
 |---|---|
-| 启动项禁用 / 删除 | 未实现，按钮 `disabled` + tooltip 说明。原因：要移动/删除用户真实 `~/Library/LaunchAgents` 等文件，属不可逆操作 |
+| 启动项禁用 / 删除 | 已实现（T3-08），但边界要说清：① 覆盖范围只有文件型来源，Windows 无免提权通路（注册表项 `operable=false`）、Login Items 与 systemd 用户单元同理不给按钮；② "禁用"是把 plist 移出启动目录，**不改** `Disabled` 键，也不触碰 `launchctl`；③ "删除"仍保留字节在 `startup-backup/<来源>/out/`，需要用户自行清盘；④ 移动逻辑在单测里用临时目录跑过 22 条（含确认闸门、不覆盖、符号链接邻居、白名单），**真机 GUI 上点一次"禁用"仍未验过** |
+| 启动项链接判定 | 指向同目录另一份 plist 的符号链接会被拒（曾是一个真 bug：canonical 之后才判"普通文件"，于是搬走的是邻居的真身并改名成链接名）。现在两处判定都在解析前，见 04 的"启动项操作" |
 | macOS 回收站 | 清理白名单**不含** `~/.Trash`（Linux 侧才有 `~/.local/share/Trash` 项）；macOS 可清理类别为缓存/日志/Xcode/模拟器/临时目录 |
 | 磁盘读写速率 | 有来源（sysinfo 0.33.1 `Disk::usage()` 增量 ÷ 刷新窗口，按挂载点缓存、窗口内各帧沿用同一值）。取不到块设备计数的平台返回 `None`、界面显示 `—`；真·空闲显示 `0 B/s` 而不是 `—`；首个刷新窗口之前一律 `—`，不拿 0 冒充空闲。同一物理盘的多个 APFS 卷会显示相同计数 |
 | 读不出容量的分区 | 后端 `available: false`（`total_bytes == 0` 的判据），`usage_percent` 因字段类型是 `f64` 而保持 `0.0`；界面看 `available` 把容量/已用/可用/使用率四列统一显示 `—`。这是 FI-04 那轮补测时查出来的显示缺陷：修之前一根 0 % 的进度条会把"断掉的挂载点"说成"一块全空的盘" |

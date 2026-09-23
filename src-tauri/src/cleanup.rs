@@ -341,6 +341,22 @@ pub struct StartupItem {
     pub source: String,       // 注册表/LaunchAgents/cron 等
     pub enabled: bool,
     pub location: String,
+    /// 后端能不能安全地操作这一项（T3-08）。false 时界面不给按钮，而不是点了再报错。
+    pub operable: bool,
+}
+
+/// 组装一枚扫描出来的启动项。`enabled` 的口径是"文件此刻在不在启动目录里"：
+/// 我们不去猜 plist 里的 `Disabled` 键，所以界面说的也是"在启动目录中"。
+fn startup_item(id: String, name: String, command: String, source: String, location: String) -> StartupItem {
+    StartupItem {
+        operable: crate::startup::id_is_operable(&id),
+        enabled: true,
+        id,
+        name,
+        command,
+        source,
+        location,
+    }
 }
 
 // 获取系统垃圾目录
@@ -805,44 +821,20 @@ pub fn get_startup_items() -> Vec<StartupItem> {
                 for (i, name) in s.split(", ").enumerate() {
                     let name = name.trim().to_string();
                     if !name.is_empty() {
-                        items.push(StartupItem {
-                            id: format!("macos-login-{}", i),
-                            name: name.clone(),
-                            command: name,
-                            source: "Login Items".to_string(),
-                            enabled: true,
-                            location: "~/Library/Application Support".to_string(),
-                        });
+                        items.push(startup_item(
+                            format!("macos-login-{}", i),
+                            name.clone(),
+                            name,
+                            "Login Items".to_string(),
+                            "~/Library/Application Support".to_string(),
+                        ));
                     }
                 }
             }
         }
 
-        // LaunchAgents
-        if let Some(home) = dirs::home_dir() {
-            let launch_agents = home.join("Library/LaunchAgents");
-            if launch_agents.exists() {
-                if let Ok(entries) = fs::read_dir(&launch_agents) {
-                    for entry in entries.flatten() {
-                        let path = entry.path();
-                        if path.extension().and_then(|s| s.to_str()) == Some("plist") {
-                            let name = path.file_name()
-                                .and_then(|s| s.to_str())
-                                .unwrap_or("")
-                                .to_string();
-                            items.push(StartupItem {
-                                id: format!("macos-agent-{}", name),
-                                name: name.clone(),
-                                command: path.to_string_lossy().to_string(),
-                                source: "LaunchAgent".to_string(),
-                                enabled: true,
-                                location: launch_agents.to_string_lossy().to_string(),
-                            });
-                        }
-                    }
-                }
-            }
-        }
+        // LaunchAgents 这一路交给 `startup.rs`：那一边知道哪些目录可以被操作，
+        // 在位项与备份项因此共用同一套过滤规则（后缀 + 普通文件），不会两边漂移。
     }
 
     #[cfg(target_os = "windows")]
@@ -859,14 +851,13 @@ pub fn get_startup_items() -> Vec<StartupItem> {
                         if parts.len() >= 3 {
                             let name = parts[0].to_string();
                             let command = parts[2..].join(" ");
-                            items.push(StartupItem {
-                                id: format!("win-run-{}", name),
+                            items.push(startup_item(
+                                format!("win-run-{}", name),
                                 name,
                                 command,
-                                source: "Registry Run".to_string(),
-                                enabled: true,
-                                location: "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run".to_string(),
-                            });
+                                "Registry Run".to_string(),
+                                "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run".to_string(),
+                            ));
                         }
                     }
                 }
@@ -876,32 +867,7 @@ pub fn get_startup_items() -> Vec<StartupItem> {
 
     #[cfg(target_os = "linux")]
     {
-        // .desktop 文件位于 ~/.config/autostart/
-        if let Some(home) = dirs::home_dir() {
-            let autostart = home.join(".config/autostart");
-            if autostart.exists() {
-                if let Ok(entries) = fs::read_dir(&autostart) {
-                    for entry in entries.flatten() {
-                        let path = entry.path();
-                        if path.extension().and_then(|s| s.to_str()) == Some("desktop") {
-                            let name = path.file_name()
-                                .and_then(|s| s.to_str())
-                                .unwrap_or("")
-                                .to_string();
-                            items.push(StartupItem {
-                                id: format!("linux-autostart-{}", name),
-                                name,
-                                command: path.to_string_lossy().to_string(),
-                                source: "XDG Autostart".to_string(),
-                                enabled: true,
-                                location: autostart.to_string_lossy().to_string(),
-                            });
-                        }
-                    }
-                }
-            }
-        }
-
+        // ~/.config/autostart 的 .desktop 同样归 `startup.rs` 扫（可操作来源，含备份项）。
         // systemd 用户服务
         if let Some(home) = dirs::home_dir() {
             let systemd = home.join(".config/systemd/user");
@@ -915,14 +881,13 @@ pub fn get_startup_items() -> Vec<StartupItem> {
                                     .and_then(|s| s.to_str())
                                     .unwrap_or("")
                                     .to_string();
-                                items.push(StartupItem {
-                                    id: format!("linux-systemd-{}", name),
+                                items.push(startup_item(
+                                    format!("linux-systemd-{}", name),
                                     name,
-                                    command: path.to_string_lossy().to_string(),
-                                    source: "systemd user".to_string(),
-                                    enabled: true,
-                                    location: systemd.to_string_lossy().to_string(),
-                                });
+                                    path.to_string_lossy().to_string(),
+                                    "systemd user".to_string(),
+                                    systemd.to_string_lossy().to_string(),
+                                ));
                             }
                         }
                     }

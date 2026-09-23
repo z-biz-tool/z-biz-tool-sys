@@ -1,8 +1,7 @@
 use crate::agent::{self, RankBy};
 use crate::cleanup::{
-    cleanup_categories, find_large_files, get_startup_items, junk_scan_flags,
-    request_cancel_junk_scan, resolve_scan_path, scan_junk_with_progress, CleanupResult, JunkReport,
-    LargeFile, StartupItem,
+    cleanup_categories, find_large_files, junk_scan_flags, request_cancel_junk_scan,
+    resolve_scan_path, scan_junk_with_progress, CleanupResult, JunkReport, LargeFile, StartupItem,
 };
 use crate::error::{AppError, CommandResult};
 use crate::export;
@@ -13,6 +12,7 @@ use crate::notify;
 use crate::platform::thermal;
 use crate::prefs;
 use crate::safety::{self, KillOutcome, KillValidation};
+use crate::startup;
 use serde::Serialize;
 use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -284,9 +284,41 @@ pub fn find_large_files_cmd(
     ))
 }
 
+/// 启动项那一页：不可操作来源（Login Items / 注册表 / systemd）+ 在位项 + 已禁用备份项。
+/// 判定与操作都只认 `id`，界面拿不到"提交一个路径"的口子。
 #[tauri::command]
-pub fn get_startup_items_cmd() -> Vec<StartupItem> {
-    get_startup_items()
+pub fn get_startup_items_cmd(app: AppHandle) -> Vec<StartupItem> {
+    startup::page(&app)
+}
+
+/// 禁用：原件移进应用备份目录，下次登录不再加载；列表里仍以"未启用"看得见，可一键恢复。
+#[tauri::command]
+pub fn disable_startup_item(
+    app: AppHandle,
+    id: String,
+    confirm_name: String,
+) -> CommandResult<startup::StartupOutcome> {
+    startup::run(&app, startup::StartupAction::Disable, &id, &confirm_name)
+}
+
+/// 删除：同样只是移进备份（本应用不做物理删除），之后不再出现在列表里。
+#[tauri::command]
+pub fn remove_startup_item(
+    app: AppHandle,
+    id: String,
+    confirm_name: String,
+) -> CommandResult<startup::StartupOutcome> {
+    startup::run(&app, startup::StartupAction::Remove, &id, &confirm_name)
+}
+
+/// 恢复：把备份里的原件放回启动目录。
+#[tauri::command]
+pub fn restore_startup_item(
+    app: AppHandle,
+    id: String,
+    confirm_name: String,
+) -> CommandResult<startup::StartupOutcome> {
+    startup::run(&app, startup::StartupAction::Restore, &id, &confirm_name)
 }
 
 // ==================== 诊断 Agent（T5-04 / T5-05 / T5-06）====================

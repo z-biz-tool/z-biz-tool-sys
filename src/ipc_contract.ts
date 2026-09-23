@@ -269,8 +269,30 @@ export interface StartupItem {
   name: string;
   command: string;
   source: string;
+  /** true = 文件此刻就在启动目录里（不代表解析过 plist 内容，我们不去猜 `Disabled` 键） */
   enabled: boolean;
   location: string;
+  /** 后端能不能安全操作这一项（T3-08）。false 时界面根本不给按钮 */
+  operable: boolean;
+}
+
+/** 启动项三种动作（T3-08）。全都只是 rename，本应用不做物理删除 */
+export type StartupAction = "disable" | "remove" | "restore";
+
+export interface StartupOutcome {
+  id: string;
+  name: string;
+  /** 后端真正执行的那一种，不是前端"以为"的那一种 */
+  action: StartupAction;
+  /** 动之前的位置（canonical 真身，照着能在访达里找到） */
+  fromPath: string;
+  /** 动之后的位置 */
+  toPath: string;
+  /** 移动了多少字节：与源文件大小一致，用来证明整份搬走 */
+  bytes: number;
+  /** 操作后这一项还会不会出现在列表里（删除不再列，文件仍在备份的 out 目录） */
+  listed: boolean;
+  message: string;
 }
 
 /** kill 分级：blocked 禁止操作，critical 需逐字输入进程名确认，standard 需对话框确认 */
@@ -486,6 +508,12 @@ export const Commands = {
   cleanupJunkFiles: "cleanup_junk_files",
   findLargeFiles: "find_large_files_cmd",
   getStartupItems: "get_startup_items_cmd",
+  /** 禁用启动项（T3-08）：原件移进应用备份目录，列表里仍看得见，可一键恢复 */
+  disableStartupItem: "disable_startup_item",
+  /** 删除启动项（T3-08）：同样只移进备份（不做物理删除），之后不再列进列表 */
+  removeStartupItem: "remove_startup_item",
+  /** 恢复启动项（T3-08）：把备份里的原件放回启动目录 */
+  restoreStartupItem: "restore_startup_item",
   /** 读取后端真正生效的告警阈值（T5-01） */
   getAlertConfig: "get_alert_config",
   /** 下发告警阈值，返回后端夹取后的生效值 */

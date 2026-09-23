@@ -42,6 +42,8 @@ import {
   type ProcessDetail,
   type ScanProgress,
   type StartupItem,
+  type StartupAction,
+  type StartupOutcome,
   type CsvExportOutcome,
   type ThermalReport,
 } from "./ipc_contract";
@@ -192,6 +194,9 @@ function App() {
 
   const [startupItems, setStartupItems] = useState<StartupItem[]>([]);
   const [loadingStartup, setLoadingStartup] = useState(false);
+  // 一次只允许一个启动项操作：两个 rename 抢同一个落点时，后一个会被「目标已被占」挡下，
+  // 但那句拒绝是给机器看的，不该让用户在同一页里连点两下之后去猜哪次生效了
+  const [startupBusy, setStartupBusy] = useState(false);
   // 温度/风扇（T5-08）：不进采集流，只在进系统信息页时读一次 + 手动刷新。
   // 读数本身可能永远为空（macOS 没有免提权通路），所以 null 与"空报告"是两种状态：
   // null = 还没查到（没试过，或那一次失败了），空报告 = 查到了、后端给了"为什么没有读数"的原因。
@@ -362,6 +367,48 @@ function App() {
       setLoadingStartup(false);
     }
   }, [msgApi, reportError]);
+
+  // 启动项三种动作（T3-08）：确认框里用户已经逐字核过名称，这里仍把同一个名称回给后端当第二道闸。
+  const runStartupOp = useCallback(
+    async (action: StartupAction, item: StartupItem) => {
+      const command =
+        action === "disable"
+          ? Commands.disableStartupItem
+          : action === "remove"
+            ? Commands.removeStartupItem
+            : Commands.restoreStartupItem;
+      const label = action === "disable" ? "禁用" : action === "remove" ? "删除" : "恢复";
+      setStartupBusy(true);
+      try {
+        const outcome = await invoke<StartupOutcome>(command, {
+          id: item.id,
+          confirmName: item.name,
+        });
+        // 结论按后端回的那一次动作说，而不是按我们「以为点了哪个按钮」
+        msgApi.success(`${label}成功：${outcome.message}`);
+      } catch (e) {
+        reportError(`${label}启动项`, e);
+      } finally {
+        // 成功与否都要重扫：文件可能已被别的进程动过，界面上得是当前状态
+        await loadStartupItems();
+        setStartupBusy(false);
+      }
+    },
+    [loadStartupItems, msgApi, reportError]
+  );
+
+  const onDisableStartup = useCallback(
+    (item: StartupItem) => void runStartupOp("disable", item),
+    [runStartupOp]
+  );
+  const onRemoveStartup = useCallback(
+    (item: StartupItem) => void runStartupOp("remove", item),
+    [runStartupOp]
+  );
+  const onRestoreStartup = useCallback(
+    (item: StartupItem) => void runStartupOp("restore", item),
+    [runStartupOp]
+  );
 
   // 温度/风扇（T5-08）：不接收任何参数，能读的位置在后端是写死的常量。
   const loadThermal = useCallback(async () => {
@@ -624,7 +671,15 @@ function App() {
       ),
       children: (
         <ErrorBoundary label="启动项页">
-          <StartupTab items={startupItems} loading={loadingStartup} onReload={loadStartupItems} />
+          <StartupTab
+            items={startupItems}
+            loading={loadingStartup}
+            busy={startupBusy}
+            onReload={loadStartupItems}
+            onDisable={onDisableStartup}
+            onRemove={onRemoveStartup}
+            onRestore={onRestoreStartup}
+          />
         </ErrorBoundary>
       ),
     },
