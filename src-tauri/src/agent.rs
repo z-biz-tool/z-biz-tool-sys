@@ -1309,4 +1309,62 @@ mod tests {
             }
         }
     }
+    /// R-07 的实测版。06 原来只写"默认本地模型；若接外部 API 需脱敏"，
+    /// 而核对代码之后的事实更强：**本应用没有任何外呼通道**，Agent 是纯函数、也不可能有。
+    /// 这条测试钉的就是这个"没有" —— 以后谁加了 HTTP 客户端依赖、在页面里写了 `fetch(`、
+    /// 或者把 CSP 的 `connect-src` 放宽到外部站点，都会立刻红，而不是等出事才发现通道早就开了。
+    #[test]
+    fn r07_there_is_no_outbound_network_path_at_all() {
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+
+        let cargo_toml = std::fs::read_to_string(manifest.join("Cargo.toml")).unwrap();
+        for outbound in [
+            "reqwest",
+            "hyper",
+            "ureq",
+            "curl",
+            "attohttpc",
+            "tauri-plugin-http",
+            "tauri-plugin-opener",
+        ] {
+            assert!(
+                !cargo_toml.contains(outbound),
+                "Cargo.toml 里出现了外呼依赖 {outbound}：R-07「没有外呼通道」的前提不再成立"
+            );
+        }
+
+        let raw = std::fs::read_to_string(manifest.join("tauri.conf.json")).unwrap();
+        let conf: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let csp = conf["app"]["security"]["csp"]
+            .as_str()
+            .expect("CSP 必须是字符串（null 等于没有策略）");
+        assert!(!csp.contains('*'), "CSP 里不许出现通配：{csp}");
+        let connect = csp
+            .split(';')
+            .map(|part| part.trim())
+            .find(|part| part.starts_with("connect-src"))
+            .expect("CSP 必须有 connect-src");
+        let mut saw_any = false;
+        for target in connect.split_whitespace().skip(1) {
+            saw_any = true;
+            assert!(
+                matches!(
+                    target,
+                    "ipc:" | "http://ipc.localhost" | "ws://localhost:1420" | "http://localhost:1420"
+                ),
+                "connect-src 出现了未预期目标 {target}：外呼通道被打开了"
+            );
+        }
+        assert!(saw_any, "connect-src 是空的？那说明 CSP 结构变了，这条测试得跟着改");
+
+        for file in ["../src/agent/AgentPanel.tsx", "../src/App.tsx", "../src/ipc_contract.ts"] {
+            let text = std::fs::read_to_string(manifest.join(file)).unwrap();
+            for dial in ["fetch(", "XMLHttpRequest", "new WebSocket", "EventSource"] {
+                assert!(
+                    !text.contains(dial),
+                    "{file} 里出现了 {dial}：Agent 侧多了把系统信息带出本机的手法"
+                );
+            }
+        }
+    }
 }

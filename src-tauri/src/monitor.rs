@@ -346,7 +346,7 @@ impl Collector {
 
     pub fn network_metrics(&mut self) -> Vec<NetworkMetrics> {
         self.networks.refresh(true);
-        let elapsed = self.last_network_sample.elapsed().as_secs_f64().max(0.001);
+        let window = self.last_network_sample.elapsed();
         self.last_network_sample = Instant::now();
 
         let addresses: HashMap<String, crate::netinfo::InterfaceAddress> = crate::netinfo::list_interfaces()
@@ -357,8 +357,8 @@ impl Collector {
         let mut out = Vec::new();
         for (name, data) in self.networks.iter() {
             let addr = addresses.get(name);
-            let received = data.received() as f64 / elapsed;
-            let transmitted = data.transmitted() as f64 / elapsed;
+            let received = bytes_per_sec(data.received(), window);
+            let transmitted = bytes_per_sec(data.transmitted(), window);
             out.push(NetworkMetrics {
                 interface: name.clone(),
                 status: match addr.map(|a| (a.up, a.loopback)) {
@@ -781,7 +781,8 @@ impl MonitorService {
             #[cfg(debug_assertions)]
             eprintln!(
                 "[monitor] 进程查询变更: 关键字={:?} 排序={:?} desc={} offset={} limit={}",
-                normalized.keyword, normalized.sort_by, normalized.desc, normalized.offset, normalized.limit
+                crate::log_sanitize::sanitize(&format!("{:?}", normalized.keyword)),
+                normalized.sort_by, normalized.desc, normalized.offset, normalized.limit
             );
         }
         normalized
@@ -891,7 +892,7 @@ async fn run_metrics_loop(
                 if let Err(e) = app.emit(METRICS_EVENT, &snapshot) {
                     static EMIT_WARNED: std::sync::Once = std::sync::Once::new();
                     EMIT_WARNED.call_once(|| {
-                        eprintln!("[monitor] 事件 {} 推送失败: {}", METRICS_EVENT, e)
+                        eprintln!("[monitor] 事件 {} 推送失败: {}", METRICS_EVENT, crate::log_sanitize::sanitize(&e.to_string()))
                     });
                 }
                 #[cfg(debug_assertions)]
@@ -927,13 +928,14 @@ async fn run_metrics_loop(
                         event.value,
                         event.threshold,
                         event.consecutive,
-                        event.target
+                        // 挂载点也是路径：与落盘副本同口径过一遍脱敏（SEC-V08）
+                        crate::log_sanitize::sanitize(&format!("{:?}", event.target))
                     );
                     // 与 metrics 帧同口径：无人 listen 时 emit 失败就丢弃，不影响采集链路。
                     if let Err(e) = app.emit(crate::alert::ALERT_EVENT, &event) {
                         static ALERT_EMIT_WARNED: std::sync::Once = std::sync::Once::new();
                         ALERT_EMIT_WARNED.call_once(|| {
-                            eprintln!("[alert] 事件推送失败: {}", e)
+                            eprintln!("[alert] 事件推送失败: {}", crate::log_sanitize::sanitize(&e.to_string()))
                         });
                     }
                     // 落盘（T5-03）与推送是两件事：界面没打开、事件没人接，历史照样要留下。
@@ -954,7 +956,7 @@ async fn run_metrics_loop(
 
         // 采集耗时计入间隔；本帧超时则直接进入下一帧，不追赶欠下的 tick。
         let spent = frame_started.elapsed();
-        let sleep_for = tick.saturating_sub(spent);
+        let sleep_for = next_sleep(tick, spent);
         if !sleep_for.is_zero() {
             tokio::time::sleep(sleep_for).await;
         }
@@ -1027,7 +1029,7 @@ async fn run_process_loop(
                             page.total,
                             page.items.len(),
                             query.sort_by,
-                            query.keyword,
+                            crate::log_sanitize::sanitize(&format!("{:?}", query.keyword)),
                             page.warming,
                             head,
                         )
@@ -1146,6 +1148,23 @@ fn recover_processes_after_panic(sys: &mut System, warmed: &mut bool, reason: St
 
 fn round2(v: f64) -> f64 {
     (v * 100.0).round() / 100.0
+}
+
+/// R-05 的背压策略：采集耗时计入间隔，慢帧之后**不追赶欠下的 tick**。
+///
+/// 抽成纯函数是为了能测这条规则（见 `r05_the_loop_never_catches_up_missed_ticks`）。
+/// 它的反面写法是"睡到下一个整点时刻"那种 catch-up：一帧慢了之后会连着推好几帧补账，
+/// 那正是规划里 R-05 担心的"事件推送频率过高把 WebView 打顿"的成因。
+fn next_sleep(tick: Duration, spent: Duration) -> Duration {
+    tick.saturating_sub(spent)
+}
+
+/// 一个刷新窗口内的字节增量换算成 B/s —— UT-06 要的 `(bytes2 - bytes1) / interval`。
+/// `sysinfo` 的 `received()/transmitted()` 本身就是"自上次 refresh 的增量"，所以这里只除窗口长度。
+/// 下限夹到 1 ms 是刻意的：refresh 被连打两次时窗口可以接近 0，不夹会算出天文数字的速率。
+fn bytes_per_sec(delta: u64, window: Duration) -> f64 {
+    let secs = window.as_secs_f64().max(0.001);
+    delta as f64 / secs
 }
 
 pub fn pressure_for(usage_percent: f64) -> MemoryPressure {
@@ -2095,6 +2114,75 @@ mod tests {
         assert!(
             loop_body.contains("let tick = Duration::from_millis(cfg.interval_ms)"),
             "帧间隔没跟着每帧重读出来的配置走"
+        );
+    }
+
+    /// UT-06：网络速率 = 一个刷新窗口内的字节增量 ÷ 窗口秒数。
+    /// 规划设想的"预构造 NetworkData"在 sysinfo 0.33 里做不到（`NetworkData` 不公开构造），
+    /// 所以把算式抽成纯函数 `bytes_per_sec` 后直接量算法本身，再用真接口保证端到端不 NaN。
+    #[test]
+    fn ut06_network_rates_divide_the_window_increment_by_the_window_length() {
+        use Duration as D;
+        assert_eq!(bytes_per_sec(1_000_000, D::from_secs(1)), 1_000_000.0);
+        assert_eq!(bytes_per_sec(1_000_000, D::from_secs(2)), 500_000.0);
+        assert_eq!(bytes_per_sec(0, D::from_secs(10)), 0.0, "真空闲要报 0，不是 None");
+        // 窗口被连打两次时夹到 1 ms：这是刻意的下限，不夹会算出天文数字
+        assert_eq!(bytes_per_sec(500, D::from_nanos(10)), 500_000.0);
+        assert!(bytes_per_sec(u64::MAX, D::from_secs(1)).is_finite());
+
+        let mut collector = Collector::new();
+        let first = collector.network_metrics();
+        let second = collector.network_metrics();
+        for (a, b) in first.iter().zip(second.iter()) {
+            assert_eq!(a.interface, b.interface);
+            for value in [b.rx_bytes_per_sec, b.tx_bytes_per_sec] {
+                assert!(value.is_finite() && value >= 0.0, "{:?}", (&a.interface, value));
+            }
+            assert!(
+                b.total_received_bytes >= a.total_received_bytes,
+                "累计量只能单调增：{:?}",
+                (&a.interface, a.total_received_bytes, b.total_received_bytes)
+            );
+        }
+        assert!(!second.is_empty(), "本机没有网卡就不算测到这条");
+    }
+
+    /// R-05：慢帧之后不许补账。既是算法测试，也钉住循环真的在走这个函数
+    /// （留一句裸的 `tick.saturating_sub(spent)` 的话，以后谁改成 catch-up 不会有人发现）。
+    #[test]
+    fn r05_the_loop_never_catches_up_missed_ticks() {
+        assert_eq!(
+            next_sleep(Duration::from_millis(1000), Duration::from_millis(400)),
+            Duration::from_millis(600)
+        );
+        assert_eq!(
+            next_sleep(Duration::from_millis(1000), Duration::from_millis(1000)),
+            Duration::ZERO
+        );
+        assert_eq!(
+            next_sleep(Duration::from_millis(1000), Duration::from_secs(9)),
+            Duration::ZERO,
+            "超时 8 秒之后欠账必须清零，不能攒着下一轮连着推好几帧"
+        );
+
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let production = std::fs::read_to_string(manifest.join("src/monitor.rs"))
+            .unwrap()
+            .split("#[cfg(test)]")
+            .next()
+            .expect("monitor.rs 应有测试模块")
+            .to_string();
+        assert!(
+            production.contains("let sleep_for = next_sleep(tick, spent);"),
+            "循环没走 next_sleep：背压策略可能被改回 catch-up"
+        );
+        assert!(
+            !production.contains("let sleep_for = tick.saturating_sub(spent)"),
+            "还留着裸的 saturating_sub：算法与调用点已经脱钩"
+        );
+        assert!(
+            production.contains("if !sleep_for.is_zero()"),
+            "零等待不要再排一次 sleep（那是每帧一次的空转调度）"
         );
     }
 }

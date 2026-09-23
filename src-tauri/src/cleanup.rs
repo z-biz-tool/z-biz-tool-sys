@@ -1418,4 +1418,75 @@ mod tests {
         ids.dedup();
         assert_eq!(ids.len(), unique, "启动项 id 有重复：{ids:?}");
     }
+
+    // ==================== UT-09 / UT-11 / UT-12 / SEC-T06 ====================
+
+    /// UT-09：`~` 展开只认家目录前缀，其余一律原样。
+    #[test]
+    fn ut09_tilde_expansion_stays_under_the_home_directory() {
+        let home = dirs::home_dir().expect("测试需要家目录");
+        assert_eq!(expand_tilde("~"), Some(home.clone()));
+        assert_eq!(expand_tilde("~/"), Some(home.clone()));
+        assert_eq!(expand_tilde("~/Library/Caches"), Some(home.join("Library/Caches")));
+        // 非 ~ 前缀不动；`~user` 也不猜（猜错就会把别人的家目录当成扫描根）
+        assert_eq!(expand_tilde("/tmp/x"), Some(PathBuf::from("/tmp/x")));
+        assert_eq!(expand_tilde("~other/x"), Some(PathBuf::from("~other/x")));
+        assert!(expand_tilde("   ").is_none(), "空白输入不该展开成家目录");
+    }
+
+    /// UT-11：符号链接指向受保护目录时，**解析后的真身**说了算。
+    /// 这是扫描与清理两个入口共同的底线：只看声明字符串等于没有黑名单。
+    #[test]
+    fn ut11_a_symlink_into_a_denied_directory_is_refused_by_its_target() {
+        let dir = fixture("symlink");
+        let target = if cfg!(windows) { "C:\\Windows" } else { "/etc" };
+        let link = dir.join("假目录");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(target, &link).expect("测试需要能建符号链接");
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_dir(target, &link).expect("测试需要能建目录符号链接");
+
+        assert!(
+            approved_cleanup_root(&link.to_string_lossy()).is_none(),
+            "指向 {target} 的符号链接被当成了合法清理目标"
+        );
+        let err = resolve_scan_path(Some(&link.to_string_lossy())).unwrap_err();
+        assert_eq!(err.code, "PATH_DENIED", "扫描入口顺着符号链接爬进了 {target}");
+        let home = dirs::home_dir().map(|h| h.to_string_lossy().to_string()).unwrap_or_default();
+        assert!(!home.is_empty() || !err.message.contains(&home));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// UT-12：空目录的 `dir_size` 是 (0, 0)，不是 panic 也不是 None。
+    #[test]
+    fn ut12_dir_size_of_an_empty_directory_is_zero_without_panicking() {
+        let dir = fixture("empty-size");
+        assert_eq!(dir_size(&dir), (0, 0));
+        fs::create_dir_all(dir.join("只有一层空目录")).unwrap();
+        assert_eq!(dir_size(&dir), (0, 0), "只有空子目录时也该报 0/0");
+        write_files(&dir, 2, 7);
+        assert_eq!(dir_size(&dir), (14, 2), "夹具本身不对，后面的断言就没有意义");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// SEC-T06：带 `..` 的声明路径永远当不了清理目标 —— 闸看的是 canonicalize 之后的位置，
+    /// 所以字符串层面的穿越绕不过去。
+    #[test]
+    fn sec_t06_a_traversal_shaped_declared_path_is_never_a_cleanup_target() {
+        let home = dirs::home_dir().expect("测试需要家目录");
+        let traversals = vec![
+            format!("{}//../etc", home.display()),
+            "~/../../etc".to_string(),
+            "/etc".to_string(),
+            "/".to_string(),
+        ];
+        for declared in &traversals {
+            assert!(approved_cleanup_root(declared).is_none(), "{declared} 被当成了合法清理目标");
+        }
+        let result = cleanup_declared(&traversals);
+        assert_eq!(result.deleted_files, 0, "{result:?}");
+        assert_eq!(result.freed_bytes, 0, "{result:?}");
+        assert_eq!(result.skipped_paths, traversals.len(), "{result:?}");
+    }
 }

@@ -5,6 +5,7 @@ use crate::cleanup::{
     LargeFile, StartupItem,
 };
 use crate::error::{AppError, CommandResult};
+use crate::export;
 use crate::monitor::{
     self, MonitorConfig, MonitorService, ProcessPage, ProcessQuery, ProcessSort, StaticInfo,
 };
@@ -115,10 +116,6 @@ pub fn set_process_query(
     state: State<'_, MonitorService>,
     query: ProcessQuery,
 ) -> ProcessQuery {
-    // PROBE-E2E：临时回传通道，E2E 探针在 WKWebView 里跑完后把结果塞进 keyword 送回来
-    // （原生壳没有 CDP 可挂，stderr 是唯一能读到的出口）。验完删除。
-    #[cfg(debug_assertions)]
-    eprintln!("[probe-e2e] {}", query.keyword);
     state.set_process_query(query)
 }
 
@@ -164,24 +161,50 @@ pub struct DnsFlushResult {
     pub manual_command: Option<String>,
 }
 
-/// 只使用用户态可执行的命令；失败时返回可复制的手动命令，而不是挂起等密码。
-#[tauri::command]
-pub fn flush_dns_cache() -> DnsFlushResult {
-    let (program, args, manual): (&str, Vec<&str>, &str) = if cfg!(target_os = "macos") {
-        (
+/// 刷新 DNS 要跑的那条**用户态**命令，以及失败时给人复制的兜底命令。
+///
+/// 抽成纯函数是为了测试能跑：`flush_dns_cache()` 会真的改动系统解析器状态（macOS 那条兜底里还有
+/// `killall -HUP mDNSResponder`），让默认套件每次都刷一次是不该发生的副作用 —— 三条 CI 腿等于各刷一次。
+/// 决策部分（选哪条命令、兜底文案、不支持的平台）全在这里，可以不碰状态就被测完。`None` = 本平台没有用户态入口。
+pub(crate) fn dns_flush_plan() -> Option<(&'static str, Vec<&'static str>, &'static str)> {
+    if cfg!(target_os = "macos") {
+        return Some((
             "dscacheutil",
             vec!["-flushcache"],
             "sudo dscacheutil -flushcache; sudo killall -HUP mDNSResponder",
-        )
-    } else if cfg!(target_os = "linux") {
-        (
-            "resolvectl",
-            vec!["flush-caches"],
-            "sudo resolvectl flush-caches",
-        )
-    } else if cfg!(windows) {
-        ("ipconfig", vec!["/flushdns"], "ipconfig /flushdns")
+        ));
+    }
+    if cfg!(target_os = "linux") {
+        return Some(("resolvectl", vec!["flush-caches"], "sudo resolvectl flush-caches"));
+    }
+    if cfg!(windows) {
+        return Some(("ipconfig", vec!["/flushdns"], "ipconfig /flushdns"));
+    }
+    None
+}
+
+/// 刷新没成功时的说法：`stderr` 过脱敏，兜底命令照样给出。
+fn dns_failure(stderr: &str, manual: &str) -> DnsFlushResult {
+    let hint = if stderr.contains("not found") {
+        "sudo systemd-resolve --flush-caches"
     } else {
+        manual
+    };
+    DnsFlushResult {
+        flushed: false,
+        message: if stderr.is_empty() {
+            "DNS 缓存刷新未生效".to_string()
+        } else {
+            crate::log_sanitize::sanitize(&format!("DNS 缓存刷新未生效: {}", stderr))
+        },
+        manual_command: Some(hint.to_string()),
+    }
+}
+
+/// 只使用用户态可执行的命令；失败时返回可复制的手动命令，而不是挂起等密码。
+#[tauri::command]
+pub fn flush_dns_cache() -> DnsFlushResult {
+    let Some((program, args, manual)) = dns_flush_plan() else {
         return DnsFlushResult {
             flushed: false,
             message: "当前平台不支持刷新 DNS 缓存".to_string(),
@@ -195,26 +218,7 @@ pub fn flush_dns_cache() -> DnsFlushResult {
             message: "DNS 缓存已刷新".to_string(),
             manual_command: None,
         },
-        Ok(out) => {
-            let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-            let hint = if stderr.contains("not found") {
-                "sudo systemd-resolve --flush-caches"
-            } else {
-                manual
-            };
-            DnsFlushResult {
-                flushed: false,
-                message: if stderr.is_empty() {
-                    "DNS 缓存刷新未生效".to_string()
-                } else {
-                    crate::log_sanitize::sanitize(&format!(
-                        "DNS 缓存刷新未生效: {}",
-                        stderr
-                    ))
-                },
-                manual_command: Some(hint.to_string()),
-            }
-        }
+        Ok(out) => dns_failure(String::from_utf8_lossy(&out.stderr).trim(), manual),
         Err(e) => DnsFlushResult {
             flushed: false,
             message: crate::log_sanitize::sanitize(&format!("无法调用 {}: {}", program, e)),
@@ -373,6 +377,23 @@ pub fn get_thermal() -> thermal::ThermalReport {
     thermal::probe()
 }
 
+// ==================== 历史 CSV 导出（02 的 F5"可导出 CSV"）====================
+
+/// 把当前时间窗口的历史趋势导成一份 CSV。路径校验与原子写复用偏好导出那一套，
+/// 这里只负责"取哪一页数据"和"数据不够新/太多时怎么如实说"。
+#[tauri::command]
+pub fn export_history_csv(
+    state: State<'_, crate::history::HistoryState>,
+    path: String,
+    span_seconds: Option<u64>,
+) -> CommandResult<export::CsvExportOutcome> {
+    let Some(store) = state.0.as_ref() else {
+        return Err(AppError::failed("历史存储不可用：应用数据目录无法写入"));
+    };
+    let span = span_seconds.unwrap_or(crate::history::DEFAULT_SPAN_SECS);
+    export::write_history_csv(store, &path, crate::history::now_ms(), span)
+}
+
 // ==================== 系统通知（T5-02）====================
 
 /// 这一次运行里投过几条系统通知、失败几条。计数只增不减，所以"0 条"的含义是
@@ -417,14 +438,93 @@ pub fn import_prefs_file(path: String) -> CommandResult<prefs::ImportOutcome> {
 mod tests {
     use super::*;
 
+        /// A-04 / SEC：应用内只跑用户态命令，`sudo` 版本只作为**给人复制的兜底**存在。
+    /// 这条取代原来的 `dns_flush_never_shells_out_to_sudo` —— 那个测试每跑一次套件就真刷一次系统解析器，
+    /// 副作用不该由单测产生（要取证见下面的 `#[ignore]` 用例）。
     #[test]
-    fn dns_flush_never_shells_out_to_sudo() {
-        let result = flush_dns_cache();
+    fn dns_flush_plan_never_escalates_inside_the_app() {
+        let Some((program, args, manual)) = dns_flush_plan() else {
+            // 只有既不是 macOS / Linux / Windows 的目标才会走到这里
+            return;
+        };
+        assert!(!program.contains("sudo"), "应用内不许调用 sudo：{program}");
+        assert!(
+            !args.iter().any(|a| a.contains("sudo") || *a == "-HUP"),
+            "参数里出现了提权痕迹：{args:?}"
+        );
+        assert_ne!(program, "su");
+        assert!(!manual.trim().is_empty(), "必须给出可复制的兜底命令");
+        if cfg!(target_os = "macos") {
+            assert_eq!(program, "dscacheutil");
+            assert!(manual.contains("mDNSResponder"), "macOS 的兜底要说全两步：{manual}");
+        }
+        if cfg!(windows) {
+            assert!(
+                !manual.contains("sudo"),
+                "Windows 的兜底命令不该写 sudo（那里不需要）：{manual}"
+            );
+        }
+    }
+
+    /// 失败路径的文案、兜底与脱敏 —— 不用真的动系统解析器就能全部测到。
+    #[test]
+    fn dns_failures_offer_a_copyable_command_and_sanitize_the_reason() {
+        let home = dirs::home_dir()
+            .map(|h| h.to_string_lossy().to_string())
+            .unwrap_or_default();
+        if !home.is_empty() {
+            let result = dns_failure(
+                &format!("dscacheutil: {home}/x: Operation not permitted"),
+                "sudo dscacheutil -flushcache",
+            );
+            assert!(!result.flushed);
+            assert_eq!(
+                result.manual_command.as_deref(),
+                Some("sudo dscacheutil -flushcache")
+            );
+            assert!(
+                !result.message.contains(&home),
+                "错误原文里的家目录没脱敏：{}",
+                result.message
+            );
+        }
+        let missing = dns_failure("resolvectl: command not found", "sudo resolvectl flush-caches");
+        assert_eq!(
+            missing.manual_command.as_deref(),
+            Some("sudo systemd-resolve --flush-caches"),
+            "命令不存在时要换另一条兜底，而不是继续推同一条"
+        );
+        assert!(
+            !dns_failure("", "sudo dscacheutil -flushcache")
+                .message
+                .is_empty(),
+            "stderr 为空也要给一句人话"
+        );
+    }
+
+    /// A-04 的真机取证（3 秒内返回、不挂起等密码）。默认套件**不跑**：它会真的刷新本机 DNS 缓存。
+    /// 需要时用 `cargo test --lib -- --ignored` 显式执行，输出的那一行就是 A-04 的证据。
+    #[tokio::test]
+    #[ignore = "会真的刷新本机 DNS 缓存（macOS 上还牵涉 mDNSResponder），只在取证时手动跑"]
+    async fn dns_flush_returns_within_three_seconds_on_this_machine() {
+        let started = std::time::Instant::now();
+        let result = tokio::task::spawn_blocking(flush_dns_cache).await.unwrap();
+        let elapsed = started.elapsed();
+        println!(
+            "A-04 证据: {:?} 用时 {:.3}s",
+            result,
+            elapsed.as_secs_f64()
+        );
+        assert!(elapsed < Duration::from_secs(3), "DNS 刷新不该挂起：{elapsed:?}");
+        assert!(
+            !result.message.contains("sudo: a terminal is required"),
+            "不许把提权失败当成结果抛给用户：{}",
+            result.message
+        );
         if let Some(cmd) = &result.manual_command {
             assert!(!result.flushed, "自动刷新成功时不应再给手动命令");
-            assert!(!cmd.is_empty(), "手动兜底命令不应为空");
+            assert!(!cmd.trim().is_empty(), "兜底命令不应为空");
         }
-        assert!(!result.message.contains("sudo: a terminal is required"));
     }
 
     /// SEC-V06：后端不得以提权方式执行命令，失败时只能返回供用户复制的手动命令。
@@ -585,5 +685,36 @@ mod tests {
         assert!(section.contains("agent::answer"), "Agent 分节没有转调引擎");
         // 采集只允许走 monitor 的只读入口
         assert!(section.contains("monitor::collect_top"));
+    }
+
+    /// SEC-T01：CSP 必须**写在配置里**且不含通配/eval —— 这条防的是配置回归（改回 `null`
+    /// 或图省事加 `unsafe-eval`，前端不会报错，只是注入防护整段没了）。
+    /// 浏览器里"注入被拦下"这一半本机没法自动化，仍按未验证记在 06。
+    #[test]
+    fn sec_t01_the_content_security_policy_is_declared_and_narrow() {
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let raw = std::fs::read_to_string(manifest.join("tauri.conf.json")).unwrap();
+        let conf: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let csp = conf["app"]["security"]["csp"]
+            .as_str()
+            .expect("CSP 必须是字符串（配成 null 等于没有策略）");
+        assert!(csp.contains("script-src 'self'"), "script-src 没收紧：{csp}");
+        for forbidden in ["unsafe-eval", "https://*", " 'self ' ", "<nonce>", "*"] {
+            assert!(!csp.contains(forbidden), "CSP 里出现了 {forbidden:?}：{csp}");
+        }
+        assert!(csp.contains("default-src 'self'"), "default-src 兜底没了：{csp}");
+    }
+
+    /// SEC-T04：命令边界上杀 PID 1 必须被拒，且**在发信号之前**就拒。
+    /// （terminate() 内部第一步就是 validate_kill；这条锁的是命令层的返回码。）
+    #[tokio::test]
+    async fn sec_t04_killing_pid_one_is_refused_at_the_command_boundary() {
+        let err = kill_process(1, None).await.unwrap_err();
+        assert_eq!(err.code, "PERMISSION_DENIED", "PID 1 没在命令层被拦下：{err:?}");
+        // 低 PID 的理由必须是"系统进程区间"，不能是"属于其他用户"（后者会让人以为换个权限就能杀）
+        assert!(err.message.contains("系统进程") && err.message.contains("禁止"),
+            "PID 1 的拒绝理由说错了：{}", err.message);
+        assert!(!err.message.contains("其他用户"), "PID 1 被判成属主问题：{}", err.message);
+        assert!(err.detail.is_none() || cfg!(debug_assertions), "detail 只许在 debug 构建里出现");
     }
 }

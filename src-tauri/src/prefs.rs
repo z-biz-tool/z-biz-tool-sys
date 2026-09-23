@@ -82,7 +82,18 @@ fn prefs_root_allowed(dir: &Path) -> bool {
 ///
 /// 目标文件本身可以还不存在（导出到新文件名），但**所在目录必须能 canonicalize** ——
 /// 不先把 `..` 与符号链接折回真实路径，黑名单就只是看着像有。
-fn resolve_json_path(raw: &str, must_exist: bool) -> CommandResult<PathBuf> {
+/// 共用的一枚"落盘边界"守卫：**指定后缀 + 用户可写范围 + 可选的存在性与体积检查**。
+///
+/// 偏好文件与历史 CSV 导出走的是同一个函数，而不是各写一份校验：两份规则一旦漂移，
+/// 就会出现"CSV 能写到 `/System` 而 JSON 不能"这种只有挨个测才能发现的问题。
+/// `kind` 只用于把错误说成人话（"偏好文件" / "历史 CSV"）。
+pub(crate) fn resolve_target_path(
+    raw: &str,
+    must_exist: bool,
+    extension: &str,
+    kind: &str,
+    max_bytes: u64,
+) -> CommandResult<PathBuf> {
     if raw.trim().is_empty() {
         return Err(AppError::invalid_input("必须先选择一个文件路径"));
     }
@@ -93,10 +104,10 @@ fn resolve_json_path(raw: &str, must_exist: bool) -> CommandResult<PathBuf> {
     if expanded
         .extension()
         .and_then(|ext| ext.to_str())
-        .map(|ext| ext.eq_ignore_ascii_case("json"))
+        .map(|ext| ext.eq_ignore_ascii_case(extension))
         != Some(true)
     {
-        return Err(AppError::invalid_input("偏好文件必须是 .json 文件"));
+        return Err(AppError::invalid_input(format!("{kind}必须是一个 .{extension} 文件")));
     }
 
     let parent = expanded
@@ -111,9 +122,9 @@ fn resolve_json_path(raw: &str, must_exist: bool) -> CommandResult<PathBuf> {
         return Err(AppError::path_denied("该位置属于系统或受保护目录，不能读写偏好文件"));
     }
     if !prefs_root_allowed(&canonical_parent) {
-        return Err(AppError::path_denied(
-            "只能在用户主目录或临时目录（含 /tmp）之下读写偏好文件",
-        ));
+        return Err(AppError::path_denied(format!(
+            "只能在用户主目录或临时目录（含 /tmp）之下读写{kind}"
+        )));
     }
 
     if must_exist {
@@ -123,15 +134,41 @@ fn resolve_json_path(raw: &str, must_exist: bool) -> CommandResult<PathBuf> {
         if !meta.is_file() {
             return Err(AppError::invalid_input("选中的不是一个普通文件"));
         }
-        if meta.len() > MAX_PREFS_FILE_BYTES {
+        if meta.len() > max_bytes {
             return Err(AppError::invalid_input(format!(
-                "文件 {} B 超过 {} B 上限，不像是一份偏好文件",
+                "文件 {} B 超过 {} B 上限，不像是一份{kind}",
                 meta.len(),
-                MAX_PREFS_FILE_BYTES
+                max_bytes,
             )));
         }
     }
     Ok(canonical)
+}
+
+/// 偏好文件那一套参数（`.json` + 64 KiB 上限）的快捷入口。
+fn resolve_json_path(raw: &str, must_exist: bool) -> CommandResult<PathBuf> {
+    resolve_target_path(raw, must_exist, "json", "偏好文件", MAX_PREFS_FILE_BYTES)
+}
+
+/// 同目录临时文件 + rename：中途失败既不会留下半份文件，也不会留下 `xxx.tmp-<pid>`。
+/// 失败时顺手把临时文件删掉 —— 用户目录里的半成品没人会去清理。
+pub(crate) fn write_bytes_atomically(target: &Path, bytes: &[u8]) -> CommandResult<()> {
+    let file_name = target
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| "export.tmp".to_string());
+    let temp = target.with_file_name(format!("{file_name}.tmp-{}", std::process::id()));
+    if let Err(e) = fs::write(&temp, bytes) {
+        let _ = fs::remove_file(&temp);
+        return Err(AppError::failed(format!("写入临时文件失败: {}", e))
+            .with_detail(sanitize(&temp.to_string_lossy())));
+    }
+    if let Err(e) = fs::rename(&temp, target) {
+        let _ = fs::remove_file(&temp);
+        return Err(AppError::failed(format!("替换目标文件失败: {}", e))
+            .with_detail(sanitize(&target.to_string_lossy())));
+    }
+    Ok(())
 }
 
 fn prefs_keys(prefs: &Value) -> usize {
@@ -160,20 +197,7 @@ pub fn write_prefs_file(path: &str, prefs: Value) -> CommandResult<ExportOutcome
         )));
     }
 
-    let file_name = target
-        .file_name()
-        .map(|name| name.to_string_lossy().to_string())
-        .unwrap_or_else(|| "prefs.json".to_string());
-    let temp = target.with_file_name(format!("{file_name}.tmp-{}", std::process::id()));
-    if let Err(e) = fs::write(&temp, &bytes) {
-        let _ = fs::remove_file(&temp);
-        return Err(AppError::failed(format!("写入临时文件失败: {}", e)).with_detail(sanitize(&temp.to_string_lossy())));
-    }
-    if let Err(e) = fs::rename(&temp, &target) {
-        // rename 失败时把临时文件一起清掉：留在用户目录里的 `xxx.json.tmp-1234` 没人会去删。
-        let _ = fs::remove_file(&temp);
-        return Err(AppError::failed(format!("替换目标文件失败: {}", e)).with_detail(sanitize(&target.to_string_lossy())));
-    }
+    write_bytes_atomically(&target, &bytes)?;
 
     Ok(ExportOutcome {
         path: target.to_string_lossy().to_string(),

@@ -1,4 +1,4 @@
-import { Col, Row, Segmented, Space, Typography } from "antd";
+import { Button, Col, Row, Segmented, Space, Typography } from "antd";
 import { CloudOutlined, DesktopOutlined, HddOutlined, WifiOutlined } from "@ant-design/icons";
 import dayjs from "dayjs";
 import { useMemo } from "react";
@@ -20,6 +20,8 @@ export function OverviewTab({
   onTrendRangeChange,
   seedInfo,
   alertEvents,
+  onExportCsv,
+  csvExporting,
 }: {
   staticInfo: StaticInfo | null;
   snapshot: MetricsSnapshot | null;
@@ -29,6 +31,9 @@ export function OverviewTab({
   seedInfo: HistorySeedInfo | null;
   /** 已触发的告警（会话内 + 落盘回填），用来在曲线上标竖线 */
   alertEvents: AlertEvent[];
+  /** 导出当前范围的历史趋势为 CSV（02 的 F5"可导出 CSV"） */
+  onExportCsv: () => void;
+  csvExporting: boolean;
 }) {
   const cpu = snapshot?.cpu;
   const memory = snapshot?.memory;
@@ -158,6 +163,14 @@ export function OverviewTab({
               onChange={(v) => onTrendRangeChange(Number(v))}
               options={TREND_RANGES.map((r) => ({ label: r.label, value: r.value }))}
             />
+            <Button
+              size="small"
+              loading={csvExporting}
+              onClick={onExportCsv}
+              title="列为 timestamp_ms / cpu_percent / memory_percent / rx_bytes_per_sec / tx_bytes_per_sec / bucket_seconds；每行自带桶宽，最后一列等于 10 才是原始采样点。全是指势数值，不含路径与进程名。"
+            >
+              导出 CSV
+            </Button>
           </Space>
         </Col>
       </Row>

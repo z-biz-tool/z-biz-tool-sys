@@ -145,6 +145,25 @@ pub fn validate_kill(pid: u32) -> CommandResult<KillValidation> {
         });
     }
 
+    // 低 PID 的判断要**排在属主查询之前**：PID 1 这类进程我们用普通权限读不到属主，
+    // 先查属主就会把它报成"属于其他用户"，而真实理由是"系统进程区间，禁止结束"。
+    // 报错误的原因比不报错误更糟 —— 用户会以为换个权限就能杀。
+    if pid <= SYSTEM_PID_CEILING {
+        let name = crate::monitor::lookup_process(pid)
+            .map(|info| info.name)
+            .unwrap_or_default();
+        return Ok(KillValidation {
+            process_name: name,
+            ..denied(
+                format!(
+                    "PID {} 属于系统进程（PID ≤ {}），已禁止结束",
+                    pid, SYSTEM_PID_CEILING
+                ),
+                KillRiskLevel::Blocked,
+            )
+        });
+    }
+
     match process_exists(pid) {
         Ok(false) => return Err(AppError::process_not_found(format!("PID {pid} 不存在"))),
         Err(_) => {
@@ -158,19 +177,6 @@ pub fn validate_kill(pid: u32) -> CommandResult<KillValidation> {
 
     let info = crate::monitor::lookup_process(pid)
         .ok_or_else(|| AppError::process_not_found(format!("PID {pid} 不存在")))?;
-
-    if pid <= SYSTEM_PID_CEILING {
-        return Ok(KillValidation {
-            process_name: info.name.clone(),
-            ..denied(
-                format!(
-                    "PID {} 属于系统进程（PID ≤ {}），已禁止结束",
-                    pid, SYSTEM_PID_CEILING
-                ),
-                KillRiskLevel::Blocked,
-            )
-        });
-    }
 
     if is_protected(&info.name) {
         return Ok(KillValidation {
@@ -392,5 +398,40 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code, "PERMISSION_DENIED");
+    }
+
+    /// UT-03：保护名单按**本平台那份**逐项拒绝，且大小写不敏感（真实进程名的大小写各家不同）。
+    #[test]
+    fn ut03_every_protected_name_on_this_platform_is_blocked() {
+        for name in PROTECTED_NAMES {
+            assert!(is_protected(name), "名单里的 {name} 没被拦住");
+            assert!(is_protected(&name.to_uppercase()), "{name} 的大写形式没被拦住");
+            assert!(is_protected(&name.to_lowercase()), "{name} 的小写形式没被拦住");
+        }
+        if cfg!(not(windows)) {
+            // 规划点名的四个里，`systemd` 在**非 Windows 这一份共用名单**里（macOS 腿也在跑它），
+            // 所以正确的断言是"另一平台的条目不许漏到本平台"。
+            for name in ["launchd", "kernel_task", "WindowServer", "systemd"] {
+                assert!(is_protected(name), "规划点名的 {name} 不在名单里");
+            }
+            assert!(!is_protected("csrss.exe"), "Windows 名单漏进了非 Windows 平台");
+        }
+        assert!(!is_protected("TextEditor"), "普通应用名不该进保护名单");
+    }
+
+    /// UT-04：普通用户进程要放行。用一个真的子进程（不是 mock 名单），
+    /// 这样"放行"这条分支是真的走通的 —— 只 validate，不发信号。
+    #[test]
+    fn ut04_an_ordinary_user_process_is_allowed() {
+        let child = std::process::Command::new("sleep")
+            .arg("20")
+            .spawn()
+            .expect("需要一个真的子进程来验放行分支");
+        let pid = child.id();
+        let verdict = validate_kill(pid).expect("普通进程应当可读元信息");
+        assert!(verdict.allowed, "普通用户进程被拒了：{:?}", verdict.denied_reason);
+        assert_eq!(verdict.process_name, "sleep");
+        assert_eq!(verdict.risk_level, KillRiskLevel::Standard, "sleep 不该被判成关键进程");
+        drop(child);
     }
 }

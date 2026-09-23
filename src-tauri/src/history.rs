@@ -291,7 +291,7 @@ impl HistoryRecorder {
         if let Some(err) = &read.io_error {
             // 整个文件打不开时 `points` 是空的，照常修剪等于用空集合覆盖历史文件 ——
             // 那会把"暂时读不到"变成"永久没了"。宁可这一轮不修剪。
-            eprintln!("[history] 读取失败，跳过修剪: {err}");
+            eprintln!("[history] 读取失败，跳过修剪: {}", sanitize(&err.to_string()));
             return 0;
         }
         let total = read.points.len();
@@ -567,7 +567,7 @@ impl AlertRecorder {
         let read = self.store.read();
         if let Some(err) = &read.io_error {
             // 同趋势侧：读不出来时 `records` 是空的，继续修剪会用空集合覆盖整个告警文件。
-            eprintln!("[alert] 读取失败，跳过修剪: {err}");
+            eprintln!("[alert] 读取失败，跳过修剪: {}", sanitize(&err.to_string()));
             return 0;
         }
         let total = read.records.len();
@@ -1358,6 +1358,41 @@ mod tests {
         blocked
     }
 
+    /// 跨平台可跑的守卫门禁：**读失败必须在任何重写之前退出**。
+    ///
+    /// 为什么钉在源码顺序上（2026-09-23 实测后的结论）：`Jsonl::read` 只在"`File::open` 失败且不是
+    /// `NotFound`"时才置 `io_error`，而三平台里能稳定造出这种失败的只有 unix 的权限位 ——
+    /// `chmod 000` 那两条用例覆盖行为，Windows 腿既造不出读失败（`NotFound` 被当合法空页、
+    /// 目录占位在 macOS 连错误都不报、Windows 的共享冲突又会让覆盖写自身失败），
+    /// 就没有任何注入能让它复现这个场景。所以顺序这条让三条腿都跑得到，避免"Windows 上守卫被删掉
+    /// 也没有任何测试会红"。这是结构证明，不是行为证明，不冒充后者。
+    #[test]
+    fn the_read_failure_guard_precedes_every_rewrite_on_both_prune_paths() {
+        let source = include_str!("history.rs");
+        for fn_name in ["fn prune_if_expired", "fn prune_if_needed"] {
+            let body = source
+                .split(fn_name)
+                .nth(1)
+                .unwrap_or_else(|| panic!("history.rs 应有 {fn_name}"))
+                .split("\n    }")
+                .next()
+                .expect("函数应有结尾")
+                .to_string();
+            let guard = body
+                .find("if let Some(err) = &read.io_error")
+                .unwrap_or_else(|| panic!("{fn_name} 里读失败不再跳过修剪了"));
+            let ret = guard + body[guard..]
+                .find("return 0")
+                .unwrap_or_else(|| panic!("{fn_name} 的 io_error 守卫没有退出：读失败时会拿空集合去修剪"));
+            if let Some(rewrite) = body.find(".rewrite(") {
+                assert!(
+                    ret < rewrite,
+                    "{fn_name} 里重写排在守卫之前 —— 读失败时会覆盖历史文件"
+                );
+            }
+        }
+    }
+
     #[test]
     #[cfg(unix)]
     fn a_history_file_that_cannot_be_read_is_not_overwritten_by_pruning() {
@@ -1426,6 +1461,164 @@ mod tests {
             "读不出来时把计数当 0，之后触顶判断会以为文件还早着呢"
         );
         assert_eq!(store.read().records.len(), 3);
+        cleanup(&dir);
+    }
+
+    /// 06 里那条"两份 jsonl 的并发写没有专门测试（结构上串行，但这是推理而非实测）"——现在打成实测，
+    /// 而且实测结果本身改了结论：**并发追加在 macOS/APFS 上会把行写断**（240 行里只能解析出 172 行，
+    /// 其余变成坏行计数），所以"每写一次新开句柄 + `O_APPEND`"并不保证并发安全。
+    /// 真正起作用的前提是生产的写法本身：两份文件都由采集线程按顺序写。于是这里测两件事：
+    /// ① 串行写（生产形态）下两份文件行数精确、0 坏行、互不污染；
+    /// ② 万一以后有人把写挪到并发线程里，损坏也**必须被如实计入 `unreadable_lines`**，
+    ///    绝不能静默少数据 —— `records + unreadable == 写入次数` 就是这条底线。
+    #[test]
+    fn serial_appends_are_exact_and_concurrent_ones_never_lose_lines_silently() {
+        let dir = fixture("writes");
+        let history = HistoryStore::new(&dir);
+        let alerts = AlertStore::new(&dir);
+        let base = 1_700_000_000_000;
+
+        // ① 生产形态：同一个线程按顺序写两份文件
+        for i in 0..120u64 {
+            history.append(point(base + i * SAMPLE_INTERVAL_MS, 33.0)).unwrap();
+            alerts
+                .append(&event(base + i * 1_000, AlertMetric::Memory, AlertLevel::Warning, 91.0, None))
+                .unwrap();
+        }
+        let serial_history = history.read_all();
+        assert_eq!(serial_history.points.len(), 120);
+        assert_eq!(serial_history.unreadable_lines, 0, "串行写就该一行不坏");
+        let serial_alerts = alerts.read();
+        assert_eq!(serial_alerts.records.len(), 120);
+        assert_eq!(serial_alerts.unreadable_lines, 0);
+
+        // ② 故意并发追加两份文件（不是生产形态）：要证的是"损坏不造假、不算重"
+        const THREADS: usize = 4;
+        const PER_THREAD: usize = 60;
+        let handles: Vec<_> = (0..THREADS)
+            .map(|t| {
+                let history = history.clone();
+                let alerts = alerts.clone();
+                std::thread::spawn(move || {
+                    for i in 0..PER_THREAD {
+                        let at = base + 10_000_000 + (t * PER_THREAD + i) as u64 * 1_000;
+                        history.append(point(at, t as f64 + 1.0)).unwrap();
+                        alerts
+                            .append(&event(at, AlertMetric::Cpu, AlertLevel::Critical, 99.0, None))
+                            .unwrap();
+                    }
+                })
+            })
+            .collect();
+        for handle in handles {
+            let _ = handle.join();
+        }
+        let written = THREADS * PER_THREAD;
+        let after_history = history.read_all();
+        let after_alerts = alerts.read();
+        // 交错写会把两条"合并成一行读不出来"，所以行数**不守恒**（这正是本轮实测到的事实：
+        // 240 次追加只剩 172 条可解析，连坏行计数一起也不到 240）。因此底线不能写成"行数守恒"，
+        // 要写成损坏真正不可能违反的那两条：
+        //   ① 不造出没写过的数据；② 不把同一行算成两条。
+        let accounted = after_history.points.len() + after_history.unreadable_lines;
+        assert!(
+            accounted <= 120 + written,
+            "计数超过写入数，说明读侧在凭空造行：{accounted}"
+        );
+        assert!(
+            after_history.unreadable_lines > 0 || after_history.points.len() == 120 + written,
+            "要么承认并发写坏了行、要么一行没坏；两者都不成立就是数错了"
+        );
+        let mut history_stamps: Vec<u64> = after_history.points.iter().map(|p| p.t).collect();
+        let before_dedupe = history_stamps.len();
+        history_stamps.sort_unstable();
+        history_stamps.dedup();
+        assert_eq!(history_stamps.len(), before_dedupe, "同一个点被算成了两条");
+        let serial_low = base;
+        let concurrent_high = base + 10_000_000 + (written * 1_000) as u64;
+        assert!(
+            after_history
+                .points
+                .iter()
+                .all(|p| (serial_low..concurrent_high).contains(&p.t)),
+            "解析得出的点必须都来自真写过的时间戳"
+        );
+
+        let alerts_accounted = after_alerts.records.len() + after_alerts.unreadable_lines;
+        assert!(alerts_accounted <= 120 + written, "告警侧同理：{alerts_accounted}");
+        let mut alert_stamps: Vec<u64> = after_alerts.records.iter().map(|e| e.timestamp_ms).collect();
+        let alerts_before_dedupe = alert_stamps.len();
+        alert_stamps.sort_unstable();
+        alert_stamps.dedup();
+        assert_eq!(alert_stamps.len(), alerts_before_dedupe, "告警被算重了");
+        assert!(alert_stamps
+            .iter()
+            .all(|t| (serial_low..concurrent_high).contains(t)));
+        assert_eq!(after_history.io_error, None);
+        assert_eq!(after_alerts.io_error, None);
+        // 两份文件即便都写坏，也不会互相污染成对方的格式（各读各的都读得动）
+        assert!(after_history.points.iter().all(|p| p.cpu >= 0.0));
+        assert!(after_alerts.records.iter().all(|e| e.timestamp_ms > 0));
+
+        cleanup(&dir);
+    }
+
+    /// 修剪一份文件不得顺手重写另一份：两者各有自己的修剪触发条件与临时文件。
+    /// 06 里这条也属于"结构上看起来独立，但没人测过"。
+    #[test]
+    fn pruning_one_file_leaves_the_other_untouched() {
+        let dir = fixture("prune-isolation");
+        let history = HistoryStore::new(&dir);
+        let alerts = AlertStore::new(&dir);
+        let base = 1_700_000_000_000;
+        for i in 0..6 {
+            history.append(point(base + i * SAMPLE_INTERVAL_MS, 30.0)).unwrap();
+            alerts
+                .append(&event(base + i * 1_000, AlertMetric::Cpu, AlertLevel::Critical, 99.0, None))
+                .unwrap();
+        }
+        let history_path = dir.join(HISTORY_FILE_NAME);
+        let alert_path = dir.join(ALERT_FILE_NAME);
+        let alerts_before = fs::read(&alert_path).unwrap();
+        let alerts_mtime_before = fs::metadata(&alert_path).unwrap().modified().unwrap();
+
+        // 历史侧：写进一个跨过保留窗口的新点，修剪应当在这一次 observe 里发生
+        let mut recorder = HistoryRecorder::open(history.clone());
+        let way_past = base + RETENTION_MS + SAMPLE_INTERVAL_MS * 5;
+        assert!(recorder.observe(point(way_past, 9.0)), "新点要落盘");
+        assert!(
+            recorder.pruned_points > 0,
+            "跨了保留窗口却没修剪，这条测试就什么都没测到：{:?}",
+            recorder.pruned_points
+        );
+
+        let alerts_after = fs::read(&alert_path).unwrap();
+        assert_eq!(alerts_before, alerts_after, "修剪历史时动了告警文件");
+        assert_eq!(
+            fs::metadata(&alert_path).unwrap().modified().unwrap(),
+            alerts_mtime_before,
+            "告警文件的 mtime 变了，说明它被重写过"
+        );
+        assert_eq!(alerts.read().records.len(), 6, "告警内容应原封不动");
+
+        // 反向：修剪告警文件也不得碰历史文件
+        let history_before = fs::read(&history_path).unwrap();
+        let mut alert_recorder = AlertRecorder::with_limits(alerts.clone(), ALERT_RETENTION_MS, 3, 2, 0);
+        let dropped = alert_recorder.prune_if_needed(base + 10_000);
+        assert!(dropped > 0, "6 条超出上限 3 却没剪掉，这条测试什么都没测到：{dropped}");
+        assert_eq!(
+            fs::read(&history_path).unwrap(),
+            history_before,
+            "修剪告警时重写了历史文件"
+        );
+
+        let leftovers: Vec<String> = fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|name| name.contains(".tmp-"))
+            .collect();
+        assert!(leftovers.is_empty(), "修剪留下了临时文件：{leftovers:?}");
         cleanup(&dir);
     }
 }

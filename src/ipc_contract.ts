@@ -183,6 +183,25 @@ export interface ThermalReport {
 }
 
 /**
+ * 历史趋势导出的 CSV 结果（02 的 F5"可导出 CSV"）。
+ * `rows` 是真实写出去的数据行数；`bucketSeconds` 说明这些行是 10 s 原始点还是更粗的桶均值 ——
+ * 少了这一列，拿 CSV 去二次计算的人会分钟均值当成瞬时值。
+ */
+export interface CsvExportOutcome {
+  path: string;
+  bytes: number;
+  rows: number;
+  spanSeconds: number;
+  bucketSeconds: number;
+  /** 该区间内实际落盘的点数（压缩之前），与 rows 一起才能说明"有没有被压缩过" */
+  storedPoints: number;
+  oldestMs: number | null;
+  newestMs: number | null;
+  /** 读盘时解析失败的行数：导出只如实带上，不修补 */
+  unreadableLines: number;
+}
+
+/**
  * 系统通知（T5-02）的投递记账。刻意只有"提交/失败"两个数，**没有"已送达"**：
  * macOS 的默认通知后端是在句柄析构时才真正发送、并把错误丢掉的，
  * 所以 `submitted` 只说明"这条交给了操作系统的通知接口"。
@@ -190,6 +209,8 @@ export interface ThermalReport {
 export interface NotifyStatus {
   submitted: number;
   failed: number;
+  /** 主窗口全屏（演示）时本应用**主动没投**的条数：02 的 F6 自动静默。告警事件与落盘不受影响 */
+  suppressed: number;
   /** 最后一次失败的原文；从没失败过时是 `null`，那不等于"全都弹出来了" */
   lastError: string | null;
   /** 本平台能不能报出投递失败。macOS 为 `false`，界面据此决定要不要挂那句说明 */
@@ -483,6 +504,8 @@ export const Commands = {
   notifyStatus: "notify_status",
   /** 投一条文案固定的测试通知（T5-02）；不接收任何参数，避免变成任意文本注入通道 */
   sendTestNotification: "send_test_notification",
+  /** 把当前时间窗口的历史趋势导成 CSV（02 的 F5）；路径由系统保存框给，后端仍会校后缀与可写范围 */
+  exportHistoryCsv: "export_history_csv",
 } as const;
 
 /** 把 invoke/listen 抛出的任意值归一化为可读文案 */

@@ -151,7 +151,7 @@ export interface Beta {
         let contract = std::fs::read_to_string(manifest.join("../src/ipc_contract.ts")).unwrap();
         assert_eq!(
             ts_interface_keys(&contract, "NotifyStatus"),
-            ["deliveryIsReported", "failed", "lastError", "submitted"]
+            ["deliveryIsReported", "failed", "lastError", "submitted", "suppressed"]
         );
         assert_eq!(
             ts_interface_keys(&contract, "ThermalReport"),

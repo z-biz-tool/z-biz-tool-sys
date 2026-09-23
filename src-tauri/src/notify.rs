@@ -25,7 +25,7 @@ use crate::alert::{AlertEvent, AlertLevel, AlertMetric};
 use crate::log_sanitize::sanitize;
 use serde::Serialize;
 use std::sync::{Arc, Mutex};
-use tauri::AppHandle;
+use tauri::{AppHandle, Manager};
 use tauri_plugin_notification::NotificationExt;
 
 /// 通知标题的前缀。Toast 是单行的（`lib/alert.ts` 的 `alertText`），系统通知需要一个标题，
@@ -84,6 +84,10 @@ pub struct NotifyStatus {
     pub submitted: u32,
     /// 通知接口当场返回 `Err` 的条数（macOS 那条路几乎总是拿不到错误，见第 3 条）。
     pub failed: u32,
+    /// 因为主窗口在全屏（演示）而**根本没投**的条数 —— 02 的 F6"全屏/演示模式自动静默"。
+    /// 与 `failed` 分得很清：这是本应用自己决定不投，不是系统拒了；且**告警照样落盘、事件照推**，
+    /// 静默的只是会盖在演示画面上的那条系统横幅。
+    pub suppressed: u32,
     /// 最后一次失败的原文（过 `sanitize`）。从没失败过时是 `None` —— 界面要显示"没有失败记录"，
     /// 不能拿 `null` 当成"投递成功"。
     pub last_error: Option<String>,
@@ -102,6 +106,7 @@ impl Default for NotifyStatus {
         Self {
             submitted: 0,
             failed: 0,
+            suppressed: 0,
             last_error: None,
             delivery_is_reported: cfg!(not(target_os = "macos")),
         }
@@ -124,6 +129,14 @@ impl NotifyState {
             guard.failed += 1;
             guard.last_error = Some(reason.clone());
         }
+    }
+
+    /// 记一次"因为全屏/演示而没投"。单独计数，绝不与"投递失败"混成同一个数。
+    pub fn record_suppressed(&self) {
+        let Ok(mut guard) = self.0.lock() else {
+            return;
+        };
+        guard.suppressed += 1;
     }
 
     pub fn status(&self) -> NotifyStatus {
@@ -156,8 +169,27 @@ pub fn post<R: tauri::Runtime>(
     outcome
 }
 
+/// 主窗口是不是正占着整屏（演示/全屏）。
+///
+/// 只读 getter ⇒ **capabilities 一条都不用加**（与投递走 Rust API 同一个理由）。
+/// 报错或取不到窗口时一律按"不在全屏"处理：宁可多弹一条横幅，也不静默吞掉一次告警。
+pub fn in_presentation<R: tauri::Runtime>(app: &AppHandle<R>) -> bool {
+    app
+        .get_webview_window("main")
+        .and_then(|window| window.is_fullscreen().ok())
+        .unwrap_or(false)
+}
+
 /// 告警事件专用的投递入口：文案由 [`alert_texts`] 生成，判定不在这里发生。
+///
+/// 02 的 F6 要求"全屏/演示模式自动静默"：主窗口全屏时**只跳过系统通知这一路**，
+/// 采集循环在此之前已经推完 `sys://alert` 事件、也写完落盘历史 —— 所以列表、角标、
+/// 跨重启历史都不受影响，被静默的条数记进 `suppressed` 让界面能明说"这几条没弹"。
 pub fn post_alert<R: tauri::Runtime>(app: &AppHandle<R>, state: &NotifyState, event: &AlertEvent) {
+    if in_presentation(app) {
+        state.record_suppressed();
+        return;
+    }
     let _ = post(app, state, alert_texts(event));
 }
 
@@ -416,6 +448,7 @@ mod tests {
         let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let contract = std::fs::read_to_string(manifest.join("../src/ipc_contract.ts")).unwrap();
         let status = NotifyState::default().status();
+        assert_eq!(status.suppressed, 0, "没投过就不该有静默计数");
         assert_eq!(
             serialized_keys(&serde_json::to_value(&status).unwrap()),
             ts_interface_keys(&contract, "NotifyStatus"),
@@ -485,6 +518,56 @@ mod tests {
         assert!(
             !hook.contains("new Notification") && !hook.contains("plugin-notification"),
             "同上：告警链路的前端半边只读记账、不自己发通知"
+        );
+    }
+
+    /// 静默与失败是两个不同的事实，混成一个数就等于说"系统拒了"，而真相是"我们自己没投"。
+    #[test]
+    fn a_suppressed_delivery_is_counted_separately_from_a_failed_one() {
+        let state = NotifyState::default();
+        state.record_suppressed();
+        state.record_suppressed();
+        state.record(&Ok(()));
+        state.record(&Err("通知中心拒收".to_string()));
+        let status = state.status();
+        assert_eq!(status.suppressed, 2, "{status:?}");
+        assert_eq!(status.submitted, 2, "静默的那两条不该算进已提交：{status:?}");
+        assert_eq!(status.failed, 1, "{status:?}");
+        assert_eq!(status.last_error.as_deref(), Some("通知中心拒收"));
+    }
+
+    /// 接线：静默必须发生在投递**之前**，且只看主窗口的只读 getter（不扩 capabilities）。
+    #[test]
+    fn the_presentation_check_happens_before_any_delivery() {
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let production = std::fs::read_to_string(manifest.join("src/notify.rs"))
+            .unwrap()
+            .split("#[cfg(test)]")
+            .next()
+            .expect("notify.rs 应有测试模块")
+            .to_string();
+        let check = production
+            .find("if in_presentation(app)")
+            .expect("post_alert 不再检查全屏/演示状态：02 的 F6 自动静默丢了");
+        let send = production
+            .find("let _ = post(app, state, alert_texts(event));")
+            .expect("post_alert 的投递调用不见了");
+        assert!(check < send, "静默判断必须在投递之前：{check} > {send}");
+        assert!(
+            production.contains("get_webview_window(\"main\")"),
+            "只该看主窗口，且用只读 getter（不加任何 capabilities 权限）"
+        );
+        assert!(
+            production.contains("window.is_fullscreen().ok()"),
+            "取不到状态时必须按不静默处理（宁可多弹一条，也不静默吞掉告警）"
+        );
+        let drawer =
+            std::fs::read_to_string(manifest.join("../src/components/AlertSettingsDrawer.tsx")).unwrap();
+        use crate::contract_fixtures::strip_ts_comments;
+        let visible = strip_ts_comments(&drawer);
+        assert!(
+            visible.contains("notifyStatus.suppressed"),
+            "被静默的条数必须在界面上说清楚，不能成为一条看不见的规则"
         );
     }
 

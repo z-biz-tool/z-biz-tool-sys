@@ -27,6 +27,7 @@ import {
 } from "@ant-design/icons";
 import dayjs from "dayjs";
 import { invoke } from "@tauri-apps/api/core";
+import { save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import {
   Commands,
@@ -41,6 +42,7 @@ import {
   type ProcessDetail,
   type ScanProgress,
   type StartupItem,
+  type CsvExportOutcome,
   type ThermalReport,
 } from "./ipc_contract";
 import { useAlerts } from "./hooks/useAlerts";
@@ -140,6 +142,34 @@ function App() {
     [msgApi]
   );
   const alerts = useAlerts(alertConfig, alertNotice, setAlertConfig);
+
+  // 导出的是"图上正在看的那个范围"：范围由趋势图的 Segmented 决定，导出与显示同源才不会骗人
+  const onExportCsv = useCallback(async () => {
+    setCsvExporting(true);
+    try {
+      // 保存框本身也可能失败（对话框不可用、被系统拒），所以它必须在 try 里：
+      // 放在外面会变成一次未捕获的 promise rejection，用户点了按钮什么也不会发生。
+      const target = await saveDialog({
+        defaultPath: `z-biz-tool-sys-history-${trendRange}s.csv`,
+        filters: [{ name: "CSV", extensions: ["csv"] }],
+      });
+      if (!target) return; // 用户取消：不是错误，也不谎报"已导出"
+      const outcome = await invoke<CsvExportOutcome>(Commands.exportHistoryCsv, {
+        path: target,
+        spanSeconds: trendRange,
+      });
+      const resolution =
+        outcome.bucketSeconds === 10
+          ? "10 s 原始采样点"
+          : `每行是 ${outcome.bucketSeconds} s 的均值`;
+      const broken = outcome.unreadableLines ? `，另有 ${outcome.unreadableLines} 行读不出未写入` : "";
+      msgApi.success(`已导出 ${outcome.rows} 行（${resolution}，共 ${outcome.bytes} B${broken}）`);
+    } catch (e) {
+      reportError("导出历史 CSV", e);
+    } finally {
+      setCsvExporting(false);
+    }
+  }, [trendRange, msgApi, reportError]);
   const [alertPanelOpen, setAlertPanelOpen] = useState(false);
   // 偏好导入/导出（T5-11）：入口在"系统信息"页，弹层渲染在树尾，故页签白名单取自 tabItems
   const [prefsPanelOpen, setPrefsPanelOpen] = useState(false);
@@ -165,6 +195,8 @@ function App() {
   // 温度/风扇（T5-08）：不进采集流，只在进系统信息页时读一次 + 手动刷新。
   // 读数本身可能永远为空（macOS 没有免提权通路），所以 null 与"空报告"是两种状态：
   // null = 还没查到（没试过，或那一次失败了），空报告 = 查到了、后端给了"为什么没有读数"的原因。
+  // 历史趋势导出 CSV（02 的 F5）
+  const [csvExporting, setCsvExporting] = useState(false);
   const [thermal, setThermal] = useState<ThermalReport | null>(null);
   const [loadingThermal, setLoadingThermal] = useState(false);
   // "这一页查过没有"要单独记一笔：失败时 thermal 会退回 null，若拿 `thermal === null` 当"没查过"，
@@ -472,6 +504,8 @@ function App() {
             onTrendRangeChange={setTrendRange}
             seedInfo={seedInfo}
             alertEvents={alerts.events}
+            onExportCsv={onExportCsv}
+            csvExporting={csvExporting}
           />
         </ErrorBoundary>
       ),

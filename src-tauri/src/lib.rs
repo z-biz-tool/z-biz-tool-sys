@@ -5,6 +5,7 @@ mod commands;
 #[cfg(test)]
 mod contract_fixtures;
 mod error;
+mod export;
 mod history;
 mod log_sanitize;
 mod monitor;
@@ -72,6 +73,7 @@ pub fn run() {
             commands::import_prefs_file,
             commands::agent_query,
             commands::get_thermal,
+            commands::export_history_csv,
             commands::notify_status,
             commands::send_test_notification,
         ])

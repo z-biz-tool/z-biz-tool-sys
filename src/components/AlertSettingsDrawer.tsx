@@ -106,6 +106,12 @@ export function AlertSettingsDrawer({ open, onClose, config, onChange, snapshot,
           </Button>
           <Text type="secondary">{notifyCountLine}</Text>
         </Space>
+        {notifyStatus && notifyStatus.suppressed > 0 && (
+          <Text type="secondary">
+            本会话有 {notifyStatus.suppressed} 条因窗口全屏（演示）没投系统通知 ——
+            只有横幅被静默，告警事件与落盘历史照常，列表里能查到这几条。
+          </Text>
+        )}
         {testOutcome && <Text type={testOutcome.level}>{testOutcome.text}</Text>}
         {/* macOS 的通知后端不会把投递结果报回来，所以这里只能说"提交"，不能说"已送达" */}
         {notifyStatus && !notifyStatus.deliveryIsReported && (
