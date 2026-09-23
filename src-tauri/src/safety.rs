@@ -430,7 +430,13 @@ mod tests {
         let pid = child.id();
         let verdict = validate_kill(pid).expect("普通进程应当可读元信息");
         assert!(verdict.allowed, "普通用户进程被拒了：{:?}", verdict.denied_reason);
-        assert_eq!(verdict.process_name, "sleep");
+        // 映像名按平台原样上报：同一个 `sleep` 在 Windows 上的真身是 `sleep.exe`。
+        // 这条断言钉的是"名称取自内核给的映像名、没被截断或改写"，不是"名字必须等于命令名"。
+        assert_eq!(
+            verdict.process_name,
+            format!("sleep{}", std::env::consts::EXE_SUFFIX),
+            "进程名要就是本平台这个可执行文件的映像名"
+        );
         assert_eq!(verdict.risk_level, KillRiskLevel::Standard, "sleep 不该被判成关键进程");
         drop(child);
     }

@@ -613,7 +613,11 @@ mod tests {
         let src = put(&a, "com.example.agent.plist", "<plist>payload-42</plist>");
         // 动之前先记下 canonical 真身：rename 之后再 canonicalize 只会拿到 Err，
         // 那时断言写成"失败就用返回值兜底"等于什么都没验。
-        let src_canonical = fs::canonicalize(&src).unwrap();
+        // 用 canonicalize_clean 而不是 fs::canonicalize：后者在 Windows 上给出 `\\?\C:\...`
+        // 这种 verbatim 形式，而产品侧回给用户的两条路径一律过 strip_verbatim（见 cleanup.rs 的
+        // 那条注释：verbatim 会绕过按字符串前缀判定的黑名单）。拿裸 canonicalize 当预期，
+        // 测的就不是"回显口径"而是"这台机器的 Windows 路径表示法"了。
+        let src_canonical = canonicalize_clean(&src).unwrap();
         let outcome = operate(&a.layout, StartupAction::Disable, &id_of("com.example.agent.plist"), "com.example.agent.plist")
             .expect("禁用应成功");
 
@@ -623,7 +627,7 @@ mod tests {
         assert_eq!(fs::read_to_string(&landed).unwrap(), "<plist>payload-42</plist>");
         assert_eq!(outcome.bytes, 25, "字节数应与源文件一致：<plist>payload-42</plist> 是 25 B：{outcome:?}");
         // 回给用户的两头路径都是 canonical 真身（macOS 的 /var 会折成 /private/var）
-        assert_eq!(outcome.to_path, fs::canonicalize(&landed).unwrap().to_string_lossy());
+        assert_eq!(outcome.to_path, canonicalize_clean(&landed).unwrap().to_string_lossy());
         assert_eq!(outcome.from_path, src_canonical.to_string_lossy(), "from_path 要能对着访达找得到");
         assert!(outcome.listed, "禁用项仍然列在界面里才能恢复");
         assert_eq!(outcome.action, StartupAction::Disable);

@@ -453,7 +453,15 @@ mod tests {
         assert!((temp.value - 52.34).abs() < 1e-9, "毫摄氏度要除以 1000：{}", temp.value);
         assert_eq!(temp.critical, Some(95.0), "传感器自己声明的上限要带出去");
         assert_eq!(temp.kind, SensorKind::Temperature);
-        assert_eq!(temp.source, format!("{}/class/hwmon/hwmon0/temp1_input", tree.root.display()));
+        // 期望值按产品同一串 join 顺序拼（probe_at 是 root.join("class/hwmon") 再逐段 join），
+        // 写成 `format!("{root}/class/hwmon/...")` 在 Windows 上会得到另一种分隔符混排：
+        // 该字段是界面上"这块数据从哪来"的凭据，测试要钉的是节点位置，不是字符串拼法。
+        let expected_source = tree
+            .root
+            .join("class/hwmon")
+            .join("hwmon0")
+            .join("temp1_input");
+        assert_eq!(temp.source, expected_source.to_string_lossy(), "读数要指回它真正来自的节点");
 
         let fan = tree.sensor(&report, "CPU FAN");
         assert_eq!(fan.value, 2410.0, "风扇已经是 RPM，不能再除 1000");
