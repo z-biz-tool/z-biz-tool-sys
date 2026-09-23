@@ -1,11 +1,19 @@
 name: CI
 
 # 只做跨平台门禁（typecheck / 前端构建 / 测试 / clippy），不产出发布物 —— 发布仍由 build.yml 负责。
-# 刻意只在 pull_request 与手动触发上跑：本仓有直接向 main 推 WIP 的习惯，加 push 触发会让每次 WIP
-# 都占满三个 runner。
+# push 到 main 也跑：本仓的日常是直接推 main、不开 PR，只挂 pull_request 等于没有门禁
+# （要等到出 tag 才有下一次验证，而那已经是最贵的那一步）。
 on:
+  push:
+    branches: [main]
   pull_request:
   workflow_dispatch:
+
+# 同一分支新 push 取消旧 run。与下面"push 只跑两条腿"合起来控制消耗：
+# 直接推 main 的习惯不会把三个 runner 同时占满。
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 # 这个 job 不写任何东西（不建 release、不传产物），所以权限收到最小。
 permissions:
@@ -15,14 +23,11 @@ jobs:
   test:
     strategy:
       fail-fast: false
+      # push 时砍掉 macOS 腿：本机就是 macOS，这条腿在每次 push 上不增量发现什么；
+      # 真正只有 CI 能验的是 Linux/Windows 上的 cfg(unix)/cfg(windows) 分支与文件系统语义。
+      # PR 与 workflow_dispatch（出包前的最后一次确认）仍跑全三条腿。
       matrix:
-        include:
-          - platform: macos-latest
-            label: macOS-ARM
-          - platform: ubuntu-22.04
-            label: Linux
-          - platform: windows-latest
-            label: Windows
+        platform: ${{ github.event_name == 'push' && fromJSON('["ubuntu-22.04", "windows-latest"]') || fromJSON('["macos-latest", "ubuntu-22.04", "windows-latest"]') }}
 
     runs-on: ${{ matrix.platform }}
     timeout-minutes: 45
