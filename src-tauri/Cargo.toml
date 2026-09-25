@@ -3,6 +3,7 @@ name = "z-biz-tool-sys"
 version = "0.1.0"
 description = "系统监控仪表盘 - 对标iStat Menus/Stats"
 edition = "2021"
+license = "MIT"
 
 [lib]
 name = "z_biz_tool_sys_lib"

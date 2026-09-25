@@ -1,6 +1,7 @@
 {
   "name": "z-biz-tool-sys",
   "version": "0.1.0",
+  "license": "MIT",
   "description": "系统监控仪表盘 - 对标iStat Menus/Stats",
   "type": "module",
   "scripts": {
