@@ -51,6 +51,7 @@ const INTENT_TEXT: Record<AgentReply["intent"], string> = {
   startupItems: "启动项",
   junkFiles: "垃圾清理",
   temperature: "温度/风扇",
+  runtimeCensus: "运行时归类",
   unknown: "未识别",
 };
 

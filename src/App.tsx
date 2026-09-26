@@ -39,7 +39,9 @@ import {
   type JunkReport,
   type KillValidation,
   type LargeFile,
+  type ListeningReport,
   type ProcessDetail,
+  type ProcessRollup,
   type ScanProgress,
   type StartupItem,
   type StartupAction,
@@ -122,6 +124,7 @@ function App() {
     changeSort: changeProcessSort,
     changePage: changeProcessPage,
     changePageSize: changeProcessPageSize,
+    changeOnlyDetached: changeProcessOnlyDetached,
     correctPageToRange: correctProcessPage,
   } = useProcessQuery();
   const processes = useProcessStream(activeTab === "processes" && !miniMode, processQuery);
@@ -203,6 +206,13 @@ function App() {
   // 历史趋势导出 CSV（02 的 F5）
   const [csvExporting, setCsvExporting] = useState(false);
   const [thermal, setThermal] = useState<ThermalReport | null>(null);
+  // 系统性观察（T6-01）：归类合计 + 监听端口。两者都不进采集流（全量枚举和起 lsof 都不便宜），
+  // 进进程页读一次、之后只由「重新观察」按钮再读。
+  // `null` 与"空数组"是两种状态：null = 没查到（没试过或那一次失败），空 = 查到了、真的没有。
+  const [rollup, setRollup] = useState<ProcessRollup[] | null>(null);
+  const [listeners, setListeners] = useState<ListeningReport | null>(null);
+  const [loadingObservation, setLoadingObservation] = useState(false);
+  const [observationTried, setObservationTried] = useState(false);
   const [loadingThermal, setLoadingThermal] = useState(false);
   // "这一页查过没有"要单独记一笔：失败时 thermal 会退回 null，若拿 `thermal === null` 当"没查过"，
   // 那次失败本身就把依赖改了、立刻再发一条 IPC（浏览器实测：点一次"重新读取"失败 → 2 条 get_thermal）。
@@ -433,6 +443,34 @@ function App() {
     }
   }, [activeTab, thermalTried, loadThermal]);
 
+  // 系统性观察（T6-01）：两条命令各自独立失败——归类走全量枚举、端口要起一次 lsof，
+  // 任何一条挂了不能把另一条的结果一起清空，否则界面会把"端口通路断了"显示成"没进程"。
+  const loadObservation = useCallback(async () => {
+    setLoadingObservation(true);
+    try {
+      const [buckets, sockets] = await Promise.all([
+        invoke<ProcessRollup[]>(Commands.getProcessRollup),
+        invoke<ListeningReport>(Commands.getListeningSockets),
+      ]);
+      setRollup(buckets);
+      setListeners(sockets);
+    } catch (e) {
+      setRollup(null);
+      setListeners(null);
+      reportError("读取归类与端口", e);
+    } finally {
+      setLoadingObservation(false);
+    }
+  }, [msgApi, reportError]);
+
+  // 和温度同一个理由：`tried` 单独记一笔，失败退回 null 不会立刻再发一轮 IPC。
+  useEffect(() => {
+    if (activeTab === "processes" && !observationTried) {
+      setObservationTried(true);
+      void loadObservation();
+    }
+  }, [activeTab, observationTried, loadObservation]);
+
   const flushDns = useCallback(async () => {    try {
       const result = await invoke<DnsFlushResult>(Commands.flushDns);
       if (result.flushed) {
@@ -597,6 +635,12 @@ function App() {
             onRefresh={processes.refresh}
             onOpenDetail={setDetailPid}
             onRequestKill={requestKill}
+            onlyDetached={processQuery.onlyDetached}
+            onOnlyDetachedChange={changeProcessOnlyDetached}
+            rollup={rollup}
+            listeners={listeners}
+            observationLoading={loadingObservation}
+            onRefreshObservation={() => void loadObservation()}
           />
         </ErrorBoundary>
       ),

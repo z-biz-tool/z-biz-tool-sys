@@ -67,6 +67,16 @@ export interface ProcessInfo {
   userName: string | null;
   parentPid: number | null;
   runTimeSeconds: number | null;
+  /**
+   * 父进程已经是 launchd（或查不到）：原始启动者退出过。
+   * 这不等于"垃圾残骸"——launchd 托管的系统守护进程同样满足，要不要收手由人判。
+   */
+  detached: boolean;
+  /**
+   * 有效 uid 与本应用相同。**false 有两种含义**：确实是别人的进程，或这个进程的 uid
+   * 根本读不到（非提权进程看不了别人的进程）。所以界面只说"其他/未知"，不说"root 进程"。
+   */
+  ownedByCurrentUser: boolean;
 }
 
 export interface ProcessPage {
@@ -89,6 +99,8 @@ export interface ProcessQuery {
   desc: boolean;
   offset: number;
   limit: number;
+  /** 只看"父进程已是 launchd"的那些行（T6-01 的残骸筛选用） */
+  onlyDetached: boolean;
 }
 
 /** 点击进程行按需拉取；刻意不含命令行参数与环境变量 */
@@ -105,6 +117,49 @@ export interface ProcessDetail {
   cpuUsage: number;
   memoryBytes: number;
   isSelf: boolean;
+}
+
+/**
+ * 一个运行时/应用归类的合计（T6-01）。
+ *
+ * `memoryBytes` 是**各进程常驻内存之和**：跨进程共享页会重复计入，所以这个数比实际
+ * 物理占用偏大。刻意不去"校正"成看起来合理的数——口径能讲清楚，比数字好看有用。
+ * 来源是一次全量枚举，不受进程表 `MAX_PROCESSES_PER_PAGE` 那 300 行的分页影响。
+ */
+export interface ProcessRollup {
+  /** 固定枚举值之一：JVM / Python / Node / Qoder / Chrome / WebKit / 系统服务 / 其他 */
+  category: string;
+  processCount: number;
+  memoryBytes: number;
+  /** 其中父进程已是 launchd 的个数 */
+  detachedCount: number;
+  /** 这一类里内存最大的进程，供一键定位；桶为空时为 null */
+  topPid: number | null;
+  topName: string | null;
+}
+
+/** 一个 TCP LISTEN 套接字（T6-01 的端口反查）。进程名不在这里，一律以进程表为准。 */
+export interface ListeningSocket {
+  pid: number;
+  port: number;
+  /** `*`、`127.0.0.1`、`[::1]` 之类 */
+  address: string;
+  /** 目前只枚举 `tcp` */
+  protocol: string;
+  /**
+   * 占端口的进程名，由后端 join 进程表得到（**不是** lsof 的 COMMAND 列，那一列截到 15 字符）。
+   * null = 这一轮进程表里没有这个 pid（刚退出或没枚举到），不等于"没有名字"。
+   */
+  processName: string | null;
+}
+
+/**
+ * 监听端口报告。空表一定要带着"为什么空"：没 lsof、没权限、真的一个都没有，
+ * 这三种情况下用户下一步完全不同，糊成一个空列表等于没说。
+ */
+export interface ListeningReport {
+  sockets: ListeningSocket[];
+  reason: string | null;
 }
 
 /** 启动时一次性拉取的静态信息 */
@@ -446,6 +501,7 @@ export type AgentIntent =
   | "startupItems"
   | "junkFiles"
   | "temperature"
+  | "runtimeCensus"
   | "unknown";
 export type AgentRankBy = "cpu" | "memory";
 export type AgentSeverity = "info" | "warning" | "critical";
@@ -534,6 +590,10 @@ export const Commands = {
   sendTestNotification: "send_test_notification",
   /** 把当前时间窗口的历史趋势导成 CSV（02 的 F5）；路径由系统保存框给，后端仍会校后缀与可写范围 */
   exportHistoryCsv: "export_history_csv",
+  /** 按运行时归类的进程合计（T6-01）；无参数，走一次全量枚举而不是进程表那一页 */
+  getProcessRollup: "get_process_rollup",
+  /** TCP LISTEN 端口 → 占用进程（T6-01）；无参数、只读 */
+  getListeningSockets: "get_listening_sockets",
 } as const;
 
 /** 把 invoke/listen 抛出的任意值归一化为可读文案 */

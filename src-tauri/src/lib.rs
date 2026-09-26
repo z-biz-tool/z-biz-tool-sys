@@ -11,6 +11,7 @@ mod log_sanitize;
 mod monitor;
 mod netinfo;
 mod notify;
+mod observe;
 mod platform;
 mod prefs;
 mod safety;
@@ -61,6 +62,8 @@ pub fn run() {
             commands::stop_process_stream,
             commands::set_process_query,
             commands::get_processes,
+            commands::get_process_rollup,
+            commands::get_listening_sockets,
             commands::get_process_detail,
             commands::validate_kill,
             commands::kill_process,

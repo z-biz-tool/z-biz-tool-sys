@@ -9,6 +9,7 @@ use crate::monitor::{
     self, MonitorConfig, MonitorService, ProcessPage, ProcessQuery, ProcessSort, StaticInfo,
 };
 use crate::notify;
+use crate::observe;
 use crate::platform::thermal;
 use crate::prefs;
 use crate::safety::{self, KillOutcome, KillValidation};
@@ -138,6 +139,49 @@ pub fn get_processes(state: State<'_, MonitorService>) -> ProcessPage {
 pub fn get_process_detail(pid: u32) -> CommandResult<monitor::ProcessDetail> {
     monitor::collect_process_detail(pid)
         .ok_or_else(|| AppError::process_not_found(format!("PID {pid} 不存在或已退出")))
+}
+
+// ==================== 系统性观察（T6-01）====================
+
+/// 归类汇总用的全量枚举 + 归桶。Agent 的"这类进程为什么这么多"也走这一条，
+/// 所以采集只在这里出现一次，两处共用同一份口径。
+///
+/// 刻意不走 `get_processes`：那条路受 `MAX_PROCESSES_PER_PAGE = 300` 夹取，
+/// 而本机实测 730 个进程 —— 拿分页页做汇总会**静默少算四百多个**，
+/// 却照样报出一排整齐的桶，比崩溃更难发现。
+fn collect_rollup() -> Vec<observe::ProcessRollup> {
+    observe::rollup_from(&monitor::collect_all_rows())
+}
+
+/// 按运行时/应用归类：谁占了多少、几个、其中几个已脱离启动者。
+#[tauri::command]
+pub async fn get_process_rollup() -> Vec<observe::ProcessRollup> {
+    tauri::async_runtime::spawn_blocking(collect_rollup)
+        .await
+        .unwrap_or_default()
+}
+
+/// 监听端口反查进程。只读。
+///
+/// 端口和名字分两次采是刻意的：`lsof` 给"谁在听哪个端口"，进程表给"那个 pid 叫什么"。
+/// join 用一次全量枚举换一张 pid→名字表，比每个 socket 各查一次进程便宜得多。
+/// 名字不从 `lsof` 的 COMMAND 列取 —— 那一列截到 15 字符，同一个进程会在两张表里叫两个名字。
+///
+/// 线程 panic 时也要带 `reason` 返回：空 `sockets` 加空 `reason` 会让界面显示成
+/// "这台机器一个端口都没在听"，那是假结论而不是未知。
+#[tauri::command]
+pub async fn get_listening_sockets() -> observe::ListeningReport {
+    let joined = || {
+        let mut report = observe::listening_sockets();
+        observe::attach_process_names(&mut report, &monitor::collect_all_rows());
+        report
+    };
+    tauri::async_runtime::spawn_blocking(joined)
+        .await
+        .unwrap_or_else(|_| observe::ListeningReport {
+            sockets: Vec::new(),
+            reason: Some("端口采集线程异常终止".to_string()),
+        })
 }
 
 // ==================== 危险操作 ====================
@@ -365,6 +409,12 @@ fn rank_needs(parsed: &agent::Parsed) -> (bool, bool) {
     }
 }
 
+/// 归类意图才付全量枚举的成本。刻意和 `rank_needs` 分开：排行榜要的是"前几名"，
+/// 走的是暖过机的采样窗；归类只要内存和个数，CPU 一行都不采（见 `collect_rollup`）。
+fn needs_rollup(parsed: &agent::Parsed) -> bool {
+    matches!(parsed.intent, agent::Intent::RuntimeCensus)
+}
+
 /// 只读的诊断问答：输入自由文本，输出结论 + **待确认的导航建议**，不执行任何东西。
 /// 边界由 `agent` 模块的类型保证（无命令/参数/路径字段），这里也只调 `answer`。
 /// 采集是同步且要等采样窗口的，所以放到 `spawn_blocking`，别把窗口线程拖住。
@@ -385,6 +435,13 @@ pub async fn agent_query(
     } else {
         (Vec::new(), Vec::new())
     };
+    let rollup = if needs_rollup(&parsed) {
+        tauri::async_runtime::spawn_blocking(collect_rollup)
+            .await
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
 
     Ok(agent::answer(
         &query,
@@ -395,6 +452,7 @@ pub async fn agent_query(
             alert: &alert,
             // 温度这条支路只在"问到温度"时才会被读到；非 Linux 平台上 probe() 是一次字符串判断，不碰文件。
             thermal: &thermal::probe(),
+            rollup: &rollup,
         },
     ))
 }

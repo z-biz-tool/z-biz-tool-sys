@@ -13,6 +13,7 @@ export function useProcessQuery() {
   const [sort, setSort] = useState<ProcessSortState>({ by: "cpu", desc: true });
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(PROCESS_PAGE_SIZE);
+  const [onlyDetached, setOnlyDetached] = useState(false);
 
   // 关键字或排序变化后回到第一页：否则偏移会落在新结果集的空段上。
   const changeKeyword = useCallback((value: string) => {
@@ -35,6 +36,11 @@ export function useProcessQuery() {
     setPageSize(next);
     setPage(1);
   }, []);
+  /** 只看"父进程已是 launchd"的行（T6-01）。同样回到第一页：结果集整个换了一批。 */
+  const changeOnlyDetached = useCallback((next: boolean) => {
+    setOnlyDetached(next);
+    setPage(1);
+  }, []);
   /**
    * 页码不能越过当前结果集的页数。T5-10 之后这一步更要紧：换页容量、或进程数在翻页途中缩水时，
    * 旧偏移会落到新结果集末尾之后，而后端 `offset.min(total)` 只会给出**空的一页** —— 表格看着像"没进程"。
@@ -55,8 +61,9 @@ export function useProcessQuery() {
       desc: sort.desc,
       offset: (page - 1) * pageSize,
       limit: pageSize,
+      onlyDetached,
     }),
-    [keyword, sort, page, pageSize]
+    [keyword, sort, page, pageSize, onlyDetached]
   );
 
   return {
@@ -65,10 +72,12 @@ export function useProcessQuery() {
     sort,
     page,
     pageSize,
+    onlyDetached,
     changeKeyword,
     changeSort,
     changePage,
     changePageSize,
+    changeOnlyDetached,
     correctPageToRange,
   };
 }

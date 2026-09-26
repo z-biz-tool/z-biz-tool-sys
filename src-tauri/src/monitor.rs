@@ -13,7 +13,9 @@ pub const METRICS_EVENT: &str = "sys://metrics";
 pub const PROCESSES_EVENT: &str = "sys://processes";
 
 const MIN_INTERVAL_MS: u64 = 200;
-const MAX_PROCESSES_PER_PAGE: usize = 300;
+/// 进程表一页最多多少行。公开是因为归类的口径说明要引用这个数（`agent::census_report`
+/// 得讲清楚"汇总走的是全量枚举，不是这一页"），不是一个可以被随手改的魔数。
+pub const MAX_PROCESSES_PER_PAGE: usize = 300;
 const DEFAULT_PROCESS_PAGE_SIZE: usize = 50;
 /// 进程表在此时间内视为可信，避免每次 kill 校验都全量枚举。
 const PROCESS_CACHE_TTL: Duration = Duration::from_secs(10);
@@ -111,6 +113,11 @@ pub struct ProcessInfo {
     pub user_name: Option<String>,
     pub parent_pid: Option<u32>,
     pub run_time_seconds: Option<u64>,
+    /// 父进程已是 launchd（或查不到）：原始启动者退出过。见 `observe::is_detached`。
+    pub detached: bool,
+    /// 有效 uid 与本应用相同。用来把"用户自己挂上来的"和"root 的守护进程"分开；
+    /// 取不到 uid 时一律为 false，绝不假定属主成立。
+    pub owned_by_current_user: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -144,6 +151,8 @@ pub struct ProcessQuery {
     pub desc: bool,
     pub offset: usize,
     pub limit: usize,
+    /// 只看被 launchd 收养的进程。用来把"启动者已经退出的那批"单独筛出来。
+    pub only_detached: bool,
 }
 
 impl Default for ProcessQuery {
@@ -154,6 +163,7 @@ impl Default for ProcessQuery {
             desc: true,
             offset: 0,
             limit: DEFAULT_PROCESS_PAGE_SIZE,
+            only_detached: false,
         }
     }
 }
@@ -167,10 +177,14 @@ impl ProcessQuery {
             desc: self.desc,
             offset: self.offset,
             limit: self.limit.clamp(1, MAX_PROCESSES_PER_PAGE),
+            only_detached: self.only_detached,
         }
     }
 
     fn matches(&self, proc: &ProcessInfo) -> bool {
+        if self.only_detached && !proc.detached {
+            return false;
+        }
         if self.keyword.is_empty() {
             return true;
         }
@@ -549,38 +563,66 @@ pub fn collect_top(by: ProcessSort, limit: usize) -> Vec<ProcessInfo> {
         desc: true,
         offset: 0,
         limit,
+        only_detached: false,
     };
     collect_processes_warmed(&query).items
 }
 
+/// 枚举一次全量进程行：不过滤、不排序、不分页。
+///
+/// 单独开这个口子是因为 `MAX_PROCESSES_PER_PAGE` 只有 300，而本机实测有 743 个进程 ——
+/// 归类汇总若走分页路径，会**静默少算 443 个**却照样报出整齐的桶。
+fn process_rows(sys: &mut System) -> Vec<ProcessInfo> {
+    sys.refresh_processes_specifics(ProcessesToUpdate::All, true, process_refresh_kind());
+    let uid = crate::observe::current_uid();
+    sys.processes()
+        .iter()
+        .map(|(pid, proc_info)| {
+            let parent_pid = proc_info.parent().map(|p| p.as_u32());
+            ProcessInfo {
+                pid: pid.as_u32(),
+                name: {
+                    let raw = proc_info.name();
+                    if raw.is_empty() {
+                        "(unknown)".to_string()
+                    } else {
+                        raw.to_string_lossy().into_owned()
+                    }
+                },
+                cpu_usage: round2(proc_info.cpu_usage() as f64),
+                memory_bytes: proc_info.memory(),
+                threads: None,
+                // sysinfo 0.30 不提供跨平台的属主名，交由 OS 权限判定兜底。
+                user_name: None,
+                parent_pid,
+                run_time_seconds: Some(proc_info.run_time()),
+                detached: crate::observe::is_detached(parent_pid),
+                // `Uid` 在 unix 上 Deref 到 `libc::uid_t`，没有 `as_u32` 那样的取值方法
+                // （`as_u32` 是 `Pid` 的），所以要解两层才拿到数值；真正的相等判定交给
+                // `observe::uid_matches`，那张三方向的真值表只有纯函数能钉死。
+                owned_by_current_user: crate::observe::uid_matches(
+                    proc_info.effective_user_id().map(|their| **their),
+                    uid,
+                ),
+            }
+        })
+        .collect()
+}
+
+/// 归类汇总用的一次性全量枚举。
+///
+/// 不做 CPU 三步暖机（H-06）：桶里只加内存和计数，不读 `cpu_usage`，
+/// 为用不到的差值白等 260 ms 不值。哪天要按 CPU 汇总，得改走 `collect_processes_warmed`。
+pub fn collect_all_rows() -> Vec<ProcessInfo> {
+    let mut sys = process_system();
+    process_rows(&mut sys)
+}
+
 pub fn collect_processes(sys: &mut System, warmed: bool, raw_query: &ProcessQuery) -> ProcessPage {
     let query = raw_query.normalized();
-    sys.refresh_processes_specifics(ProcessesToUpdate::All, true, process_refresh_kind());
+    let mut rows = process_rows(sys);
 
-    let mut rows: Vec<ProcessInfo> = sys
-        .processes()
-        .iter()
-        .map(|(pid, proc_info)| ProcessInfo {
-            pid: pid.as_u32(),
-            name: {
-                let raw = proc_info.name();
-                if raw.is_empty() {
-                    "(unknown)".to_string()
-                } else {
-                    raw.to_string_lossy().into_owned()
-                }
-            },
-            cpu_usage: round2(proc_info.cpu_usage() as f64),
-            memory_bytes: proc_info.memory(),
-            threads: None,
-            // sysinfo 0.30 不提供跨平台的属主名，交由 OS 权限判定兜底。
-            user_name: None,
-            parent_pid: proc_info.parent().map(|p| p.as_u32()),
-            run_time_seconds: Some(proc_info.run_time()),
-        })
-        .filter(|p| query.matches(p))
-        .collect();
-
+    rows.retain(|p| query.matches(p));
     rows.sort_by(|a, b| query.compare(a, b));
 
     let total = rows.len();
@@ -1402,6 +1444,8 @@ mod tests {
             user_name: None,
             parent_pid: None,
             run_time_seconds: None,
+            detached: crate::observe::is_detached(None),
+            owned_by_current_user: false,
         }
     }
 
@@ -2184,5 +2228,150 @@ mod tests {
             production.contains("if !sleep_for.is_zero()"),
             "零等待不要再排一次 sleep（那是每帧一次的空转调度）"
         );
+    }
+
+    /// 归类汇总的数据源必须看见**全部**进程。`MAX_PROCESSES_PER_PAGE` 只有 300，
+    /// 本机实测七百多个 —— 走分页路径汇总会静默少算几百个，却照样报出一排整齐的桶。
+    /// 后半段是这条对照的猎物：证明分页路径真的会丢东西，而不是我臆想的风险。
+    #[test]
+    fn rollup_source_sees_every_process_not_just_one_page() {
+        let all = collect_all_rows();
+        assert!(
+            all.len() > MAX_PROCESSES_PER_PAGE,
+            "本机只枚举到 {} 行，未超过分页上限 {} —— 这条对照已失去意义，别当通过",
+            all.len(),
+            MAX_PROCESSES_PER_PAGE
+        );
+        // 刻意在**同一次**枚举里自证，不去和上面那份快照比精确相等：
+        // 进程数本来就会漂，比两次采样的总数相等只会造出偶发假红。
+        let mut sys = process_system();
+        let page = collect_processes(
+            &mut sys,
+            true,
+            &ProcessQuery {
+                limit: MAX_PROCESSES_PER_PAGE * 4,
+                ..ProcessQuery::default()
+            },
+        );
+        assert!(
+            page.total > MAX_PROCESSES_PER_PAGE,
+            "本机进程数 {} 没超过上限，夹取无从体现",
+            page.total
+        );
+        assert_eq!(
+            page.items.len(),
+            MAX_PROCESSES_PER_PAGE,
+            "分页路径没被上限夹住 —— 汇总若走这条路就会静默少算"
+        );
+    }
+
+    /// 属主判定要拿**独立来源**对账，而且要**全表**对账：先前两版对照都是空跑 ——
+    /// "全机存在一行 false"被 `effective_user_id() == None` 满足，"取样前 40 行"在本机
+    /// 全是 501。改成一次 `ps -eo pid=,uid=` 全表比，才真正钉住"报出来的属主都是我的"。
+    ///
+    /// 但这一半**钉不住恒真**：本机非提权读不到别人进程的 uid，反向半边全落在 `None` 上，
+    /// 实测恒真变异在这里照样绿。恒真由 `observe::uid_matches` 的固定真值表拦。
+    #[test]
+    fn ownership_flag_matches_ps_uid() {
+        let rows = collect_all_rows();
+        let me = crate::observe::current_uid().expect("unix 上应取到自己的 uid");
+
+        // 一次 `ps -eo pid=,uid=` 拿到**独立**的全表 oracle。此前是"取样前 40 行"，
+        // 实测那 40 行全是本用户进程 —— 于是把 `**their == me` 改成恒真测试照样绿，
+        // 反向半边等于没测。全表比下来既不挑机器，也只 fork 一次 ps。
+        let out = std::process::Command::new("ps")
+            .args(["-eo", "pid=,uid="])
+            .output()
+            .expect("ps 应可调用");
+        let text = String::from_utf8_lossy(&out.stdout);
+        let mut table: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+        for line in text.lines() {
+            let mut it = line.split_whitespace();
+            if let (Some(pid), Some(uid)) = (it.next(), it.next()) {
+                if let (Ok(pid), Ok(uid)) = (pid.parse::<u32>(), uid.parse::<u32>()) {
+                    table.insert(pid, uid);
+                }
+            }
+        }
+        assert!(!table.is_empty(), "ps 没读出任何一行，这个对照就是空跑");
+
+        let mut mine_seen = 0;
+        let mut not_mine_seen = 0;
+        for row in &rows {
+            // ps 看不到（进程刚退出）就跳过，不能算不一致。
+            let Some(&uid) = table.get(&row.pid) else {
+                continue;
+            };
+            let want = uid == me;
+            assert_eq!(
+                row.owned_by_current_user, want,
+                "pid {} 的属主判定与 ps 不符：flag={} 但 ps uid={uid} (我={me})",
+                row.pid, row.owned_by_current_user
+            );
+            if want {
+                mine_seen += 1;
+            } else {
+                not_mine_seen += 1;
+            }
+        }
+        assert!(mine_seen > 0, "样本里一个本用户进程都没有，正向半边空跑");
+        assert!(
+            not_mine_seen > 0,
+            "样本里一个非本用户进程都没有，反向半边空跑（恒真就测不出来）"
+        );
+    }
+
+    /// `detached` 同样要双向：既要有脱离的（本机常驻服务必然有），也要有不脱离的，
+    /// 否则"恒真/恒假"两种坏法都测不出来。
+    #[test]
+    fn detached_flag_is_not_constant() {
+        let rows = collect_all_rows();
+        assert!(rows.iter().any(|r| r.detached), "没有一个进程挂在 launchd 下？判定恒假");
+        assert!(rows.iter().any(|r| !r.detached), "所有进程都算脱离？判定恒真");
+        // 猎物：`onlyDetached` 必须真的收窄结果，且收窄后的每一条都带着那面旗。
+        let query = ProcessQuery {
+            only_detached: true,
+            limit: MAX_PROCESSES_PER_PAGE,
+            ..ProcessQuery::default()
+        };
+        let page = collect_processes_warmed(&query);
+        assert!(page.total > 0, "过滤后一条都不剩，筛选位没接上");
+        assert!(
+            page.total < rows.len(),
+            "过滤后总数没变少（{}/{}），onlyDetached 根本没生效",
+            page.total,
+            rows.len()
+        );
+        assert!(page.items.iter().all(|r| r.detached), "筛出来的行里混进了未脱离的");
+    }
+
+    /// 进程表的行与查询条件都要和前端 `interface` 逐字段对拍（T5-02/T5-08 同一条纪律）。
+    /// 这两个载荷漂移是**双向静默**的：行里少了 `detached`，前端的旗恒为 `undefined`（画出来
+    /// 就是"一个脱离的都没有"）；查询里少了 `onlyDetached`，反序列化取默认值（画出来就是
+    /// "勾了没反应"）。两种都不报错。
+    #[test]
+    fn process_row_and_query_keys_match_the_frontend_interfaces() {
+        use crate::contract_fixtures::{serialized_keys, ts_interface_keys};
+
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let contract = std::fs::read_to_string(manifest.join("../src/ipc_contract.ts")).unwrap();
+
+        let sample = row(11, "java", 12.5, 4096);
+        assert!(sample.detached, "阳性对照：夹具里这一行得真带着脱离旗");
+        assert_eq!(
+            serialized_keys(&serde_json::to_value(&sample).unwrap()),
+            ts_interface_keys(&contract, "ProcessInfo"),
+            "ProcessInfo 的字段名与前端不一致"
+        );
+        assert_eq!(
+            serialized_keys(&serde_json::to_value(ProcessQuery::default()).unwrap()),
+            ts_interface_keys(&contract, "ProcessQuery"),
+            "ProcessQuery 的字段名与前端不一致"
+        );
+        // 下划线没换掉的话，前端读到的就是 undefined；这一条把驼峰值守也钉住。
+        let raw = serde_json::to_string(&sample).unwrap();
+        assert!(raw.contains("ownedByCurrentUser") && !raw.contains("owned_by_current_user"), "{raw}");
+        let raw = serde_json::to_string(&ProcessQuery::default()).unwrap();
+        assert!(raw.contains("onlyDetached") && !raw.contains("only_detached"), "{raw}");
     }
 }

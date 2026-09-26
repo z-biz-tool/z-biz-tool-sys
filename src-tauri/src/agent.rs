@@ -10,6 +10,7 @@
 use crate::alert::{AlertConfig, AlertThresholds};
 use crate::log_sanitize::sanitize;
 use crate::monitor::{DiskMetrics, MetricsSnapshot, ProcessInfo};
+use crate::observe::ProcessRollup;
 use crate::platform::thermal::{Sensor, SensorSeverity, ThermalReport};
 use serde::Serialize;
 
@@ -27,6 +28,12 @@ const MAX_NETWORK_FINDINGS: usize = 4;
 const MAX_THERMAL_FINDINGS: usize = 3;
 /// 风扇最多列几条：转速不是"越高越危险"，列多了反而像在排行。
 const MAX_FAN_FINDINGS: usize = 2;
+/// 归类结论最多列几桶。桶一共就 8 个，但"其他"和几个 0 内存的桶不必占位置。
+const MAX_CENSUS_FINDINGS: usize = 6;
+/// 一类占到 ΣRSS 的多少、且绝对值到多少，才敢说"这一类是主要占用"。
+/// 两个条件都要：只看比例会在总共 200 MB 时误报，只看绝对值会在 8 GB 机器上漏报。
+const DOMINANT_SHARE: f64 = 0.4;
+const DOMINANT_MIN_BYTES: u64 = 1024 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -47,6 +54,8 @@ pub enum Intent {
     JunkFiles,
     /// 温度 / 风扇：读数来自 `platform::thermal`，没有免提权通路时如实说原因（T5-08）
     Temperature,
+    /// "怎么跑了这么多 java / python 进程" —— 按运行时归类给合计，不是排行榜（T6-01）
+    RuntimeCensus,
     Unknown,
 }
 
@@ -174,7 +183,8 @@ impl Reply {
 }
 
 /// Agent 能看到的**全部**数据：两个排好序的进程切片 + 一帧指标快照 + 当前阈值配置
-/// + 一份温度/风扇报告（T5-08，由命令层采好再传进来，引擎自己不去碰文件系统）。
+/// + 一份温度/风扇报告（T5-08）+ 一份运行时归类合计（T6-01），全部由命令层采好再传进来，
+/// 引擎自己不去碰文件系统、也不起任何子进程。
 ///
 /// 刻意不含进程命令行、环境变量、用户目录。
 #[derive(Debug, Clone, Copy)]
@@ -188,6 +198,9 @@ pub struct Input<'a> {
     pub alert: &'a AlertConfig,
     /// 温度/风扇。空报告一定带着"为什么空"，所以这里不需要 `Option`
     pub thermal: &'a ThermalReport,
+    /// 按运行时归类的合计（T6-01）。只有归类意图才付这份采集成本，其余意图传空切片。
+    /// 空切片**不等于**"机器上没进程" —— 那可能是没采到，`census_report` 按这个区分说人话。
+    pub rollup: &'a [ProcessRollup],
 }
 
 // ==================== 意图识别 ====================
@@ -221,6 +234,15 @@ const STARTUP_WORDS: &[&str] = &["启动项", "开机", "自启", "startup", "lo
 const JUNK_WORDS: &[&str] = &["垃圾", "缓存", "清理", "junk", "临时文件"];
 const TEMP_WORDS: &[&str] = &["温度", "风扇", "过热", "thermal", "temperature"];
 const SLOW_WORDS: &[&str] = &["卡", "慢", "诊断", "为什么", "怎么回事", "报告", "状况", "slow", "lag", "freeze"];
+/// 归类口径的问题（T6-01）："怎么这么多 java 进程""跑了哪些运行时"。
+///
+/// 刻意不收"进程"二字本身，也不收"最多/最高"：那些是排行榜的措辞，抢过来会让
+/// `哪个进程占内存最高` 从榜单退化成桶。这里要的是**按类合并**这一层意思。
+const CENSUS_WORDS: &[&str] = &[
+    "归类", "分类", "按类", "哪些类", "哪些种", "种类", "一堆", "这么多", "那么多", "都跑了",
+    "跑了多少", "都在跑", "残留", "孤儿", "脱离", "收养", "常驻", "census", "by category",
+    "how many process", "categories",
+];
 /// 看起来在要求"代执行"的自由文本。命中即拒绝，只给一句说明。
 const COMMAND_LIKE: &[&str] = &[
     "sudo", "rm -", "chmod", "chown", "kill ", "killall", "pkill", "bash", "zsh -c",
@@ -260,6 +282,12 @@ pub fn parse(raw: &str) -> Parsed {
     }
     if has(&q, JUNK_WORDS) {
         return Parsed { intent: Intent::JunkFiles, rank_by: None, refused: false };
+    }
+    // 归类问法排在排行榜**之前**：这类问句里几乎必然同时出现"进程"和某个极值词
+    // （"这么多进程""哪个占用最多"），排在后面就会被 `about_process && wants_rank` 吃掉，
+    // 用户拿到一份五行榜单，而他要的是"一共哪些类、各占多少"。
+    if has(&q, CENSUS_WORDS) {
+        return Parsed { intent: Intent::RuntimeCensus, rank_by: None, refused: false };
     }
     // "占用最高的进程""谁最吃内存"：明确的排行榜
     if (about_process && (rank_by.is_some() || wants_rank)) || (wants_rank && rank_by.is_some()) {
@@ -420,6 +448,13 @@ pub fn answer(raw_query: &str, input: &Input) -> Reply {
                     ),
                 });
             }
+        }
+        Intent::RuntimeCensus => {
+            census_report(&mut reply, input);
+            reply.suggest(Suggestion::OpenTab {
+                tab: "processes",
+                label: "打开进程表看每一类里的具体进程".to_string(),
+            });
         }
         Intent::Unknown => {
             if parsed.refused {
@@ -675,6 +710,85 @@ fn process_report(reply: &mut Reply, by: RankBy, input: &Input) {
     }
 }
 
+// ==================== 运行时归类（T6-01）====================
+
+/// 归类桶的排序：和 `ranked` 一样**不信上游顺序**，这里再排一次并截断。
+fn ranked_buckets(rows: &[ProcessRollup], limit: usize) -> Vec<&ProcessRollup> {
+    let mut picked: Vec<&ProcessRollup> = rows.iter().collect();
+    picked.sort_by(|a, b| {
+        b.memory_bytes
+            .cmp(&a.memory_bytes)
+            .then_with(|| b.process_count.cmp(&a.process_count))
+            .then_with(|| a.category.cmp(b.category))
+    });
+    picked.truncate(limit);
+    picked
+}
+
+fn census_report(reply: &mut Reply, input: &Input) {
+    if input.rollup.is_empty() {
+        // 空切片有两种可能：机器真没进程（不可能），或这一轮没采到。只有后者需要说，
+        // 且不能顺嘴说成"没在跑东西" —— 那是把采集失败包装成结论。
+        reply.note("这一轮没有拿到进程枚举结果，归类汇总是空的。空表只代表没采到，不代表机器上没在跑东西。");
+        return;
+    }
+
+    let total_procs: usize = input.rollup.iter().map(|b| b.process_count).sum();
+    let total_mem: u64 = input.rollup.iter().map(|b| b.memory_bytes).sum();
+    let total_detached: usize = input.rollup.iter().map(|b| b.detached_count).sum();
+
+    for bucket in ranked_buckets(input.rollup, MAX_CENSUS_FINDINGS) {
+        let share = if total_mem > 0 {
+            bucket.memory_bytes as f64 / total_mem as f64 * 100.0
+        } else {
+            0.0
+        };
+        let mut text = format!(
+            "{}：{} 个进程 · 合计 {} · 占 {:.1} %",
+            bucket.category, bucket.process_count, human_bytes(bucket.memory_bytes), share
+        );
+        if bucket.detached_count > 0 {
+            text.push_str(&format!(" · {} 个已脱离启动者", bucket.detached_count));
+        }
+        // "占大头"这条判级要有两条腿：只看比例会在总共几百 MB 时误报，
+        // 只看绝对值会漏掉"占比不高但确实吃掉几个 G"的那一类。
+        let level = if bucket.memory_bytes >= DOMINANT_MIN_BYTES
+            && total_mem as f64 * DOMINANT_SHARE <= bucket.memory_bytes as f64
+        {
+            Severity::Warning
+        } else {
+            Severity::Info
+        };
+        reply.find(Finding {
+            metric: AgentMetric::Process,
+            text,
+            value: Some(human_bytes(bucket.memory_bytes)),
+            level,
+        });
+    }
+
+    reply.note(format!(
+        "口径：这 {total_procs} 行来自一次全量枚举，不受进程表 {} 行分页影响；内存是各进程常驻内存之和，\
+         跨进程共享页会重复计入，因此比实际物理占用偏大。",
+        crate::monitor::MAX_PROCESSES_PER_PAGE
+    ));
+    if total_detached > 0 {
+        reply.note(format!(
+            "{total_detached} 个进程的父进程已经是 launchd，只能说明原始启动者退出过；\
+             launchd 托管的系统服务同样满足这一条。要不要收手得看属主和运行时长，我不替你判。"
+        ));
+    }
+    if let Some(top) = ranked_buckets(input.rollup, 1).first() {
+        if let Some(pid) = top.top_pid {
+            reply.suggest(Suggestion::FocusProcess {
+                pid,
+                name: sanitize(&top.top_name.clone().unwrap_or_default()),
+                label: format!("在进程表里定位 {} 里最大的那个", top.category),
+            });
+        }
+    }
+}
+
 // ==================== 展示格式化 ====================
 
 /// 与前端 `formatBytes` 同一口径：1024 进制、两位小数、B/KB/MB/GB/TB。
@@ -700,7 +814,9 @@ fn human_rate(bytes_per_sec: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::monitor::{CpuMetrics, MemoryMetrics, MemoryPressure, NetworkMetrics};
+    use crate::monitor::{
+        CpuMetrics, MemoryMetrics, MemoryPressure, NetworkMetrics, MAX_PROCESSES_PER_PAGE,
+    };
     use crate::platform::thermal::{self, SensorKind};
 
     fn proc(pid: u32, name: &str, cpu: f64, mem: u64) -> ProcessInfo {
@@ -713,6 +829,8 @@ mod tests {
             user_name: None,
             parent_pid: None,
             run_time_seconds: None,
+            detached: false,
+            owned_by_current_user: false,
         }
     }
 
@@ -756,6 +874,9 @@ mod tests {
         mem: Vec<ProcessInfo>,
         alert: AlertConfig,
         thermal: ThermalReport,
+        /// 默认**空表**：默认夹具代表"这一轮没采到归类数据"，需要桶的用例自己填。
+        /// 留默认桶会让"空表要怎么说"那半边永远没人测。
+        rollup: Vec<ProcessRollup>,
     }
 
     impl Default for Fixture {
@@ -768,6 +889,7 @@ mod tests {
                 // 默认当作"这台机器给不出温度"，键写死 "macos" 而不是 `env::consts::OS`：
                 // Linux CI 上 probe() 走的是有货那条腿，用当台的值会让下面的 SMC 断言莫名红。
                 thermal: ThermalReport::unavailable(thermal::unsupported_reason("macos")),
+                rollup: Vec::new(),
             }
         }
     }
@@ -815,6 +937,7 @@ mod tests {
                 mem_ranked: &self.mem,
                 alert: &self.alert,
                 thermal: &self.thermal,
+                rollup: &self.rollup,
             }
         }
     }
@@ -927,6 +1050,7 @@ mod tests {
             mem_ranked: &fixture.mem,
             alert: &fixture.alert,
             thermal: &fixture.thermal,
+            rollup: &fixture.rollup,
         };
         let reply = answer("为什么这么卡", &input);
         // 指标快照缺席时，CPU/内存/磁盘三类的结论一条都不能有（进程榜是另一个数据源，照常给）
@@ -1366,5 +1490,339 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ---------- T6-01 运行时归类 ----------
+
+    fn bucket(category: &'static str, count: usize, mem: u64, detached: usize) -> ProcessRollup {
+        ProcessRollup {
+            category,
+            process_count: count,
+            memory_bytes: mem,
+            detached_count: detached,
+            top_pid: None,
+            top_name: None,
+        }
+    }
+
+    fn gb(n: u64) -> u64 {
+        n * 1024 * 1024 * 1024
+    }
+
+    /// 归类问法要认得，但**不许把排行榜抢过来**：那两类问句里同样有"进程"和极值词，
+    /// 判级顺序写反了用户要的五强榜单就会变成几个桶。
+    #[test]
+    fn recognizes_census_without_stealing_the_ranking_questions() {
+        for q in [
+            "为什么有这么多 java 进程",
+            "怎么跑了那么多 python",
+            "进程按类别归类一下",
+            "残留的孤儿进程有多少",
+            "how many processes are running",
+        ] {
+            assert_eq!(parse(q).intent, Intent::RuntimeCensus, "{q} 应判为归类");
+        }
+        for (q, want) in [
+            ("哪个进程占内存最高", Intent::RankProcesses),
+            ("哪个进程占 CPU 最高", Intent::RankProcesses),
+            ("内存是不是快满了", Intent::MemoryPressure),
+            ("为什么这么卡", Intent::DiagnoseSlowness),
+        ] {
+            assert_eq!(parse(q).intent, want, "{q} 被判错了意图");
+        }
+    }
+
+    /// 桶要按内存降序，且**不信上游顺序**（和 `ranked` 同一条纪律）。
+    #[test]
+    fn census_lists_buckets_by_memory_descending_not_input_order() {
+        let fixture = Fixture {
+            rollup: vec![
+                bucket(crate::observe::CATEGORY_NODE, 3, gb(1), 0),
+                bucket(crate::observe::CATEGORY_QODER, 12, gb(9), 2),
+                bucket(crate::observe::CATEGORY_JVM, 5, gb(4), 1),
+            ],
+            ..Fixture::default()
+        };
+        let reply = ask(&fixture, "为什么有这么多 java 进程");
+        let categories: Vec<&str> = reply
+            .findings
+            .iter()
+            .map(|f| f.text.split('：').next().unwrap_or_default())
+            .collect();
+        assert_eq!(
+            categories,
+            [
+                crate::observe::CATEGORY_QODER,
+                crate::observe::CATEGORY_JVM,
+                crate::observe::CATEGORY_NODE
+            ],
+            "{:?}",
+            reply.findings
+        );
+        // 每一行都得带着"几个进程"和合计，光给类别等于没答。
+        assert!(reply.findings[0].text.contains("12 个进程"));
+        assert!(reply.findings[0].text.contains("9.00 GB"));
+        assert!(reply.findings[0].text.contains("脱离"), "带脱离数的桶要在同一行里说出来");
+    }
+
+    /// 空表只能说"没采到"，不能说"机器上没在跑东西" —— 后者是把采集失败包装成结论。
+    #[test]
+    fn empty_rollup_is_reported_as_missing_data_not_as_an_idle_machine() {
+        let reply = ask(&Fixture::default(), "进程按类别归类");
+        assert!(reply.findings.is_empty(), "没数据就不许有桶：{:?}", reply.findings);
+        let notes = reply.notes.join("\n");
+        assert!(notes.contains("没采到"), "{notes}");
+        assert!(!notes.contains("没在跑东西。") || notes.contains("不代表"), "{notes}");
+    }
+
+    /// 口径必须随报告一起出去：ΣRSS 会重复计共享页，也不受 300 行分页影响。
+    /// 少了这两句，用户会拿"合计 19 GB"去对"机器只有 16 GB"，然后得出工具在撒谎的结论。
+    #[test]
+    fn census_declares_its_own_measurement_basis() {
+        let fixture = Fixture {
+            rollup: vec![bucket(crate::observe::CATEGORY_PYTHON, 4, gb(2), 0)],
+            ..Fixture::default()
+        };
+        let notes = ask(&fixture, "python 都跑了多少").notes.join("\n");
+        assert!(notes.contains("共享页"), "少了重复计入的说明：{notes}");
+        assert!(notes.contains("分页"), "少了口径来源的说明：{notes}");
+        assert!(
+            notes.contains(&MAX_PROCESSES_PER_PAGE.to_string()),
+            "说明里要出现真实的上限值，不能只说\"不受分页影响\"：{notes}"
+        );
+    }
+
+    /// "脱离启动者"只给事实，不给判决：写清楚 launchd 托管的服务同样满足这一条。
+    #[test]
+    fn detached_tone_is_a_lead_not_a_verdict() {
+        let fixture = Fixture {
+            rollup: vec![bucket(crate::observe::CATEGORY_JVM, 6, gb(3), 4)],
+            ..Fixture::default()
+        };
+        let reply = ask(&fixture, "有残留的 java 进程吗");
+        let all = format!("{}{}", reply.findings.iter().map(|f| f.text.clone()).collect::<Vec<_>>().join("\n"), reply.notes.join("\n"));
+        assert!(all.contains("launchd"), "没说明这一条的成因：{all}");
+        assert!(all.contains("我不替你判"), "{all}");
+        // 反向：不许出现任何"我来收/建议结束"的口吻。
+        for forbidden in ["已结束", "已清理", "建议结束", "帮你杀", "已杀死"] {
+            assert!(!all.contains(forbidden), "归类报告替用户做了决定：{forbidden}");
+        }
+    }
+
+    /// 判级"占大头"要两条腿：只看比例会在小机器上误报，只看绝对值会漏报。
+    #[test]
+    fn dominant_bucket_needs_both_share_and_absolute_size() {
+        let cases: &[(&str, Vec<ProcessRollup>, Severity)] = &[
+            // 2 GB / 合计 3 GB：既是 66 % 又过 1 GB ⇒ Warning
+            ("big-and-dominant", vec![bucket("A", 1, gb(2), 0), bucket("B", 1, gb(1), 0)], Severity::Warning),
+            // 400 MB / 合计 500 MB：比例够但绝对值不够 ⇒ Info
+            ("share-only", vec![bucket("A", 1, 400 * 1024 * 1024, 0), bucket("B", 1, 100 * 1024 * 1024, 0)], Severity::Info),
+            // 2 GB 但合计 20 GB：绝对值够但比例不够 ⇒ Info
+            ("size-only", vec![bucket("A", 1, gb(2), 0), bucket("B", 9, gb(18), 0)], Severity::Info),
+        ];
+        for (label, rollup, want) in cases {
+            let fixture = Fixture { rollup: rollup.clone(), ..Fixture::default() };
+            let reply = ask(&fixture, "进程归类");
+            let top = reply
+                .findings
+                .iter()
+                .find(|f| f.text.starts_with("A："))
+                .unwrap_or_else(|| panic!("{label} 没给出 A 桶：{:?}", reply.findings));
+            assert_eq!(&top.level, want, "{label} 判级错了：{}", top.text);
+        }
+    }
+
+    /// 桶再多也不能把报告刷满：只留最大的 `MAX_CENSUS_FINDINGS` 个。
+    #[test]
+    fn census_caps_how_many_buckets_are_listed() {
+        let rollup = (0..9)
+            .map(|i| bucket(if i == 0 { "A" } else { "filler" }, 1, gb(i as u64 + 1), 0))
+            .collect();
+        let fixture = Fixture { rollup, ..Fixture::default() };
+        let reply = ask(&fixture, "进程归类");
+        assert_eq!(reply.findings.len(), MAX_CENSUS_FINDINGS, "{:?}", reply.findings);
+        assert!(reply.findings.iter().all(|f| !f.text.starts_with("A：")), "最小的桶反而留下了");
+    }
+
+    /// 归类也要给"下一步去哪看"：桶顶进程能定位时出一条 FocusProcess（只有 pid 和名字）。
+    #[test]
+    fn census_offers_to_locate_the_biggest_process_in_a_bucket() {
+        let fixture = Fixture {
+            rollup: vec![ProcessRollup {
+                category: crate::observe::CATEGORY_JVM,
+                process_count: 3,
+                memory_bytes: gb(5),
+                detached_count: 0,
+                top_pid: Some(4242),
+                top_name: Some("java".to_string()),
+            }],
+            ..Fixture::default()
+        };
+        let reply = ask(&fixture, "java 都跑了多少");
+        assert!(
+            reply
+                .suggestions
+                .iter()
+                .any(|s| matches!(s, Suggestion::FocusProcess { pid: 4242, .. })),
+            "{:?}",
+            reply.suggestions
+        );
+    }
+
+    /// 归类的建议只能落在真实页签上，和其余意图一起受这条约束。
+    #[test]
+    fn census_suggestions_point_at_real_tabs() {
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let app = std::fs::read_to_string(manifest.join("../src/App.tsx")).unwrap();
+        let fixture = Fixture {
+            rollup: vec![bucket(crate::observe::CATEGORY_JVM, 2, gb(1), 0)],
+            ..Fixture::default()
+        };
+        let reply = ask(&fixture, "为什么有这么多 java 进程");
+        assert!(!reply.suggestions.is_empty(), "归类不给任何导航");
+        for suggestion in &reply.suggestions {
+            if let Suggestion::OpenTab { tab, .. } = suggestion {
+                assert!(app.contains(&format!("key: \"{tab}\"")), "不存在的页签 {tab}");
+            }
+        }
+    }
+
+    /// 从**本文件的源码**里读出 `pub enum Intent` 的变体名。
+    ///
+    /// 不用手写清单：手写清单正是这条测试要防的东西 —— 有人加了变体、忘了改前端标签，
+    /// 十有八九也会忘了改清单，两边一起漏，测试照样绿。
+    fn intent_variants_in_source() -> Vec<String> {
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let src = std::fs::read_to_string(manifest.join("src/agent.rs")).unwrap();
+        let head = "pub enum Intent {";
+        let start = src.find(head).expect("本文件里应能找到 pub enum Intent");
+        let body = &src[start + head.len()..];
+        let body = &body[..body.find('}').expect("enum 应有结尾大括号")];
+        body.lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .filter(|line| !line.starts_with("//") && !line.starts_with('#'))
+            .map(|line| line.trim_end_matches(',').trim().to_string())
+            // 变体名只能是 PascalCase 标识符，其余（注释残段、空行）一律不算
+            .filter(|line| {
+                !line.is_empty()
+                    && line.starts_with(|c: char| c.is_ascii_uppercase())
+                    && line.chars().all(|c| c.is_ascii_alphanumeric())
+            })
+            .collect()
+    }
+
+    /// 意图枚举是**三方契约**：Rust 变体 → serde camelCase → 前端 `AgentIntent` 联合类型
+    /// + `INTENT_TEXT` 标签表。漂在任何一处都是静默的 —— 后端回了 `"runtimeCensus"`，
+    /// 前端 `INTENT_TEXT[...]` 取到 `undefined`，回复卡片上的意图标签直接空掉。
+    #[test]
+    fn every_intent_variant_is_named_by_the_frontend() {
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let variants = intent_variants_in_source();
+        let serialized: Vec<String> = [
+            Intent::RankProcesses,
+            Intent::DiagnoseSlowness,
+            Intent::MemoryPressure,
+            Intent::DiskSpace,
+            Intent::NetworkThroughput,
+            Intent::StartupItems,
+            Intent::JunkFiles,
+            Intent::Temperature,
+            Intent::RuntimeCensus,
+            Intent::Unknown,
+        ]
+        .iter()
+        .map(|intent| {
+            serde_json::to_value(intent)
+                .unwrap()
+                .as_str()
+                .unwrap_or_else(|| panic!("{intent:?} 序列化出来不是字符串"))
+                .to_string()
+        })
+        .collect();
+
+        // 阳性对照：两份清单都得非空且同长，否则下面的集合比较会退化成"空 == 空"。
+        assert!(variants.len() >= 9, "源码里只读出 {variants:?}，解析器坏了");
+        assert_eq!(
+            variants.len(),
+            serialized.len(),
+            "枚举里有的变体没进上面这份可枚举清单（或反之）：{variants:?}"
+        );
+
+        // PascalCase → camelCase 的预测必须等于 serde 真正给出的串：
+        // 哪天 `rename_all` 被改掉，这里先红，而不是让前端安静地读到 undefined。
+        let predicted = |name: &str| match name.chars().next() {
+            Some(first) => first.to_lowercase().collect::<String>() + &name[first.len_utf8()..],
+            None => String::new(),
+        };
+        let mut predicted_serialized: Vec<String> = variants.iter().map(|v| predicted(v)).collect();
+        predicted_serialized.sort();
+        let mut actual_serialized = serialized.clone();
+        actual_serialized.sort();
+        assert_eq!(
+            predicted_serialized, actual_serialized,
+            "serde 的 camelCase 与预测不一致，前端标签会漂"
+        );
+
+        let contract = std::fs::read_to_string(manifest.join("../src/ipc_contract.ts")).unwrap();
+        let block = contract
+            .find("export type AgentIntent =")
+            .map(|at| &contract[at..])
+            .and_then(|rest| rest.split(';').next())
+            .expect("前端没有 AgentIntent 联合类型");
+        let panel = std::fs::read_to_string(manifest.join("../src/agent/AgentPanel.tsx")).unwrap();
+        let labels = panel
+            .find("const INTENT_TEXT")
+            .map(|at| &panel[at..])
+            .and_then(|rest| rest.split("};").next())
+            .expect("前端没有 INTENT_TEXT 标签表");
+        for name in &serialized {
+            assert!(
+                block.contains(&format!("\"{name}\"")),
+                "前端 AgentIntent 联合类型里少了 {name}"
+            );
+            assert!(
+                labels.contains(&format!("{name}:")),
+                "前端 INTENT_TEXT 里少了 {name} 的标签"
+            );
+        }
+        // 反向：前端多出来一个后端不会发的意图，也要当场说出来。
+        let union_names: Vec<&str> = block
+            .split('"')
+            .skip(1)
+            .step_by(2)
+            .filter(|s| !s.is_empty())
+            .collect();
+        assert!(!union_names.is_empty(), "联合类型没解析出成员，反向半边是空跑");
+        for name in union_names {
+            assert!(
+                serialized.iter().any(|v| v == name),
+                "前端声明了后端发不出的意图 {name}"
+            );
+        }
+    }
+
+    /// 归类的回答同样不许带可执行载荷 / 用户目录（进程名最容易漏）。
+    #[test]
+    fn census_reply_carries_no_executable_payload() {
+        let fixture = Fixture {
+            rollup: vec![ProcessRollup {
+                category: crate::observe::CATEGORY_JVM,
+                process_count: 2,
+                memory_bytes: gb(1),
+                detached_count: 1,
+                top_pid: Some(99),
+                // 进程名里放一个真实形状的家目录：这是最容易把用户名带出去的位置。
+                top_name: Some("/Users/zifang/private_tool".to_string()),
+            }],
+            ..Fixture::default()
+        };
+        let reply = ask(&fixture, "为什么有这么多 java 进程");
+        let raw = serde_json::to_string(&reply).unwrap();
+        // 与 `mount_points_and_process_names_are_sanitized` 同一条纪律：用户名必须换成占位，
+        // 路径骨架留着（它本身不是秘密，还能让用户认出来是哪个进程）。
+        assert!(!raw.contains("zifang"), "归类回答把用户名带出去了：{raw}");
+        assert!(raw.contains("<user>"), "没走脱敏：{raw}");
+        assert!(raw.contains("\"executed\":false"), "{raw}");
     }
 }
