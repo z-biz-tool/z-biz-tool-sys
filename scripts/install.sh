@@ -102,21 +102,36 @@ info "[2/3] 编译 Rust 后端 + 打 .app bundle（首次约 5-10 分钟）..."
 # 我们这里只产出 .app，不生成 .dmg（用户场景是替换现有 .app，无需 dmg）
 TAURI_SKIP_DMG=1 npx tauri build --bundles app
 
-# 查找 .app 产物
+# 查找 .app 产物。
+# 不能写死 src-tauri/target：`~/.cargo/config.toml` 的 build.target-dir 会把整棵 target 树
+# 重定向到别处（本机就指向 ~/.cargo-shared-target），写死会让脚本在"编译成功"之后
+# 报"未找到构建产物"并以 rc=1 退出 —— 症状看起来像构建失败，其实是产物在别处。
+# 一律以 cargo metadata 报的 target_directory 为准，src-tauri/target 只作兜底。
+TARGET_DIR=""
+if command -v cargo > /dev/null 2>&1; then
+  TARGET_DIR=$(cd src-tauri && cargo metadata --format-version 1 --no-deps 2>/dev/null \
+    | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p' | head -1)
+fi
+
 APP_PATH=""
-for candidate in \
-  "src-tauri/target/release/bundle/macos/${APP_NAME}.app" \
-  "src-tauri/target/release/bundle/macos/${DISPLAY_NAME}.app" \
-  "src-tauri/target/release/bundle/osx/${APP_NAME}.app"; do
-  if [ -d "$candidate" ]; then
-    APP_PATH="$candidate"
-    break
-  fi
+for root in "${TARGET_DIR:-}" "src-tauri/target"; do
+  [ -n "$root" ] || continue
+  for bundle_dir in "release/bundle/macos" "release/bundle/osx"; do
+    for name in "${APP_NAME}.app" "${DISPLAY_NAME}.app"; do
+      candidate="$root/$bundle_dir/$name"
+      if [ -d "$candidate" ]; then
+        APP_PATH="$candidate"
+        break 3
+      fi
+    done
+  done
 done
 
 if [ -z "$APP_PATH" ]; then
   err "未找到构建产物 .app"
-  err "请检查 src-tauri/target/release/bundle/"
+  err "cargo target_directory=${TARGET_DIR:-<未知>}"
+  err "请检查 $TARGET_DIR/release/bundle/ 与 src-tauri/target/release/bundle/"
+  ls -la "$TARGET_DIR/release/bundle/" 2>/dev/null || true
   ls -la src-tauri/target/release/bundle/ 2>/dev/null || true
   exit 1
 fi
