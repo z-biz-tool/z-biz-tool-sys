@@ -89,6 +89,22 @@ pub fn current_uid() -> Option<u32> {
     }
 }
 
+/// 进程的有效 uid，取不到就 `None`（一律按"不属主"处理）。
+///
+/// Windows 上 sysinfo 给的是 `Sid` 而不是数值 uid，那里没有可比的数 —— 直接 `None`，
+/// 让 `uid_matches` 走"缺值判 false"那一支，而不是在比较之前先把人分成"都是我的"。
+pub fn effective_uid(proc_info: &sysinfo::Process) -> Option<u32> {
+    #[cfg(unix)]
+    {
+        proc_info.effective_user_id().map(|their| **their)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = proc_info;
+        None
+    }
+}
+
 /// 是否"脱离启动者"：父进程是 launchd（pid 1）或根本查不到。
 ///
 /// 刻意不叫"残骸"：launchd 托管的系统守护进程同样满足这一条。工具只给事实，

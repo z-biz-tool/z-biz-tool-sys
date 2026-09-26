@@ -597,11 +597,11 @@ fn process_rows(sys: &mut System) -> Vec<ProcessInfo> {
                 parent_pid,
                 run_time_seconds: Some(proc_info.run_time()),
                 detached: crate::observe::is_detached(parent_pid),
-                // `Uid` 在 unix 上 Deref 到 `libc::uid_t`，没有 `as_u32` 那样的取值方法
-                // （`as_u32` 是 `Pid` 的），所以要解两层才拿到数值；真正的相等判定交给
-                // `observe::uid_matches`，那张三方向的真值表只有纯函数能钉死。
+                // 取值这一步本身分平台（Windows 上 sysinfo 给的是 `Sid`，不是数值 uid），
+                // 收进 `observe::effective_uid`；真正的相等判定交给 `uid_matches`，
+                // 那张四方向的真值表只有纯函数能钉死。
                 owned_by_current_user: crate::observe::uid_matches(
-                    proc_info.effective_user_id().map(|their| **their),
+                    crate::observe::effective_uid(proc_info),
                     uid,
                 ),
             }
@@ -2230,39 +2230,67 @@ mod tests {
         );
     }
 
-    /// 归类汇总的数据源必须看见**全部**进程。`MAX_PROCESSES_PER_PAGE` 只有 300，
-    /// 本机实测七百多个 —— 走分页路径汇总会静默少算几百个，却照样报出一排整齐的桶。
-    /// 后半段是这条对照的猎物：证明分页路径真的会丢东西，而不是我臆想的风险。
+    /// 归类汇总的数据源必须看见**全部**进程：`MAX_PROCESSES_PER_PAGE` 只有 300，
+    /// 走分页路径汇总会静默少算几百个，却照样报出一排整齐的桶。
+    ///
+    /// "少算"只有在本机进程数真的超过上限时才看得见 —— CI 的 Linux 腿实测 270 行 < 300，
+    /// 在那里那半条断言是空跑，所以强版本钉在 macOS 腿（本机七百多行）。跨平台成立的是
+    /// 另外两件事：源是"一进程一行"（不是某一页），以及分页路径确实按 limit 截。
     #[test]
     fn rollup_source_sees_every_process_not_just_one_page() {
-        let all = collect_all_rows();
-        assert!(
-            all.len() > MAX_PROCESSES_PER_PAGE,
-            "本机只枚举到 {} 行，未超过分页上限 {} —— 这条对照已失去意义，别当通过",
-            all.len(),
-            MAX_PROCESSES_PER_PAGE
-        );
-        // 刻意在**同一次**枚举里自证，不去和上面那份快照比精确相等：
-        // 进程数本来就会漂，比两次采样的总数相等只会造出偶发假红。
+        // 同一次枚举里比，不去和另一次采样比总数：进程数本来就会漂，
+        // 比两次采样的行数相等只会造出偶发假红。
         let mut sys = process_system();
+        let rows = process_rows(&mut sys);
+        assert_eq!(
+            rows.len(),
+            sys.processes().len(),
+            "汇总源不是「一进程一行」—— 中间被夹了一道，桶里的合计就会静默少算"
+        );
+
         let page = collect_processes(
             &mut sys,
             true,
             &ProcessQuery {
-                limit: MAX_PROCESSES_PER_PAGE * 4,
+                limit: 8,
                 ..ProcessQuery::default()
             },
         );
         assert!(
-            page.total > MAX_PROCESSES_PER_PAGE,
-            "本机进程数 {} 没超过上限，夹取无从体现",
+            page.total > 8,
+            "本机只数到 {} 个进程，limit=8 的对照失去意义，别当通过",
             page.total
         );
-        assert_eq!(
-            page.items.len(),
-            MAX_PROCESSES_PER_PAGE,
-            "分页路径没被上限夹住 —— 汇总若走这条路就会静默少算"
-        );
+        assert_eq!(page.items.len(), 8, "limit 没生效，分页路径不可信");
+
+        #[cfg(target_os = "macos")]
+        {
+            let all = collect_all_rows();
+            let capped = collect_processes(
+                &mut sys,
+                true,
+                &ProcessQuery {
+                    limit: MAX_PROCESSES_PER_PAGE * 4,
+                    ..ProcessQuery::default()
+                },
+            );
+            assert!(
+                capped.total > MAX_PROCESSES_PER_PAGE,
+                "本机进程数 {} 没超过上限 {}，夹取无从体现",
+                capped.total,
+                MAX_PROCESSES_PER_PAGE
+            );
+            assert_eq!(
+                capped.items.len(),
+                MAX_PROCESSES_PER_PAGE,
+                "分页路径没被上限夹住 —— 汇总若走这条路就会静默少算"
+            );
+            assert!(
+                all.len() > capped.items.len(),
+                "汇总源只拿到 {} 行，与一页的上限齐平 —— 汇总被夹住了",
+                all.len()
+            );
+        }
     }
 
     /// 属主判定要拿**独立来源**对账，而且要**全表**对账：先前两版对照都是空跑 ——
@@ -2271,16 +2299,31 @@ mod tests {
     ///
     /// 但这一半**钉不住恒真**：本机非提权读不到别人进程的 uid，反向半边全落在 `None` 上，
     /// 实测恒真变异在这里照样绿。恒真由 `observe::uid_matches` 的固定真值表拦。
+    ///
+    /// 整条用例只属 unix：`ps` 与 `getuid` 都在那一侧，Windows 腿上既没有 `ps` 可调用、
+    /// `current_uid()` 也恒为 `None` —— 在那里它不守卫任何东西，只是一句必然的 panic。
+    ///
+    /// 判据是**有效** uid，oracle 也就得跟着取同一列：Linux 上 `ps` 的 `uid` 是**真实** uid，
+    /// 两者在 setuid 进程上会分叉（CI 实测 pid 898 real=1001 / euid=0，被这条对账误判成
+    /// "该报我的却没报"），所以那一侧点 `euid=`。macOS 的 `ps` 没有 `euid` 关键字
+    /// （实测 "keyword not found"），只能拿 `uid` 对；代价是本机若真有一个"我起的、按 root 跑"
+    /// 的进程会在这里报假红 —— 消息带着 pid 和两个 uid，按本注释查即可。
+    #[cfg(unix)]
     #[test]
     fn ownership_flag_matches_ps_uid() {
         let rows = collect_all_rows();
         let me = crate::observe::current_uid().expect("unix 上应取到自己的 uid");
 
-        // 一次 `ps -eo pid=,uid=` 拿到**独立**的全表 oracle。此前是"取样前 40 行"，
+        #[cfg(target_os = "linux")]
+        const PS_UID_COL: &str = "pid=,euid=";
+        #[cfg(target_os = "macos")]
+        const PS_UID_COL: &str = "pid=,uid=";
+
+        // 一次 `ps` 拿到**独立**的全表 oracle。此前是"取样前 40 行"，
         // 实测那 40 行全是本用户进程 —— 于是把 `**their == me` 改成恒真测试照样绿，
         // 反向半边等于没测。全表比下来既不挑机器，也只 fork 一次 ps。
         let out = std::process::Command::new("ps")
-            .args(["-eo", "pid=,uid="])
+            .args(["-eo", PS_UID_COL])
             .output()
             .expect("ps 应可调用");
         let text = String::from_utf8_lossy(&out.stdout);
@@ -2321,28 +2364,49 @@ mod tests {
         );
     }
 
-    /// `detached` 同样要双向：既要有脱离的（本机常驻服务必然有），也要有不脱离的，
-    /// 否则"恒真/恒假"两种坏法都测不出来。
+    /// `detached` 双向 + `onlyDetached` 真的接到了后端。
+    ///
+    /// "本机一定有脱离启动者的进程"只在 macOS 成立（launchd 会收养退出者的孩子）；Windows 腿上
+    /// 父进程链基本完整，那里旗数为 0 是事实而不是缺陷。所以两半都改成本机旗数说话：
+    /// 有旗就要求筛出非空且变窄，没旗就要求筛出空 —— 两种情形下"筛选位被忽略"都会红。
+    /// 恒真/恒假本身由 `observe::is_detached` 的真值表拦，这里不重复。
     #[test]
     fn detached_flag_is_not_constant() {
         let rows = collect_all_rows();
-        assert!(rows.iter().any(|r| r.detached), "没有一个进程挂在 launchd 下？判定恒假");
-        assert!(rows.iter().any(|r| !r.detached), "所有进程都算脱离？判定恒真");
-        // 猎物：`onlyDetached` 必须真的收窄结果，且收窄后的每一条都带着那面旗。
-        let query = ProcessQuery {
+        let flagged = rows.iter().filter(|r| r.detached).count();
+        assert!(
+            flagged < rows.len(),
+            "所有进程都算脱离（{}/{}）？判定恒真",
+            flagged,
+            rows.len()
+        );
+        #[cfg(target_os = "macos")]
+        assert!(flagged > 0, "没有一个进程挂在 launchd 下？判定恒假");
+
+        let page = collect_processes_warmed(&ProcessQuery {
             only_detached: true,
             limit: MAX_PROCESSES_PER_PAGE,
             ..ProcessQuery::default()
-        };
-        let page = collect_processes_warmed(&query);
-        assert!(page.total > 0, "过滤后一条都不剩，筛选位没接上");
+        });
+        if flagged == 0 {
+            assert_eq!(
+                page.total, 0,
+                "本机一面旗都没有，勾选后却有 {} 条 ⇒ onlyDetached 反向失效",
+                page.total
+            );
+        } else {
+            assert!(page.total > 0, "过滤后一条都不剩，筛选位没接上");
+            assert!(
+                page.total < rows.len(),
+                "过滤后总数没变少（{}/{}），onlyDetached 根本没生效",
+                page.total,
+                rows.len()
+            );
+        }
         assert!(
-            page.total < rows.len(),
-            "过滤后总数没变少（{}/{}），onlyDetached 根本没生效",
-            page.total,
-            rows.len()
+            page.items.iter().all(|r| r.detached),
+            "筛出来的行里混进了未脱离的"
         );
-        assert!(page.items.iter().all(|r| r.detached), "筛出来的行里混进了未脱离的");
     }
 
     /// 进程表的行与查询条件都要和前端 `interface` 逐字段对拍（T5-02/T5-08 同一条纪律）。
