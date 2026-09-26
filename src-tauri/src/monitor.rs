@@ -503,7 +503,15 @@ impl Default for Collector {
 
 // ==================== 进程采集 ====================
 
-/// 进程表/排行榜的采样项：只要内存和 CPU 占用。
+/// 进程表/排行榜的采样项：内存、CPU 占用，以及属主 uid。
+///
+/// `with_user()` 不是可省的装饰：Linux 上 sysinfo 只在被明确要求时才去读
+/// `/proc/<pid>/status` 的 uid 行，缺了它 `effective_user_id()` 对**所有**进程恒返回 `None`，
+/// 属主那一列于是静默退化成"整表都不是我的"（CI 的 Linux 腿实测：`ps` 报 euid=1001 的行
+/// flag 仍为 false）。macOS 侧的 euid 不走这份开关，所以本机跑一百遍也发现不了 ——
+/// 这条口径只能由跨平台对账守。取 `OnlyIfNotSet` 而不是 `Always`：一个 pid 的有效 uid 在它的
+/// 生命周期里不会变（只有 exec 能改，而那是另一个 pid），每帧重读 `/proc/<pid>/status`
+/// 是白付 741 次系统调用。
 ///
 /// 刻意不取 `cmd` / `environ` / `root` —— `ProcessRefreshKind::everything()` 会把命令行参数与
 /// 环境变量一并读进来（sysinfo 0.33.1 `common/system.rs` 的 `everything()` 里 `cmd`/`environ`
@@ -515,7 +523,10 @@ impl Default for Collector {
 /// "不采集路径/参数/环境"才是可证的，而不是碰巧成立。
 /// 公开是给 `commands.rs` 的兜底路径用 —— 任何走 `refresh_processes()` 的地方都会退回宽口径。
 pub fn process_refresh_kind() -> ProcessRefreshKind {
-    ProcessRefreshKind::nothing().with_memory().with_cpu()
+    ProcessRefreshKind::nothing()
+        .with_memory()
+        .with_cpu()
+        .with_user(UpdateKind::OnlyIfNotSet)
 }
 
 /// 进程详情一次性读取的采样项：抽屉里要展示可执行路径和工作目录，所以在这两项上放宽，
