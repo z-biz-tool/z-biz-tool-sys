@@ -1,6 +1,6 @@
 import { Alert, Button, Card, Input, Select, Space, Switch, Table, Tag, Tooltip, Typography } from "antd";
 import { ReloadOutlined, SearchOutlined, StopOutlined } from "@ant-design/icons";
-import { useMemo } from "react";
+import { memo, useMemo } from "react";
 import type {
   ListeningReport,
   ProcessInfo,
@@ -40,6 +40,11 @@ interface Props {
   onRefresh: () => void;
   onOpenDetail: (pid: number) => void;
   onRequestKill: (pid: number) => void;
+  /** 勾选中的 PID（跨页/跨帧保留，由 App 持有） */
+  selectedPids: number[];
+  onSelectedPidsChange: (pids: number[]) => void;
+  /** 打开批量结束确认框：真正的拒绝判定在后端，这里只负责把清单摊给人看 */
+  onRequestBulkKill: () => void;
   /** 只看"父进程已是 launchd"的行（后端筛选，不是前端过滤当前页） */
   onlyDetached: boolean;
   onOnlyDetachedChange: (next: boolean) => void;
@@ -51,7 +56,7 @@ interface Props {
 }
 
 /** 排序、过滤、分页都在后端执行，这里只映射表头指示与当前页窗口 */
-export function ProcessTab({
+export const ProcessTab = memo(function ProcessTab({
   page,
   streaming,
   hasSnapshot,
@@ -67,6 +72,9 @@ export function ProcessTab({
   onRefresh,
   onOpenDetail,
   onRequestKill,
+  selectedPids,
+  onSelectedPidsChange,
+  onRequestBulkKill,
   onlyDetached,
   onOnlyDetachedChange,
   rollup,
@@ -253,6 +261,16 @@ export function ProcessTab({
             <Button icon={<ReloadOutlined />} onClick={onRefresh}>
               刷新
             </Button>
+            <Tooltip title="勾选后可批量结束（⌘/Ctrl+K）。应用自身进程、PID ≤ 100 与系统关键进程会被后端逐条拒掉，结果里会点名说原因。">
+              <Button
+                danger
+                icon={<StopOutlined />}
+                disabled={selectedPids.length === 0}
+                onClick={onRequestBulkKill}
+              >
+                {`结束所选${selectedPids.length ? ` (${selectedPids.length})` : ""}`}
+              </Button>
+            </Tooltip>
           </Space>
         }
       >
@@ -265,7 +283,14 @@ export function ProcessTab({
           loading={rows.length === 0 && streaming}
           pagination={false}
           virtual={virtual}
-          scroll={virtual ? { x: 1150, y: 560 } : { x: 1150 }}
+          scroll={virtual ? { x: 1194, y: 560 } : { x: 1194 }}
+          rowSelection={{
+            selectedRowKeys: selectedPids,
+            // 采集帧每 3 s 换一批行对象，只认 pid：翻页/筛选后已选的要留着，否则"结束所选"永远凑不齐
+            preserveSelectedRowKeys: true,
+            columnWidth: 44,
+            onChange: (keys) => onSelectedPidsChange(keys.map(Number)),
+          }}
           onRow={(record) => ({
             onClick: () => onOpenDetail(record.pid),
             style: { cursor: "pointer" },
@@ -295,6 +320,16 @@ export function ProcessTab({
           >
             下一页
           </Button>
+          {selectedPids.length > 0 && (
+            <>
+              <Text type="secondary" style={{ fontSize: 12 }}>
+                已选 {selectedPids.length} 个进程
+              </Text>
+              <Button size="small" onClick={() => onSelectedPidsChange([])}>
+                取消选择
+              </Button>
+            </>
+          )}
         </Space>
       </Card>
       <ListeningPortsPanel
@@ -305,4 +340,4 @@ export function ProcessTab({
       />
     </Space>
   );
-}
+});

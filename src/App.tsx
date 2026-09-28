@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Alert,
   Badge,
@@ -21,9 +21,12 @@ import {
   CompressOutlined,
   DashboardOutlined,
   FileSearchOutlined,
+  PauseCircleOutlined,
+  PlayCircleOutlined,
   RocketOutlined,
   RobotOutlined,
   SyncOutlined,
+  ThunderboltOutlined,
 } from "@ant-design/icons";
 import dayjs from "dayjs";
 import { invoke } from "@tauri-apps/api/core";
@@ -32,6 +35,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import {
   Commands,
   MonitorEvent,
+  describeError,
   type AgentReply,
   type AlertEvent,
   type CleanupResult,
@@ -53,13 +57,14 @@ import { useAlerts } from "./hooks/useAlerts";
 import { usePrefs } from "./hooks/usePrefs";
 import { useProcessQuery } from "./hooks/useProcessQuery";
 import { useProcessStream } from "./hooks/useProcessStream";
-import { useSystemMonitor } from "./hooks/useSystemMonitor";
+import { useSystemMonitor, type LinkStatus } from "./hooks/useSystemMonitor";
 import { alertText } from "./lib/alert";
 import { presentError } from "./lib/error_ui";
 import { formatBytes } from "./lib/format";
 import { HISTORY_LIMIT } from "./lib/trend";
 import { INTERVAL_OPTIONS, PREF, cardBgGradient, gradientText } from "./lib/ui";
 import { AlertSettingsDrawer } from "./components/AlertSettingsDrawer";
+import { BulkKillModal, type BulkKillRow, type BulkKillTarget } from "./components/BulkKillModal";
 import { CleanupConfirmModal } from "./components/CleanupConfirmModal";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import { KillConfirmModal } from "./components/KillConfirmModal";
@@ -79,6 +84,26 @@ import { SystemInfoTab } from "./components/tabs/SystemInfoTab";
 const { Header, Content } = Layout;
 const { Title, Text } = Typography;
 
+/** 采集链路的三种状态各自的说法：`paused` 是用户按下的，不能和"停滞"（坏了）混成一个红点 */
+const LINK_BADGE: Record<LinkStatus, { status: "success" | "processing" | "error" | "default"; text: string }> = {
+  live: { status: "success", text: "实时采集" },
+  stalled: { status: "error", text: "采集停滞" },
+  paused: { status: "default", text: "已暂停" },
+  connecting: { status: "processing", text: "连接中" },
+};
+
+/** 全局快捷键的现场说明：藏在菜单里等于没有 */
+const HOTKEY_HELP = (
+  <div style={{ fontSize: 12, lineHeight: 1.9 }}>
+    <div>⌘/Ctrl + 1…9 切换页签</div>
+    <div>⌘/Ctrl + , 告警阈值与历史</div>
+    <div>⌘/Ctrl + R 按当前页重新取数</div>
+    <div>⌘/Ctrl + K 结束所选进程（仍需确认）</div>
+    <div>Space 暂停 / 恢复采集</div>
+    <div>M 迷你模式 · Esc 退出</div>
+  </div>
+);
+
 function App() {
   const {
     darkMode,
@@ -89,6 +114,8 @@ function App() {
     setTrendRange,
     activeTab,
     setActiveTab,
+    paused,
+    setPaused,
     alertConfig,
     setAlertConfig,
     prefsSnapshot,
@@ -110,9 +137,10 @@ function App() {
     [msgApi]
   );
 
-  const { staticInfo, snapshot, history, status, seedInfo } = useSystemMonitor(
+  const { staticInfo, snapshot, history, status, seedInfo, netSession } = useSystemMonitor(
     HISTORY_LIMIT,
-    intervalMs
+    intervalMs,
+    paused
   );
   const {
     query: processQuery,
@@ -252,17 +280,17 @@ function App() {
     };
   }, [detailPid, reportError]);
 
-  // 采集频率交给后端，避免前后端两套节奏。
+  // 采集频率与暂停都交给后端，避免前后端两套节奏（Space 只是切这一项）。
   useEffect(() => {
     invoke(Commands.setMonitorConfig, {
       config: {
         intervalMs,
         processIntervalMs: 3000,
         diskIntervalMs: 10000,
-        paused: false,
+        paused,
       },
     }).catch((e) => reportError("设置采集频率", e));
-  }, [intervalMs, reportError]);
+  }, [intervalMs, paused, reportError]);
 
   const scanJunk = useCallback(async () => {
     setScanning(true);
@@ -525,6 +553,81 @@ function App() {
     }
   }, [killTarget, msgApi, processes, reportError]);
 
+  // 批量结束：勾选跨页保留，所以确认框必须把每个 pid + 进程名摊出来。
+  // 「该不该碰」不在前端判 —— safety.rs 的受保护名单（本应用自身、PID ≤ 100、关键系统进程）
+  // 是唯一事实来源，这里只转述它逐条给的拒因，免得两份名单各自漂移。
+  const [selectedPids, setSelectedPids] = useState<number[]>([]);
+  const [bulkKillOpen, setBulkKillOpen] = useState(false);
+  const [bulkKilling, setBulkKilling] = useState(false);
+  const [bulkRows, setBulkRows] = useState<BulkKillRow[]>([]);
+  // 名字/内存取自当前页；不在页上的（翻页后仍选着的）只报 PID，不猜名字
+  const bulkTargets: BulkKillTarget[] = useMemo(
+    () =>
+      selectedPids.map((pid) => {
+        const row = processes.page.items.find((p) => p.pid === pid);
+        return { pid, name: row?.name ?? `PID ${pid}`, memoryBytes: row?.memoryBytes ?? null };
+      }),
+    [selectedPids, processes.page.items]
+  );
+
+  const openBulkKill = useCallback(() => {
+    if (!selectedPids.length) {
+      msgApi.info("先在进程表里勾选要结束的工程");
+      return;
+    }
+    setBulkRows([]);
+    setBulkKillOpen(true);
+  }, [msgApi, selectedPids.length]);
+
+  const closeBulkKill = useCallback(() => {
+    setBulkKillOpen(false);
+    setBulkRows([]);
+    setSelectedPids([]);
+    processes.refresh();
+  }, [processes]);
+
+  // 并发上限 4：几十个一起发会把 blocking 池占满，而且失败原因会糊成一片
+  const runBulkKill = useCallback(async () => {
+    if (bulkKilling) return;
+    setBulkKilling(true);
+    const rows: BulkKillRow[] = bulkTargets.map((t) => ({ ...t, done: false, ok: false, graceful: null, reason: null }));
+    setBulkRows([...rows]);
+    const queue = [...rows];
+    // 每完成一条就整体回写：确认框里的表是"跑到哪了"的唯一现场
+    const writeBack = () => setBulkRows([...rows]);
+    await Promise.all(
+      Array.from({ length: Math.min(4, queue.length) }, async () => {
+        for (let task = queue.shift(); task; task = queue.shift()) {
+          try {
+            const outcome = await invoke<{ pid: number; terminatedGracefully: boolean }>(
+              Commands.killProcess,
+              { pid: task.pid, graceMs: 3000 }
+            );
+            task.done = true;
+            task.ok = true;
+            task.graceful = outcome.terminatedGracefully;
+            task.reason = null;
+          } catch (e) {
+            task.done = true;
+            task.ok = false;
+            task.graceful = null;
+            task.reason = describeError(e);
+          }
+          writeBack();
+        }
+      })
+    );
+    const failed = rows.filter((r) => !r.ok);
+    if (failed.length) {
+      msgApi.warning(
+        `已结束 ${rows.length - failed.length} 个，${failed.length} 个未成功：${failed[0].name}（${failed[0].reason ?? "原因未知"}）`
+      );
+    } else {
+      msgApi.success(`已结束 ${rows.length} 个进程`);
+    }
+    setBulkKilling(false);
+  }, [bulkKilling, bulkTargets, msgApi]);
+
   // 诊断 Agent（T5-04）：唯一的 IPC。后端返回的是"结论 + 待确认的导航建议"，
   // 这里拿到什么就显示什么，不额外触发任何动作。
   const askAgent = useCallback(
@@ -556,26 +659,54 @@ function App() {
     [changeProcessKeyword, setActiveTab]
   );
 
-  // 迷你模式的键盘入口：`M` 切进/切出，`Esc` 切出。三条守卫都是必要的 ——
-  // 进程表搜索框里打 m 不该换界面；弹层开着时 Esc 该归弹层自己关；带修饰键的组合留给系统。
+  // 三条守卫都是必要的 —— 进程表搜索框里打 m 不该换界面；弹层开着时 Esc 该归弹层自己关；
+  // 带修饰键的组合留给系统。快捷键本身见下面 `hotkeyRef`（要按 tabItems 的次序切页，故排在其后）。
   const overlayOpen =
-    alertPanelOpen || prefsPanelOpen || cleanupConfirmOpen || detailPid !== null || killTarget !== null;
-  useEffect(() => {
-    const onKey = (event: KeyboardEvent) => {
-      if (event.metaKey || event.ctrlKey || event.altKey || overlayOpen) return;
-      const node = event.target as HTMLElement | null;
-      const typing =
-        !!node &&
-        (node.isContentEditable || ["INPUT", "TEXTAREA", "SELECT"].includes(node.tagName));
-      if (typing) return;
-      if (event.key === "Escape") setMiniMode(false);
-      else if (event.key.toLowerCase() === "m") setMiniMode((prev) => !prev);
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [overlayOpen]);
+    alertPanelOpen ||
+    prefsPanelOpen ||
+    cleanupConfirmOpen ||
+    detailPid !== null ||
+    killTarget !== null ||
+    bulkKillOpen;
 
-  const tabItems = [
+  // ⌘R：把手头这几条"不进采集流"的一次性读取各刷一遍。进程/归类/端口/启动项/温度
+  // 各有各的取数路径，只刷事件缓存等于什么都没刷。
+  const forceRefresh = useCallback(() => {
+    processes.refresh();
+    if (activeTab === "processes" && observationTried) void loadObservation();
+    if (activeTab === "startup") void loadStartupItems();
+    if (activeTab === "system") void loadThermal();
+    msgApi.info("已按当前页重新取数");
+  }, [
+    activeTab,
+    loadObservation,
+    loadStartupItems,
+    loadThermal,
+    msgApi,
+    observationTried,
+    processes,
+  ]);
+
+  const togglePause = useCallback(() => {
+    setPaused((prev) => {
+      const next = !prev;
+      msgApi.info(next ? "已暂停采集（Space 恢复）" : "已恢复采集");
+      return next;
+    });
+  }, [msgApi, setPaused]);
+
+  // 内联箭头会让 useMemo 每帧都失效，故先把这几个"打开某块弹层"的回调稳定下来
+  const refreshObservation = useCallback(() => void loadObservation(), [loadObservation]);
+  const openCleanupConfirm = useCallback(() => setCleanupConfirmOpen(true), []);
+  const openPrefsPanel = useCallback(() => setPrefsPanelOpen(true), []);
+  const openAlertSettings = useCallback(() => {
+    setAlertPanelOpen(true);
+    // 打开面板才回读落盘文件：告警是低频事件，没必要为此每秒起一次 IPC
+    alerts.refreshHistory();
+  }, [alerts]);
+
+  const tabItems = useMemo(
+    () => [
     {
       key: "overview",
       label: "概览",
@@ -589,6 +720,7 @@ function App() {
             onTrendRangeChange={setTrendRange}
             seedInfo={seedInfo}
             alertEvents={alerts.events}
+            netSession={netSession}
             onExportCsv={onExportCsv}
             csvExporting={csvExporting}
           />
@@ -635,12 +767,15 @@ function App() {
             onRefresh={processes.refresh}
             onOpenDetail={setDetailPid}
             onRequestKill={requestKill}
+            selectedPids={selectedPids}
+            onSelectedPidsChange={setSelectedPids}
+            onRequestBulkKill={openBulkKill}
             onlyDetached={processQuery.onlyDetached}
             onOnlyDetachedChange={changeProcessOnlyDetached}
             rollup={rollup}
             listeners={listeners}
             observationLoading={loadingObservation}
-            onRefreshObservation={() => void loadObservation()}
+            onRefreshObservation={refreshObservation}
           />
         </ErrorBoundary>
       ),
@@ -682,7 +817,7 @@ function App() {
             cancelRequested={cancelRequested}
             onScan={scanJunk}
             onCancelScan={cancelJunkScan}
-            onRequestCleanup={() => setCleanupConfirmOpen(true)}
+            onRequestCleanup={openCleanupConfirm}
           />
         </ErrorBoundary>
       ),
@@ -738,19 +873,204 @@ function App() {
             thermal={thermal}
             thermalLoading={loadingThermal}
             onRefreshThermal={loadThermal}
-            onTransferPrefs={() => setPrefsPanelOpen(true)}
+            onTransferPrefs={openPrefsPanel}
           />
         </ErrorBoundary>
       ),
     },
-  ];
+  ],
+    // 只有这些真变了才重建那 9 个面板的元素。内联对象/箭头会让 memo 形同不存在，
+    // 所以配套的回调全部走 useCallback（见 openCleanupConfirm / refreshObservation）。
+    [
+      staticInfo,
+      snapshot,
+      history,
+      trendRange,
+      seedInfo,
+      alerts.events,
+      netSession,
+      onExportCsv,
+      csvExporting,
+      agentReply,
+      askingAgent,
+      askAgent,
+      focusAgentProcess,
+      setActiveTab,
+      processes.page,
+      processes.streaming,
+      processes.refresh,
+      processKeyword,
+      changeProcessKeyword,
+      processSort,
+      changeProcessSort,
+      processPage,
+      changeProcessPage,
+      processQuery.offset,
+      processQuery.onlyDetached,
+      changeProcessOnlyDetached,
+      processPageSize,
+      changeProcessPageSize,
+      setDetailPid,
+      requestKill,
+      selectedPids,
+      setSelectedPids,
+      openBulkKill,
+      rollup,
+      listeners,
+      loadingObservation,
+      refreshObservation,
+      junkReport,
+      selectedJunkIds,
+      setSelectedJunkIds,
+      scanning,
+      cleaning,
+      scanProgress,
+      cancelRequested,
+      scanJunk,
+      cancelJunkScan,
+      openCleanupConfirm,
+      largeFiles,
+      largeFileMinSize,
+      setLargeFileMinSize,
+      scanningLarge,
+      scanLargeFiles,
+      startupItems,
+      loadingStartup,
+      startupBusy,
+      loadStartupItems,
+      onDisableStartup,
+      onRemoveStartup,
+      onRestoreStartup,
+      thermal,
+      loadingThermal,
+      loadThermal,
+      openPrefsPanel,
+      setTrendRange,
+    ]
+  );
 
   // 持久化的 tab key 可能是旧版本改名前的残留或手改值；antd 拿到不存在的 activeKey 时
   // 一个面板都不渲染（实测内容区直接空白）。以真实 items 为唯一事实来源回落，并把修正值写回。
   const activeKey = tabItems.some((item) => item.key === activeTab) ? activeTab : "overview";
   useEffect(() => {
-    localStorage.setItem(PREF + "tab", activeKey);
+    const timer = window.setTimeout(() => {
+      try {
+        localStorage.setItem(PREF + "tab", activeKey);
+      } catch {
+        /* 存不下不影响干活 */
+      }
+    }, 300);
+    return () => window.clearTimeout(timer);
   }, [activeKey]);
+
+  // 快捷键（照本 fleet 的 `z-biz-tool-db` 做法）：一个全局 keydown + 一张每次渲染刷新的
+  // `hotkeyRef`。把回调放进依赖数组会变成"每帧摘装一次监听器"，而这里每帧都在重渲染。
+  // ⌘/Ctrl+1..9 切页、⌘, 设置、Space 暂停/恢复、⌘R 重新取数、⌘K 结束所选、M/Esc 迷你模式。
+  const hotkeyRef = useRef<{
+    switchTab: (index: number) => void;
+    openSettings: () => void;
+    togglePause: () => void;
+    forceRefresh: () => void;
+    killSelected: () => void;
+    toggleMini: () => void;
+    exitMini: () => void;
+  }>({
+    switchTab: () => {},
+    openSettings: () => {},
+    togglePause: () => {},
+    forceRefresh: () => {},
+    killSelected: () => {},
+    toggleMini: () => {},
+    exitMini: () => {},
+  });
+
+  useEffect(() => {
+    hotkeyRef.current = {
+      // 页序就是 tabItems 的序：新加一页会自动占一个号，不会像写死的 1..4 那样悄悄错位
+      switchTab: (index) => {
+        const item = tabItems[index];
+        if (item) setActiveTab(item.key);
+      },
+      openSettings: () => openAlertSettings(),
+      togglePause: () => {
+        if (overlayOpen) return;
+        togglePause();
+      },
+      // 结束所选只开确认框：SIGKILL 前必须让人逐条看清 pid 与进程名
+      killSelected: () => {
+        if (overlayOpen || miniMode) return;
+        if (selectedPids.length === 1) void requestKill(selectedPids[0]);
+        else openBulkKill();
+      },
+      forceRefresh: () => {
+        if (miniMode) return;
+        forceRefresh();
+      },
+      toggleMini: () => {
+        if (overlayOpen) return;
+        setMiniMode((prev) => !prev);
+      },
+      exitMini: () => {
+        // 弹层开着时 Esc 归弹层自己关，不能让迷你模式抢走它
+        if (overlayOpen) return;
+        setMiniMode(false);
+      },
+    };
+  });
+
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      const node = event.target as HTMLElement | null;
+      const typing =
+        !!node &&
+        (node.isContentEditable || ["INPUT", "TEXTAREA", "SELECT"].includes(node.tagName));
+      const key = event.key.toLowerCase();
+      if (event.metaKey || event.ctrlKey) {
+        if (event.altKey) return;
+        // 这两个要在打字时也生效：搜索框正是人想"刷一下"的地方
+        if (key === ",") {
+          event.preventDefault();
+          hotkeyRef.current.openSettings();
+          return;
+        }
+        if (key === "r") {
+          event.preventDefault();
+          hotkeyRef.current.forceRefresh();
+          return;
+        }
+        if (typing) return;
+        if (/^[1-9]$/.test(key)) {
+          event.preventDefault();
+          hotkeyRef.current.switchTab(Number(key) - 1);
+          return;
+        }
+        if (key === "k") {
+          event.preventDefault();
+          hotkeyRef.current.killSelected();
+        }
+        return;
+      }
+      if (typing || event.altKey) return;
+      if (event.key === "Escape") {
+        hotkeyRef.current.exitMini();
+        return;
+      }
+      // Space 是"停住这一帧"，滚动条不该跟着跳：必须吃掉默认动作。
+      // 但焦点在按钮/开关上时让给键盘激活那个控件 —— Space 本来就是它的确认键
+      if (event.key === " ") {
+        const activatable =
+          !!node &&
+          (node.tagName === "BUTTON" || node.closest('[role="switch"],[role="checkbox"]') !== null);
+        if (activatable) return;
+        event.preventDefault();
+        hotkeyRef.current.togglePause();
+        return;
+      }
+      if (key === "m") hotkeyRef.current.toggleMini();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
 
   return (
     <ConfigProvider
@@ -782,17 +1102,12 @@ function App() {
                   ? `后端采集正常，最近帧 ${snapshot ? dayjs(snapshot.timestampMs).format("HH:mm:ss") : "—"}`
                   : status === "stalled"
                     ? "超过 3 个周期未收到采集帧"
-                    : "正在连接后端采集器"
+                    : status === "paused"
+                      ? "已按你的要求暂停采集，曲线停在暂停那一刻"
+                      : "正在连接后端采集器"
               }
             >
-              <Badge
-                status={
-                  status === "live" ? "success" : status === "stalled" ? "error" : "processing"
-                }
-                text={
-                  status === "live" ? "实时采集" : status === "stalled" ? "采集停滞" : "连接中"
-                }
-              />
+              <Badge status={LINK_BADGE[status].status} text={LINK_BADGE[status].text} />
             </Tooltip>
             <Text type="secondary">
               {staticInfo
@@ -828,6 +1143,24 @@ function App() {
               >
                 迷你模式
               </Button>
+            </Tooltip>
+            <Tooltip
+              title={
+                paused
+                  ? "恢复采集（Space）。暂停期间后端不采样，曲线与读数停在按下那一刻"
+                  : "暂停采集（Space）。暂停期间后端不采样，也不会判告警"
+              }
+            >
+              <Button
+                icon={paused ? <PlayCircleOutlined /> : <PauseCircleOutlined />}
+                style={{ borderRadius: 6 }}
+                onClick={togglePause}
+              >
+                {paused ? "恢复采集" : "暂停采集"}
+              </Button>
+            </Tooltip>
+            <Tooltip title={HOTKEY_HELP}>
+              <Button icon={<ThunderboltOutlined />} style={{ borderRadius: 6 }} aria-label="快捷键" />
             </Tooltip>
             <Select
               size="small"
@@ -926,6 +1259,16 @@ function App() {
           onCancel={() => setKillTarget(null)}
           onConfirm={confirmKill}
           afterClose={() => setKillConfirmText("")}
+        />
+
+        <BulkKillModal
+          open={bulkKillOpen}
+          targets={bulkTargets}
+          rows={bulkRows}
+          running={bulkKilling}
+          onConfirm={() => (bulkRows.length ? closeBulkKill() : void runBulkKill())}
+          onCancel={() => (bulkKilling ? undefined : closeBulkKill())}
+          onAfterClose={closeBulkKill}
         />
 
         <PrefsTransferModal

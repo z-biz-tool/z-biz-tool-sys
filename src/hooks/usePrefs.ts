@@ -25,6 +25,9 @@ export function usePrefs() {
   });
   // Tab 的陌生值要按真实 `tabItems` 回落，那份列表在渲染期才拿得到，故校验留在 App 内
   const [activeTab, setActiveTab] = useState(() => localStorage.getItem(PREF + "tab") ?? "overview");
+  // 暂停采集（快捷键 Space）：会话级偏好，进 localStorage 但**不进** T5-11 的导出快照 ——
+  // 那份快照的字段集由 `PrefsSnapshot` 与 Rust 侧契约测试锁着，schemaVersion 仍是 1。
+  const [paused, setPaused] = useState(() => localStorage.getItem(PREF + "paused") === "1");
   // 告警阈值（T5-01）：一份 JSON，读侧整体过 normalizeAlertConfig，写侧回写归一化后的值
   const [alertConfig, setAlertConfig] = useState<AlertConfig>(() => {
     const saved = localStorage.getItem(PREF + "alert");
@@ -36,18 +39,22 @@ export function usePrefs() {
     }
   });
 
+  // 落盘统一防抖 300 ms：这几项都是"改一次看很久"的低频值，而界面每秒重渲染一次，
+  // 逐个 useEffect 直写等于把同步的 localStorage 写按项铺在渲染路径上。
   useEffect(() => {
-    localStorage.setItem(PREF + "dark", darkMode ? "1" : "0");
-  }, [darkMode]);
-  useEffect(() => {
-    localStorage.setItem(PREF + "interval", String(intervalMs));
-  }, [intervalMs]);
-  useEffect(() => {
-    localStorage.setItem(PREF + "trendRange", String(trendRange));
-  }, [trendRange]);
-  useEffect(() => {
-    localStorage.setItem(PREF + "alert", JSON.stringify(alertConfig));
-  }, [alertConfig]);
+    const timer = window.setTimeout(() => {
+      try {
+        localStorage.setItem(PREF + "dark", darkMode ? "1" : "0");
+        localStorage.setItem(PREF + "interval", String(intervalMs));
+        localStorage.setItem(PREF + "trendRange", String(trendRange));
+        localStorage.setItem(PREF + "paused", paused ? "1" : "0");
+        localStorage.setItem(PREF + "alert", JSON.stringify(alertConfig));
+      } catch {
+        /* 存不下（配额、隐私模式）不影响干活 */
+      }
+    }, 300);
+    return () => window.clearTimeout(timer);
+  }, [darkMode, intervalMs, trendRange, paused, alertConfig]);
 
   /**
    * 导出用的当前快照（T5-11）。就是这几项，不含任何路径、进程或主机信息。
@@ -79,6 +86,8 @@ export function usePrefs() {
     setTrendRange,
     activeTab,
     setActiveTab,
+    paused,
+    setPaused,
     alertConfig,
     setAlertConfig,
     prefsSnapshot: snapshot,

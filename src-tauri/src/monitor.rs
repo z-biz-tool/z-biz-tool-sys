@@ -1034,6 +1034,13 @@ async fn run_process_loop(
             continue;
         }
 
+        // 「暂停」要覆盖整条采集链，不只是趋势图：进程表还在 3 s 一帧地刷的话，
+        // 界面上那句"已暂停"就是假的，而且枚举本身的功耗也没省下来。
+        if config.read().map(|g| g.paused).unwrap_or(false) {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            continue;
+        }
+
         let interval = config
             .read()
             .map(|g| g.process_interval_ms)
@@ -1678,7 +1685,7 @@ mod tests {
         for required in [
             "busiestDisk(",
             "windowHistory(",
-            "downsampleHistory(",
+            "resampleEnvelope(",
             "onExit",
         ] {
             assert!(

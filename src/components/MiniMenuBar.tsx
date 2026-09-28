@@ -1,6 +1,7 @@
 import { Badge, Button, Select, Tooltip, Typography } from "antd";
 import { ExpandOutlined } from "@ant-design/icons";
 import dayjs from "dayjs";
+import { useMemo } from "react";
 import { ALERT_LEVEL_COLORS, busiestDisk, ALERT_LEVEL_LABELS, ALERT_METRIC_LABELS } from "../lib/alert";
 import {
   formatBytes,
@@ -11,7 +12,8 @@ import {
   usageColor,
 } from "../lib/format";
 import { INTERVAL_OPTIONS, monitorCardStyle } from "../lib/ui";
-import { downsampleHistory, TREND_RANGES, windowHistory } from "../lib/trend";
+import { resampleEnvelope, TREND_RANGES, windowHistory } from "../lib/trend";
+import { sumRates } from "../lib/metrics_math";
 import type {
   AlertConfig,
   AlertEvent,
@@ -180,12 +182,21 @@ export function MiniMenuBar({
   const disk = busiestDisk(snapshot);
   const usableNetworks = snapshot?.networks ?? [];
   // 无接口 ≠ 零流量：拿不到接口时是 `—`，不能把"没有数据"显示成"没在传"
-  const rx = usableNetworks.length ? usableNetworks.reduce((a, n) => a + n.rxBytesPerSec, 0) : null;
-  const tx = usableNetworks.length ? usableNetworks.reduce((a, n) => a + n.txBytesPerSec, 0) : null;
+  const rx = usableNetworks.length ? sumRates(usableNetworks.map((n) => n.rxBytesPerSec)) : null;
+  const tx = usableNetworks.length ? sumRates(usableNetworks.map((n) => n.txBytesPerSec)) : null;
   const perCore = snapshot?.cpu.perCore ?? [];
   const usableDisks = (snapshot?.disks ?? []).filter((d) => d.available);
-  // 与概览页趋势图同一套裁剪与降采样：同一时刻两条曲线不该给出两个形状的折线
-  const windowed = downsampleHistory(windowHistory(history, trendRange));
+  // 与概览页趋势图同一套裁剪与降采样：同一时刻两条曲线不该给出两个形状的折线。
+  // 迷你模式每帧都重渲染，14 400 点的窗口不 memo 就是每秒白烧一次 CPU。
+  const windowed = useMemo(() => windowHistory(history, trendRange), [history, trendRange]);
+  const sparkCpu = useMemo(
+    () => resampleEnvelope(windowed, (p) => p.cpu).map((x) => x.v),
+    [windowed]
+  );
+  const sparkMemory = useMemo(
+    () => resampleEnvelope(windowed, (p) => p.memory).map((x) => x.v),
+    [windowed]
+  );
   const rangeLabel = TREND_RANGES.find((r) => r.value === trendRange)?.label ?? `${trendRange} 秒`;
 
   return (
@@ -217,8 +228,24 @@ export function MiniMenuBar({
           迷你监控
         </Text>
         <Badge
-          status={status === "live" ? "success" : status === "stalled" ? "error" : "processing"}
-          text={status === "live" ? "实时采集" : status === "stalled" ? "采集停滞" : "连接中"}
+          status={
+            status === "live"
+              ? "success"
+              : status === "stalled"
+                ? "error"
+                : status === "paused"
+                  ? "default"
+                  : "processing"
+          }
+          text={
+            status === "live"
+              ? "实时采集"
+              : status === "stalled"
+                ? "采集停滞"
+                : status === "paused"
+                  ? "已暂停"
+                  : "连接中"
+          }
         />
         <Readout
           testId="cpu"
@@ -282,13 +309,13 @@ export function MiniMenuBar({
           testId="spark-cpu"
           label={`CPU · 近 ${rangeLabel}`}
           color={snapshot ? usageColor(snapshot.cpu.total, alertConfig.cpu.warning) : IDLE_STROKE}
-          points={windowed.map((p) => p.cpu)}
+          points={sparkCpu}
         />
         <Sparkline
           testId="spark-memory"
           label={`内存 · 近 ${rangeLabel}`}
           color={snapshot ? PRESSURE_COLOR[snapshot.memory.pressure] : IDLE_STROKE}
-          points={windowed.map((p) => p.memory)}
+          points={sparkMemory}
         />
         <div data-mini="alert" style={{ marginLeft: "auto", fontSize: 12 }}>
           {!alertConfig.enabled ? (

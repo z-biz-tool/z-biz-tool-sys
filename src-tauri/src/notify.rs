@@ -416,7 +416,7 @@ mod tests {
         let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let commands_rs = std::fs::read_to_string(manifest.join("src/commands.rs")).unwrap();
         let signature = commands_rs
-            .split("pub fn send_test_notification")
+            .split("pub async fn send_test_notification")
             .nth(1)
             .expect("应有 send_test_notification")
             // 只看参数表：到第一个 `{` 为止，别把函数体里的 `test_texts()` 也算进来
@@ -491,7 +491,7 @@ mod tests {
         // 那条解释性的文档注释本身就写着这几个字。
         let commands_rs = std::fs::read_to_string(manifest.join("src/commands.rs")).unwrap();
         let body = commands_rs
-            .split("pub fn send_test_notification")
+            .split("pub async fn send_test_notification")
             .nth(1)
             .expect("应有 send_test_notification")
             .split("\n}")

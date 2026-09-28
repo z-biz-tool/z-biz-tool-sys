@@ -1,12 +1,18 @@
+import { pickByteUnit, usageLevel } from "./metrics_math.ts";
+
 const UNITS = ["B", "KB", "MB", "GB", "TB", "PB"];
 
+export const USAGE_LEVEL_COLOR = {
+  ok: "#52c41a",
+  warn: "#faad14",
+  danger: "#ff4d4f",
+} as const;
+
 export function formatBytes(bytes: number, digits = 2): string {
+  // "没有数据"要说 0 B，不是 "0.00 B"：界面上一排 0.00 会被读成"量不出来"而不是"确实是零"
   if (!Number.isFinite(bytes) || bytes <= 0) return "0 B";
-  const i = Math.min(
-    Math.floor(Math.log(bytes) / Math.log(1024)),
-    UNITS.length - 1
-  );
-  return `${(bytes / 1024 ** i).toFixed(digits)} ${UNITS[i]}`;
+  const { value, unit } = pickByteUnit(bytes, UNITS);
+  return `${value.toFixed(digits)} ${unit}`;
 }
 
 export function formatRate(bytesPerSec: number | null | undefined): string {
@@ -33,7 +39,8 @@ export function formatUptime(seconds: number): string {
 
 /** 状态色：阈值以下绿色，接近阈值黄色，超过红色。 */
 export function usageColor(value: number, threshold: number): string {
-  if (value >= threshold) return "#ff4d4f";
-  if (value >= threshold * 0.8) return "#faad14";
-  return "#52c41a";
+  const level = usageLevel(value, threshold);
+  // 阈值本身不可用（0 / NaN / 被关掉的档位）时不猜颜色，给中性灰
+  if (level === null) return "#8c8c8c";
+  return USAGE_LEVEL_COLOR[level];
 }

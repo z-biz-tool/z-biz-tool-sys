@@ -66,36 +66,50 @@ pub fn set_alert_config(
 
 /// 历史趋势（T3-07）：读已落盘的 10 s 采样点，跨度超过保留窗口时按上限夹取。
 /// 存储不可用时返回错误而不是空页 —— 前端需要能区分"没有历史"和"存不了历史"。
+///
+/// 同步版本会把整段 JSONL 文件读在 IPC/主线程上（本机 1 h ≈ 360 行，重启后首帧之前就发），
+/// 所以走 `spawn_blocking`：命令名与参数不变，前端调用点不用改。
+/// `AppHandle` 而不是 `State<'_, _>`：借用不能跨过 await 带到 blocking 线程上。
 #[tauri::command]
-pub fn get_history(
-    state: State<'_, crate::history::HistoryState>,
+pub async fn get_history(
+    app: AppHandle,
     span_seconds: Option<u64>,
 ) -> CommandResult<crate::history::HistoryPage> {
-    let Some(store) = state.0.as_ref() else {
-        return Err(AppError::failed("历史存储不可用：应用数据目录无法写入"));
-    };
     let span = span_seconds.unwrap_or(crate::history::DEFAULT_SPAN_SECS);
-    Ok(crate::history::query(store, crate::history::now_ms(), span))
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<crate::history::HistoryState>();
+        let Some(store) = state.0.as_ref().cloned() else {
+            return Err(AppError::failed("历史存储不可用：应用数据目录无法写入"));
+        };
+        Ok(crate::history::query(&store, crate::history::now_ms(), span))
+    })
+    .await
+    .map_err(|e| AppError::failed(format!("历史读取线程异常退出：{e}")))?
 }
 
 /// 告警历史（T5-03）：读已落盘的触发记录，默认最近 7 天、上界为保留窗口。
 /// 与 `get_history` 同口径 —— 存储不可用时返回错误，前端要能分辨"没发生过告警"和"存不下"。
 #[tauri::command]
-pub fn get_alert_history(
-    state: State<'_, crate::history::AlertHistoryState>,
+pub async fn get_alert_history(
+    app: AppHandle,
     span_seconds: Option<u64>,
 ) -> CommandResult<crate::history::AlertHistoryPage> {
-    let Some(store) = state.0.as_ref() else {
-        return Err(AppError::failed(
-            "告警历史存储不可用：应用数据目录无法写入，当前只显示本次会话内的告警",
-        ));
-    };
     let span = span_seconds.unwrap_or(crate::history::DEFAULT_ALERT_SPAN_SECS);
-    Ok(crate::history::query_alerts(
-        store,
-        crate::history::now_ms(),
-        span,
-    ))
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<crate::history::AlertHistoryState>();
+        let Some(store) = state.0.as_ref().cloned() else {
+            return Err(AppError::failed(
+                "告警历史存储不可用：应用数据目录无法写入，当前只显示本次会话内的告警",
+            ));
+        };
+        Ok(crate::history::query_alerts(
+            &store,
+            crate::history::now_ms(),
+            span,
+        ))
+    })
+    .await
+    .map_err(|e| AppError::failed(format!("告警历史读取线程异常退出：{e}")))?
 }
 
 #[tauri::command]
@@ -120,25 +134,38 @@ pub fn set_process_query(
     state.set_process_query(query)
 }
 
-/// 优先读采集循环的缓存；冷启动时做一次两次采样的兜底枚举。
+/// 优先读采集循环的缓存；冷启动时做一次两次采样的兜底枚举（约 300 ms，绝不能留在 IPC 线程上）。
 #[tauri::command]
-pub fn get_processes(state: State<'_, MonitorService>) -> ProcessPage {
-    let query = state.current_process_query();
-    // 缓存可能还是上一次查询（关键字/分页）的帧，落后时必须重采集。
-    if state.processes_match_query() {
-        if let Some(page) = state.latest_processes() {
-            return page;
+pub async fn get_processes(app: AppHandle) -> ProcessPage {
+    let joined = move || -> ProcessPage {
+        let state = app.state::<MonitorService>();
+        let query = state.current_process_query();
+        // 缓存可能还是上一次查询（关键字/分页）的帧，落后时必须重采集。
+        if state.processes_match_query() {
+            if let Some(page) = state.latest_processes() {
+                return page;
+            }
         }
+        monitor::collect_processes_warmed(&query)
+    };
+    match tauri::async_runtime::spawn_blocking(joined).await {
+        Ok(page) => page,
+        Err(_) => ProcessPage {
+            total: 0,
+            items: Vec::new(),
+            timestamp_ms: 0,
+            warming: true,
+        },
     }
-
-    monitor::collect_processes_warmed(&query)
 }
 
-/// 进程详情（点击进程行时按需读取，不进 3s 事件流）。
+/// 进程详情（点击进程行时按需读取，不进 3s 事件流）。要枚举一次全量进程，所以放到 blocking 池。
 #[tauri::command]
-pub fn get_process_detail(pid: u32) -> CommandResult<monitor::ProcessDetail> {
-    monitor::collect_process_detail(pid)
-        .ok_or_else(|| AppError::process_not_found(format!("PID {pid} 不存在或已退出")))
+pub async fn get_process_detail(pid: u32) -> CommandResult<monitor::ProcessDetail> {
+    let found = tauri::async_runtime::spawn_blocking(move || monitor::collect_process_detail(pid))
+        .await
+        .map_err(|e| AppError::failed(format!("详情采集线程异常退出：{e}")))?;
+    found.ok_or_else(|| AppError::process_not_found(format!("PID {pid} 不存在或已退出")))
 }
 
 // ==================== 系统性观察（T6-01）====================
@@ -186,9 +213,12 @@ pub async fn get_listening_sockets() -> observe::ListeningReport {
 
 // ==================== 危险操作 ====================
 
+/// 结束前的校验：要读真实进程名与属主（本机是一次全量枚举量级的采样），放 blocking 池。
 #[tauri::command]
-pub fn validate_kill(pid: u32) -> CommandResult<KillValidation> {
-    safety::validate_kill(pid)
+pub async fn validate_kill(pid: u32) -> CommandResult<KillValidation> {
+    tauri::async_runtime::spawn_blocking(move || safety::validate_kill(pid))
+        .await
+        .map_err(|e| AppError::failed(format!("校验线程异常退出：{e}")))?
 }
 
 #[tauri::command]
@@ -246,8 +276,22 @@ fn dns_failure(stderr: &str, manual: &str) -> DnsFlushResult {
 }
 
 /// 只使用用户态可执行的命令；失败时返回可复制的手动命令，而不是挂起等密码。
+/// `dscacheutil` 是要等的子进程，同步版本会把 IPC 线程一起卡住。
 #[tauri::command]
-pub fn flush_dns_cache() -> DnsFlushResult {
+pub async fn flush_dns_cache() -> DnsFlushResult {
+    tauri::async_runtime::spawn_blocking(run_dns_flush)
+        .await
+        .unwrap_or_else(|_| {
+            DnsFlushResult {
+                flushed: false,
+                message: "DNS 刷新线程异常退出".to_string(),
+                manual_command: dns_flush_plan().map(|(_, _, manual)| manual.to_string()),
+            }
+        })
+}
+
+/// 真正跑命令的那一段（同步、可单测），由 `flush_dns_cache` 放到 blocking 池上。
+fn run_dns_flush() -> DnsFlushResult {
     let Some((program, args, manual)) = dns_flush_plan() else {
         return DnsFlushResult {
             flushed: false,
@@ -303,66 +347,92 @@ pub fn cancel_junk_scan() -> bool {
     request_cancel_junk_scan()
 }
 
+/// 删除是整棵目录树的 I/O，同步版本会让 webview 在按钮转圈期间整体卡住。
 #[tauri::command]
-pub fn cleanup_junk_files(ids: Vec<String>) -> CommandResult<CleanupResult> {
+pub async fn cleanup_junk_files(ids: Vec<String>) -> CommandResult<CleanupResult> {
     if ids.is_empty() {
         return Err(AppError::invalid_input("请至少选择一个清理类别"));
     }
-    Ok(cleanup_categories(&ids))
+    tauri::async_runtime::spawn_blocking(move || Ok(cleanup_categories(&ids)))
+        .await
+        .map_err(|e| AppError::failed(format!("清理线程异常退出：{e}")))?
 }
 
+/// 参数校验（纯函数、可单测）：MB → 字节，页容量夹进 1..=500。
+fn large_file_args(min_size_mb: u64, limit: Option<usize>) -> CommandResult<(u64, usize)> {
+    if min_size_mb == 0 || min_size_mb > 1024 * 1024 {
+        return Err(AppError::invalid_input("最小文件大小需在 1MB ~ 1TB 之间"));
+    }
+    Ok((min_size_mb * 1024 * 1024, limit.unwrap_or(50).clamp(1, 500)))
+}
+
+/// 整盘遍历是这条命令里最慢的一段（实测数十秒），必须离开 IPC 线程。
 #[tauri::command]
-pub fn find_large_files_cmd(
+pub async fn find_large_files_cmd(
     path: Option<String>,
     min_size_mb: u64,
     limit: Option<usize>,
 ) -> CommandResult<Vec<LargeFile>> {
-    if min_size_mb == 0 || min_size_mb > 1024 * 1024 {
-        return Err(AppError::invalid_input("最小文件大小需在 1MB ~ 1TB 之间"));
-    }
-    let root = resolve_scan_path(path.as_deref())?;
-    Ok(find_large_files(
-        &root,
-        min_size_mb * 1024 * 1024,
-        limit.unwrap_or(50).clamp(1, 500),
-    ))
+    let (min_bytes, cap) = large_file_args(min_size_mb, limit)?;
+    let found = tauri::async_runtime::spawn_blocking(move || -> CommandResult<Vec<LargeFile>> {
+        let root = resolve_scan_path(path.as_deref())?;
+        Ok(find_large_files(&root, min_bytes, cap))
+    })
+    .await
+    .map_err(|e| AppError::failed(format!("扫描线程异常退出：{e}")))?;
+    found
 }
 
 /// 启动项那一页：不可操作来源（Login Items / 注册表 / systemd）+ 在位项 + 已禁用备份项。
 /// 判定与操作都只认 `id`，界面拿不到"提交一个路径"的口子。
 #[tauri::command]
-pub fn get_startup_items_cmd(app: AppHandle) -> Vec<StartupItem> {
-    startup::page(&app)
+pub async fn get_startup_items_cmd(app: AppHandle) -> Vec<StartupItem> {
+    tauri::async_runtime::spawn_blocking(move || startup::page(&app))
+        .await
+        .unwrap_or_default()
 }
 
 /// 禁用：原件移进应用备份目录，下次登录不再加载；列表里仍以"未启用"看得见，可一键恢复。
 #[tauri::command]
-pub fn disable_startup_item(
+pub async fn disable_startup_item(
     app: AppHandle,
     id: String,
     confirm_name: String,
 ) -> CommandResult<startup::StartupOutcome> {
-    startup::run(&app, startup::StartupAction::Disable, &id, &confirm_name)
+    run_startup_op(app, startup::StartupAction::Disable, id, confirm_name).await
 }
 
 /// 删除：同样只是移进备份（本应用不做物理删除），之后不再出现在列表里。
 #[tauri::command]
-pub fn remove_startup_item(
+pub async fn remove_startup_item(
     app: AppHandle,
     id: String,
     confirm_name: String,
 ) -> CommandResult<startup::StartupOutcome> {
-    startup::run(&app, startup::StartupAction::Remove, &id, &confirm_name)
+    run_startup_op(app, startup::StartupAction::Remove, id, confirm_name).await
 }
 
 /// 恢复：把备份里的原件放回启动目录。
 #[tauri::command]
-pub fn restore_startup_item(
+pub async fn restore_startup_item(
     app: AppHandle,
     id: String,
     confirm_name: String,
 ) -> CommandResult<startup::StartupOutcome> {
-    startup::run(&app, startup::StartupAction::Restore, &id, &confirm_name)
+    run_startup_op(app, startup::StartupAction::Restore, id, confirm_name).await
+}
+
+/// 三种动作共用一条通路：文件级操作（rename/移进备份）在 blocking 池上跑。
+/// 名字保持 `startup::run(&app, ...)` 的转调形态，T3-08 的契约测试按这一句核。
+async fn run_startup_op(
+    app: AppHandle,
+    action: startup::StartupAction,
+    id: String,
+    confirm_name: String,
+) -> CommandResult<startup::StartupOutcome> {
+    tauri::async_runtime::spawn_blocking(move || startup::run(&app, action, &id, &confirm_name))
+        .await
+        .map_err(|e| AppError::failed(format!("启动项操作线程异常退出：{e}")))?
 }
 
 // ==================== 诊断 Agent（T5-04 / T5-05 / T5-06）====================
@@ -463,8 +533,10 @@ pub async fn agent_query(
 /// 前端传不进路径，也就没有"借这条命令去读任意文件"的通路。
 /// 没有免提权通路的平台会返回空列表 + 原因，不会返回 0 值凑数。
 #[tauri::command]
-pub fn get_thermal() -> thermal::ThermalReport {
-    thermal::probe()
+pub async fn get_thermal() -> thermal::ThermalReport {
+    tauri::async_runtime::spawn_blocking(thermal::probe)
+        .await
+        .unwrap_or_else(|_| thermal::ThermalReport::unavailable("传感器读取线程异常终止"))
 }
 
 // ==================== 历史 CSV 导出（02 的 F5"可导出 CSV"）====================
@@ -472,16 +544,21 @@ pub fn get_thermal() -> thermal::ThermalReport {
 /// 把当前时间窗口的历史趋势导成一份 CSV。路径校验与原子写复用偏好导出那一套，
 /// 这里只负责"取哪一页数据"和"数据不够新/太多时怎么如实说"。
 #[tauri::command]
-pub fn export_history_csv(
-    state: State<'_, crate::history::HistoryState>,
+pub async fn export_history_csv(
+    app: AppHandle,
     path: String,
     span_seconds: Option<u64>,
 ) -> CommandResult<export::CsvExportOutcome> {
-    let Some(store) = state.0.as_ref() else {
-        return Err(AppError::failed("历史存储不可用：应用数据目录无法写入"));
-    };
     let span = span_seconds.unwrap_or(crate::history::DEFAULT_SPAN_SECS);
-    export::write_history_csv(store, &path, crate::history::now_ms(), span)
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<crate::history::HistoryState>();
+        let Some(store) = state.0.as_ref().cloned() else {
+            return Err(AppError::failed("历史存储不可用：应用数据目录无法写入"));
+        };
+        export::write_history_csv(&store, &path, crate::history::now_ms(), span)
+    })
+    .await
+    .map_err(|e| AppError::failed(format!("导出线程异常退出：{e}")))?
 }
 
 // ==================== 系统通知（T5-02）====================
@@ -501,27 +578,36 @@ pub fn notify_status(app: tauri::AppHandle) -> notify::NotifyStatus {
 /// （`AlertSettingsDrawer` 分"测试通知没发出去"与"读不到投递记账"两句）。两边各加一半前缀
 /// 会拼出"系统通知状态读取失败：系统通知投递失败：…"这种重复的错话，浏览器实测抓到过。
 #[tauri::command]
-pub fn send_test_notification(app: tauri::AppHandle) -> Result<notify::NotifyStatus, AppError> {
-    let state = app.state::<notify::NotifyState>();
-    match notify::post(&app, &state, notify::test_texts()) {
-        Ok(()) => Ok(state.status()),
-        Err(reason) => Err(AppError::failed(reason)),
-    }
+pub async fn send_test_notification(app: tauri::AppHandle) -> Result<notify::NotifyStatus, AppError> {
+    // 投递通知要等 osascript/通知中心返回，同步版本会把 IPC 线程按住几百毫秒
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<notify::NotifyState>();
+        match notify::post(&app, &state, notify::test_texts()) {
+            Ok(()) => Ok(state.status()),
+            Err(reason) => Err(AppError::failed(reason)),
+        }
+    })
+    .await
+    .map_err(|e| AppError::failed(format!("通知线程异常退出：{e}")))?
 }
 
 // ==================== 偏好导入/导出（T5-11）====================
 
 #[tauri::command]
-pub fn export_prefs_file(
+pub async fn export_prefs_file(
     path: String,
     prefs: serde_json::Value,
 ) -> CommandResult<prefs::ExportOutcome> {
-    prefs::write_prefs_file(&path, prefs)
+    tauri::async_runtime::spawn_blocking(move || prefs::write_prefs_file(&path, prefs))
+        .await
+        .map_err(|e| AppError::failed(format!("偏好写入线程异常退出：{e}")))?
 }
 
 #[tauri::command]
-pub fn import_prefs_file(path: String) -> CommandResult<prefs::ImportOutcome> {
-    prefs::read_prefs_file(&path)
+pub async fn import_prefs_file(path: String) -> CommandResult<prefs::ImportOutcome> {
+    tauri::async_runtime::spawn_blocking(move || prefs::read_prefs_file(&path))
+        .await
+        .map_err(|e| AppError::failed(format!("偏好读取线程异常退出：{e}")))?
 }
 
 #[cfg(test)]
@@ -598,7 +684,7 @@ mod tests {
     #[ignore = "会真的刷新本机 DNS 缓存（macOS 上还牵涉 mDNSResponder），只在取证时手动跑"]
     async fn dns_flush_returns_within_three_seconds_on_this_machine() {
         let started = std::time::Instant::now();
-        let result = tokio::task::spawn_blocking(flush_dns_cache).await.unwrap();
+        let result = tokio::task::spawn_blocking(run_dns_flush).await.unwrap();
         let elapsed = started.elapsed();
         println!(
             "A-04 证据: {:?} 用时 {:.3}s",
@@ -666,16 +752,20 @@ mod tests {
         );
     }
 
+    /// 参数校验已抽成纯函数 `large_file_args`：命令本体现在是 async + blocking 池，
+    /// 拿它测拒绝逻辑会真的去遍历用户目录。
     #[test]
     fn large_file_scan_rejects_out_of_range_sizes() {
         assert_eq!(
-            find_large_files_cmd(None, 0, None).unwrap_err().code,
+            large_file_args(0, None).unwrap_err().code,
             "INVALID_INPUT"
         );
         assert_eq!(
-            find_large_files_cmd(None, 2_000_000, None).unwrap_err().code,
+            large_file_args(2_000_000, None).unwrap_err().code,
             "INVALID_INPUT"
         );
+        assert_eq!(large_file_args(100, None).unwrap(), (100 * 1024 * 1024, 50));
+        assert_eq!(large_file_args(1, Some(5_000)).unwrap().1, 500);
     }
 
     #[test]
@@ -703,10 +793,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn cleanup_requires_selection() {
+    #[tokio::test]
+    async fn cleanup_requires_selection() {
         assert_eq!(
-            cleanup_junk_files(vec![]).unwrap_err().code,
+            cleanup_junk_files(vec![]).await.unwrap_err().code,
             "INVALID_INPUT"
         );
     }

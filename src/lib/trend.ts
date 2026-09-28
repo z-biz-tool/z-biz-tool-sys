@@ -10,8 +10,24 @@ export const TREND_RANGES = [
 /** 1 小时窗口在 0.5 秒采集下最多约 7200 帧，取 2 倍冗余上限 */
 export const HISTORY_LIMIT = 14400;
 
-/** Recharts 在上千数据点上会掉帧，先按桶取均值压缩 */
+/** Recharts 在上千数据点上会掉帧，先按桶压；桶数上限，输出的行数最多是它的 2 倍（每桶 min+max） */
 export const MAX_TREND_POINTS = 240;
+
+/** 曲线上的一个点：`v` 取自真实某一帧，不合成值 */
+export interface EnvelopePoint {
+  t: number;
+  v: number;
+}
+
+/**
+ * 趋势图的 time 列必须与告警标注用的 time 列逐字相同，否则 ReferenceLine 找不到落点。
+ * 这里不用 dayjs：降采样是纯逻辑，要能被 `node --test` 直接跑。
+ */
+export function formatClock(ms: number): string {
+  const d = new Date(ms);
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+}
 
 /**
  * 以「最新一帧」为锚点裁剪窗口：数据流停滞时不会把整段历史挤掉，
@@ -23,24 +39,47 @@ export function windowHistory(points: HistoryPoint[], seconds: number): HistoryP
   return points.filter((p) => p.t >= from);
 }
 
-/** 点数超限时按连续区段取均值压缩，时间戳取该区段最后一帧 */
-export function downsampleHistory(points: HistoryPoint[]): HistoryPoint[] {
-  if (points.length <= MAX_TREND_POINTS) return points;
-  const size = Math.ceil(points.length / MAX_TREND_POINTS);
-  const out: HistoryPoint[] = [];
+/** 从一帧历史点里取一条指标的值 */
+export type MetricPick = (p: HistoryPoint) => number;
+
+/**
+ * 按连续区段取 **min/max 包络**压缩：每桶最多落两个点（最低与最高，各带自己的真实时刻）。
+ *
+ * 换成包络的理由：14 400 点压到 240 桶时一桶是 60 帧（30 s），
+ * 一次 CPU 打满在这 60 帧里只占 1 帧 —— 均值会把它抹成 1.7%，图上看着"从没发生过"。
+ * 对监控工具来说那是假结论。包络保住极值，同时点数仍只有桶数的两倍。
+ */
+export function resampleEnvelope(
+  points: HistoryPoint[],
+  pick: MetricPick,
+  maxBuckets = MAX_TREND_POINTS
+): EnvelopePoint[] {
+  if (!points.length) return [];
+  const size = Math.max(1, Math.ceil(points.length / Math.max(1, maxBuckets)));
+  const out: EnvelopePoint[] = [];
   for (let i = 0; i < points.length; i += size) {
-    const slice = points.slice(i, i + size);
-    const avg = (pick: (p: HistoryPoint) => number) =>
-      slice.reduce((a, p) => a + pick(p), 0) / slice.length;
-    out.push({
-      t: slice[slice.length - 1].t,
-      cpu: avg((p) => p.cpu),
-      memory: avg((p) => p.memory),
-      rxBytesPerSec: avg((p) => p.rxBytesPerSec),
-      txBytesPerSec: avg((p) => p.txBytesPerSec),
-    });
+    const end = Math.min(i + size, points.length);
+    let lo = i;
+    let hi = i;
+    for (let j = i + 1; j < end; j += 1) {
+      if (pick(points[j]) < pick(points[lo])) lo = j;
+      if (pick(points[j]) > pick(points[hi])) hi = j;
+    }
+    if (lo === hi) {
+      out.push({ t: points[lo].t, v: pick(points[lo]) });
+      continue;
+    }
+    // 极值要按时间先后落点，否则同一桶里 max 在 min 之前时会画出一段往回走的线
+    const a = { t: points[lo].t, v: pick(points[lo]) };
+    const b = { t: points[hi].t, v: pick(points[hi]) };
+    out.push(a.t <= b.t ? a : b, a.t <= b.t ? b : a);
   }
   return out;
+}
+
+/** 降采样结果 → Recharts 的行：time 用秒精度，值保留两位（tooltip 与曲线同一口径） */
+export function toChartRows(points: EnvelopePoint[]): Array<{ t: number; time: string; value: number }> {
+  return points.map((p) => ({ t: p.t, time: formatClock(p.t), value: Math.round(p.v * 100) / 100 }));
 }
 
 /** 趋势图上的一条告警竖线 */

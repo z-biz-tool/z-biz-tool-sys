@@ -1,11 +1,17 @@
 import { Button, Col, Row, Segmented, Space, Typography } from "antd";
 import { CloudOutlined, DesktopOutlined, HddOutlined, WifiOutlined } from "@ant-design/icons";
-import dayjs from "dayjs";
 import { useMemo } from "react";
 import type { AlertEvent, HistoryPoint, MetricsSnapshot, StaticInfo } from "../../ipc_contract";
-import type { HistorySeedInfo } from "../../hooks/useSystemMonitor";
+import type { HistorySeedInfo, NetSessionTotals } from "../../hooks/useSystemMonitor";
 import { formatBytes, formatGb, formatPercent, formatRate } from "../../lib/format";
-import { TREND_RANGES, alignAlertMarkers, downsampleHistory, windowHistory } from "../../lib/trend";
+import {
+  TREND_RANGES,
+  alignAlertMarkers,
+  resampleEnvelope,
+  toChartRows,
+  windowHistory,
+} from "../../lib/trend";
+import { sumRates } from "../../lib/metrics_math";
 import { CpuCores } from "../CpuCores";
 import { MetricCard } from "../MetricCard";
 import { TrendChart } from "../TrendChart";
@@ -20,6 +26,7 @@ export function OverviewTab({
   onTrendRangeChange,
   seedInfo,
   alertEvents,
+  netSession,
   onExportCsv,
   csvExporting,
 }: {
@@ -31,6 +38,8 @@ export function OverviewTab({
   seedInfo: HistorySeedInfo | null;
   /** 已触发的告警（会话内 + 落盘回填），用来在曲线上标竖线 */
   alertEvents: AlertEvent[];
+  /** 本次会话累计收发（按累计计数器差分，接口复位时重算基线） */
+  netSession: NetSessionTotals | null;
   /** 导出当前范围的历史趋势为 CSV（02 的 F5"可导出 CSV"） */
   onExportCsv: () => void;
   csvExporting: boolean;
@@ -43,8 +52,8 @@ export function OverviewTab({
     const active = snapshot.networks.filter((n) => n.status === "up" && n.ipv4);
     const pool = active.length ? active : snapshot.networks;
     return {
-      rx: pool.reduce((a, n) => a + n.rxBytesPerSec, 0),
-      tx: pool.reduce((a, n) => a + n.txBytesPerSec, 0),
+      rx: sumRates(pool.map((n) => n.rxBytesPerSec)),
+      tx: sumRates(pool.map((n) => n.txBytesPerSec)),
       ipv4: pool.find((n) => n.ipv4)?.ipv4 ?? null,
     };
   }, [snapshot]);
@@ -57,34 +66,27 @@ export function OverviewTab({
     return { total, used, percent: total > 0 ? (used / total) * 100 : 0 };
   }, [snapshot]);
 
-  // 先留一份裁剪+压缩后的原始点：告警竖线要按真实采样时刻对齐，不能拿格式化过的字符串反推
-  const chartRows = useMemo(
-    () => downsampleHistory(windowHistory(history, trendRange)),
-    [history, trendRange]
+  // 14 400 点的窗口裁剪 + 降采样只在数据或窗口真的变了才算：本组件每一帧都重渲染，
+  // 不 memo 就等于每秒白烧一次 CPU（迷你模式同一套理由，见 MiniMenuBar）
+  const windowed = useMemo(() => windowHistory(history, trendRange), [history, trendRange]);
+  // 三条曲线各自降采样：极值落在哪一帧是每条指标自己的事，共用一套行会把尖峰抹平
+  const cpuRows = useMemo(
+    () => toChartRows(resampleEnvelope(windowed, (p) => p.cpu)),
+    [windowed]
+  );
+  const memoryRows = useMemo(
+    () => toChartRows(resampleEnvelope(windowed, (p) => p.memory)),
+    [windowed]
   );
 
-  const chartData = useMemo(
-    () =>
-      chartRows.map((p) => ({
-        time: dayjs(p.t).format("HH:mm:ss"),
-        cpu: Number(p.cpu.toFixed(2)),
-        memory: Number(p.memory.toFixed(2)),
-        network: Number(((p.rxBytesPerSec + p.txBytesPerSec) / 1024).toFixed(2)),
-      })),
-    [chartRows]
-  );
-
-  const markerRows = useMemo(
-    () => chartRows.map((p) => ({ t: p.t, time: dayjs(p.t).format("HH:mm:ss") })),
-    [chartRows]
-  );
+  // 告警竖线只能落在本条曲线真实存在的那一行上，所以 markers 与曲线共用同一批 time 字符串
   const cpuMarkers = useMemo(
-    () => alignAlertMarkers(alertEvents, markerRows, "cpu"),
-    [alertEvents, markerRows]
+    () => alignAlertMarkers(alertEvents, cpuRows, "cpu"),
+    [alertEvents, cpuRows]
   );
   const memoryMarkers = useMemo(
-    () => alignAlertMarkers(alertEvents, markerRows, "memory"),
-    [alertEvents, markerRows]
+    () => alignAlertMarkers(alertEvents, memoryRows, "memory"),
+    [alertEvents, memoryRows]
   );
   const markerSkewSecs = Math.round(
     Math.max(cpuMarkers.maxSkewMs, memoryMarkers.maxSkewMs) / 1000
@@ -144,7 +146,10 @@ export function OverviewTab({
               snapshot
                 ? `↓ ${formatRate(networkTotal.rx)} · ↑ ${formatRate(networkTotal.tx)} · ${
                     networkTotal.ipv4 ?? "无 IPv4"
-                  }`
+                  } · 会话累计 ↓${formatBytes(netSession?.rxBytes ?? 0, 1)} ↑${formatBytes(
+                    netSession?.txBytes ?? 0,
+                    1
+                  )}`
                 : "等待首帧…"
             }
           />
@@ -155,7 +160,7 @@ export function OverviewTab({
         <Col span={24} style={{ display: "flex", justifyContent: "flex-end" }}>
           <Space size={8}>
             <Text type="secondary" style={{ fontSize: 12 }}>
-              趋势范围（仅显示已采集的 {chartData.length} 个点 · {trendSourceText}）
+              趋势范围（窗口内 {windowed.length} 个原始点 → 图上 {cpuRows.length} 个点，取每桶最低/最高，尖峰不被均值抹平 · {trendSourceText}）
             </Text>
             <Segmented
               size="small"
@@ -179,8 +184,8 @@ export function OverviewTab({
         <Col span={12}>
           <TrendChart
             title="CPU 使用率趋势"
-            data={chartData}
-            dataKey="cpu"
+            data={cpuRows}
+            dataKey="value"
             color="#667eea"
             gradientId="colorCpu"
             yMax={100}
@@ -192,8 +197,8 @@ export function OverviewTab({
         <Col span={12}>
           <TrendChart
             title="内存使用趋势"
-            data={chartData}
-            dataKey="memory"
+            data={memoryRows}
+            dataKey="value"
             color="#764ba2"
             yMax={100}
             gradientId="colorMemory"
