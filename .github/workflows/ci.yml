@@ -51,8 +51,7 @@ jobs:
           cache: npm
 
       - name: Install npm dependencies
-        # npm ci 而非 npm install：package-lock.json 的 236 条 resolved 已全部指向 npmmirror，
-        # 锁文件自己就能定住源；install 允许与锁文件漂移，那样"CI 绿"就不对应任何一份确定的依赖树。
+                # 锁文件自己就能定住源；install 允许与锁文件漂移，那样"CI 绿"就不对应任何一份确定的依赖树。
         run: npm ci
 
       - name: Typecheck
