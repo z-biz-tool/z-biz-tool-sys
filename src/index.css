@@ -122,3 +122,11 @@ body {
 [data-theme="dark"] .progress-bar {
   background: #333;
 }
+/* 网络接口表：当前选中的接口（画曲线的那个） */
+.net-row-selected > td {
+  background: rgba(102, 126, 234, 0.12) !important;
+}
+
+[data-theme="dark"] .net-row-selected > td {
+  background: rgba(102, 126, 234, 0.24) !important;
+}

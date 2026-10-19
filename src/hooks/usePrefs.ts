@@ -3,6 +3,7 @@ import { INTERVAL_OPTIONS, PREF } from "../lib/ui";
 import { TREND_RANGES } from "../lib/trend";
 import { DEFAULT_ALERT_CONFIG, normalizeAlertConfig } from "../lib/alert";
 import { buildPrefsSnapshot } from "../lib/prefs_file";
+import { normalizeLang, type Lang } from "../lib/i18n";
 import type { AlertConfig, PrefsSnapshot } from "../ipc_contract";
 
 /**
@@ -28,6 +29,12 @@ export function usePrefs() {
   // 暂停采集（快捷键 Space）：会话级偏好，进 localStorage 但**不进** T5-11 的导出快照 ——
   // 那份快照的字段集由 `PrefsSnapshot` 与 Rust 侧契约测试锁着，schemaVersion 仍是 1。
   const [paused, setPaused] = useState(() => localStorage.getItem(PREF + "paused") === "1");
+  // 界面语言（T4-09）。与 `paused` 同类：**只落本地，不进 T5-11 的导出快照** ——
+  // 那份快照的字段集由 `PrefsSnapshot` 与 Rust/TS 契约测试锁着，schemaVersion 仍是 1。
+  // 读侧过 `normalizeLang` 白名单：localStorage 里可能是旧版本或手改过的陌生值。
+  const [language, setLanguage] = useState<Lang>(() =>
+    normalizeLang(localStorage.getItem(PREF + "language"))
+  );
   // 告警阈值（T5-01）：一份 JSON，读侧整体过 normalizeAlertConfig，写侧回写归一化后的值
   const [alertConfig, setAlertConfig] = useState<AlertConfig>(() => {
     const saved = localStorage.getItem(PREF + "alert");
@@ -49,12 +56,13 @@ export function usePrefs() {
         localStorage.setItem(PREF + "trendRange", String(trendRange));
         localStorage.setItem(PREF + "paused", paused ? "1" : "0");
         localStorage.setItem(PREF + "alert", JSON.stringify(alertConfig));
+        localStorage.setItem(PREF + "language", language);
       } catch {
         /* 存不下（配额、隐私模式）不影响干活 */
       }
     }, 300);
     return () => window.clearTimeout(timer);
-  }, [darkMode, intervalMs, trendRange, paused, alertConfig]);
+  }, [darkMode, intervalMs, trendRange, paused, alertConfig, language]);
 
   /**
    * 导出用的当前快照（T5-11）。就是这几项，不含任何路径、进程或主机信息。
@@ -88,6 +96,8 @@ export function usePrefs() {
     setActiveTab,
     paused,
     setPaused,
+    language,
+    setLanguage,
     alertConfig,
     setAlertConfig,
     prefsSnapshot: snapshot,

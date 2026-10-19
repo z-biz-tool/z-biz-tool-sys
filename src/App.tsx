@@ -58,6 +58,8 @@ import { usePrefs } from "./hooks/usePrefs";
 import { useProcessQuery } from "./hooks/useProcessQuery";
 import { useProcessStream } from "./hooks/useProcessStream";
 import { useSystemMonitor, type LinkStatus } from "./hooks/useSystemMonitor";
+import { useNetworkSeries } from "./hooks/useNetworkSeries";
+import { LANGS, applyDocumentLanguage } from "./lib/i18n";
 import { alertText } from "./lib/alert";
 import { presentError } from "./lib/error_ui";
 import { formatBytes } from "./lib/format";
@@ -116,11 +118,19 @@ function App() {
     setActiveTab,
     paused,
     setPaused,
+    language,
+    setLanguage,
     alertConfig,
     setAlertConfig,
     prefsSnapshot,
     applyPrefs,
   } = usePrefs();
+  // 文档标题跟着语言偏好走（T4-09）。**标题与 <html lang> 一次改完** ——
+  // 分成两处的话，早晚会出现「标题变了、lang 没变」的不一致。
+  useEffect(() => {
+    applyDocumentLanguage(language);
+  }, [language]);
+
   const [msgApi, msgContext] = message.useMessage();
   // 迷你模式（T5-07）：刻意只做会话级开关，不进 `usePrefs` 的那 5 项快照 ——
   // 加第 6 项要动 `PrefsSnapshot` 的字段与 T5-11 的 Rust/TS 契约测试，而偏好文件的
@@ -142,6 +152,9 @@ function App() {
     intervalMs,
     paused
   );
+  // per-interface 实时时序（T3-02）。后端落盘历史只有**聚合**上下行速率，
+  // 「是哪个网卡在跑流量」这个问题只能在前端按接口各自维护一条曲线。
+  const networkSeries = useNetworkSeries(snapshot);
   const {
     query: processQuery,
     keyword: processKeyword,
@@ -785,7 +798,7 @@ function App() {
       label: "网络",
       children: (
         <ErrorBoundary label="网络页">
-          <NetworkTab snapshot={snapshot} />
+          <NetworkTab snapshot={snapshot} series={networkSeries} />
         </ErrorBoundary>
       ),
     },
@@ -1096,6 +1109,14 @@ function App() {
             </Title>
           </Space>
           <Space size="middle">
+            <Select
+              value={language}
+              onChange={setLanguage}
+              options={LANGS.map((l) => ({ value: l.value, label: l.label }))}
+              style={{ width: 108 }}
+              size="small"
+              aria-label="界面语言"
+            />
             <Tooltip
               title={
                 status === "live"
