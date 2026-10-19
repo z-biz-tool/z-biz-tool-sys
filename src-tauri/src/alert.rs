@@ -650,14 +650,33 @@ mod tests {
         collector.refresh_cpu();
         std::thread::sleep(Duration::from_millis(250));
 
-        // 阈值压到 1 %：这台机器的内存占用必然越限，因此三帧之后就该出事件。
-        // CPU / 磁盘钉在 100 %，用来核对事件读的是各自那一栏而不是串了字段。
+        // 阈值压到 1 %：内存占用必然越限，因此三帧之后就该出事件。
+        // （`AlertThresholds::clamped` 把阈值夹在 1..=100，所以"内存 > 1 %"是领域保证，不是运气。）
+        // CPU / 磁盘也压到 1 %：让**所有真实越限的指标都真的出事件**，
+        // 这样"读串了字段"才有东西可咬。
+        //
+        // ⚠️ 早先这里是"CPU / 磁盘钉在 100 %，只让内存出场"，那是个**错的假设**：
+        // 满载时 CPU 真会顶到 100.0，磁盘分区也真的会 100 %（本轮实测
+        // `/Volumes/DeepSeek Harness 0.2.1-rc.2-arm64` 就在 100 %），
+        // 于是"出了磁盘事件 = 读串了字段"这条断言在真机上会误报红。
+        // 反过来，钉在 100 % 还有第二个更隐蔽的漏：把磁盘的值改成 CPU 值之后，
+        // 改出来的值低于 100 % 阈值 ⇒ 事件根本不出 ⇒ **串字段的变异测不出来**
+        // （实测：这条真采集用例当时是绿的，只有确定性用例 `disk_alerts_target_the_fullest_available_partition` 抓住了）。
+        //
+        // 所以**不用"哪些指标不该出场"来证伪串字段**，改用更直接也更强的判据：
+        // **每条事件的 value 必须等于本帧它自己那一栏的值**
+        // （CPU→cpu.total、Memory→memory.usage_percent、Disk→最满分区的 usage_percent），
+        // 磁盘事件还要对上本帧最满分区的挂载点。
+        // 这条判据与机器负载无关，且比"除了内存只能是 CPU"更强 ——
+        // 它对**每一种**指标都成立，串了字段必然对不上。
+        //
+        // 磁盘那格是"有才判"：采集器一个可用分区都没报时本来就不该有磁盘事件。
         let cfg = AlertConfig {
             consecutive: 3,
             cooldown_secs: 0,
             memory: AlertThresholds::new(1.0, 2.0),
-            cpu: AlertThresholds::new(100.0, 100.0),
-            disk: AlertThresholds::new(100.0, 100.0),
+            cpu: AlertThresholds::new(1.0, 2.0),
+            disk: AlertThresholds::new(1.0, 2.0),
             ..Default::default()
         }
         .clamped();
@@ -665,31 +684,46 @@ mod tests {
         let mut engine = AlertEngine::new();
         let mut fired = Vec::new();
         let mut last_memory = 0.0;
+        let mut last_cpu = 0.0;
+        let mut last_disk: Option<(String, f64)> = None;
         for _ in 0..3 {
             let frame = collector.snapshot(Duration::from_millis(10_000));
             last_memory = frame.memory.usage_percent;
+            last_cpu = frame.cpu.total;
+            last_disk = worst_disk(&frame).map(|d| (d.mount_point.clone(), d.usage_percent));
             fired.extend(engine.evaluate(&frame, &cfg));
             std::thread::sleep(Duration::from_millis(220));
         }
 
-        // 满载机器上 CPU 真的会顶到 100.0，而阈值夹在 1..=100 —— 于是"钉在 100 % 就当它不会触发"
-        // 是错的（本仓并发编译时这条连续三轮都红）。仍然要能抓住串字段：内存恰好一条，
-        // 其它任何一条都只能是"值确实顶到自家阈值"的 CPU 事件，磁盘在 100 % 下永不出场。
+        // 内存必然越限（阈值 1 %），恰好一条。
         let memory: Vec<_> = fired
             .iter()
             .filter(|e| e.metric == AlertMetric::Memory)
             .collect();
         assert_eq!(memory.len(), 1, "内存必然越限，应恰好一条: {fired:?}");
-        for extra in fired.iter().filter(|e| e.metric != AlertMetric::Memory) {
+
+        // 串字段的判据：每条事件的值都必须来自本帧它自己那一栏。
+        // 磁盘事件的 target 还必须是最满分区的挂载点。
+        for e in fired.iter() {
+            let (expected_target, expected_value) = match e.metric {
+                AlertMetric::Memory => (None, round2(last_memory)),
+                AlertMetric::Cpu => (None, round2(last_cpu)),
+                AlertMetric::Disk => match last_disk.as_ref() {
+                    Some((mount, usage)) => (Some(mount.clone()), round2(*usage)),
+                    None => panic!("出了磁盘事件，但本帧没有可用分区（与事实矛盾）: {e:?}"),
+                },
+            };
             assert_eq!(
-                extra.metric,
-                AlertMetric::Cpu,
-                "磁盘阈值钉在 100 % 却出了磁盘事件，说明读串了字段: {extra:?}"
+                e.value, expected_value,
+                "事件值必须等于本帧该指标自己那一栏（读串了字段）: {e:?}"
             );
-            assert!(
-                extra.value >= 100.0,
-                "CPU 事件只有在真实到顶时才允许出现: {extra:?}"
-            );
+            if let Some(exp) = expected_target {
+                assert_eq!(
+                    e.target.as_deref(),
+                    Some(exp.as_str()),
+                    "磁盘事件的 target 必须是本帧最满分区的挂载点: {e:?}"
+                );
+            }
         }
         let memory = &memory[0];
         assert_eq!(memory.metric, AlertMetric::Memory);
