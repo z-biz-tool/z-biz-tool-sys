@@ -2431,8 +2431,25 @@ mod tests {
     /// "全机存在一行 false"被 `effective_user_id() == None` 满足，"取样前 40 行"在本机
     /// 全是 501。改成一次 `ps -eo pid=,uid=` 全表比，才真正钉住"报出来的属主都是我的"。
     ///
-    /// 但这一半**钉不住恒真**：本机非提权读不到别人进程的 uid，反向半边全落在 `None` 上，
-    /// 实测恒真变异在这里照样绿。恒真由 `observe::uid_matches` 的固定真值表拦。
+    /// **两侧都有确定答案才做 oracle 对账**（2026-10-22 修掉的假红）：
+    /// 我侧 uid 读不到时，按政策只能报"不属主"（`uid_matches(None, _) == false`），
+    /// 而 `ps` 可能刚好说它属我 —— 实测本机 uid 读不到的 169 行里，就混着我自己的进程
+    /// 在退出那一瞬读不到 uid 的情形，这条对账于是报假红（实测 6 轮挂 1 次，pid 每次不同）。
+    /// 所以分成两支：
+    /// - 我侧读得到 uid ⇒ 与 `ps` 的同一列对账（正向、反向都有牙）；
+    /// - 我侧读不到 ⇒ 只核**政策**（必须报"不属主"）。这一支才是"该报不属主的得报不属主"
+    ///   那条的真牙：恒真变异（永远报"属我"）在这里被咬住，实测 169 行样本。
+    ///
+    /// 但**oracle 这一半钉不住恒真**：本机非提权读不到别人进程的 uid，反向半边全落在
+    /// `None` 上，实测恒真变异在 oracle 这一支照样绿 —— 由上面"读不到 ⇒ 必须报不属主"
+    /// 那一支接手。恒真的总闸仍在 `observe::uid_matches` 的固定真值表。
+    ///
+    /// **本机量不到的那一半由 Linux 腿补上**："读得到 uid 就当属我"这个变异在 macOS 上
+    /// 与正确实现**不可区分** —— 实测本机 169 个他人进程的 uid 一个都读不到
+    /// （macOS 侧的 uid 走 `PROC_PIDTBSDINFO`，读别人的进程要特权），于是"读得到"与
+    /// "属我"在这台机器上恒等。Linux 侧 uid 走 `/proc/<pid>/status`（世界可读），
+    /// root 进程的 euid 读得到 ⇒"读得到但不是我的"样本存在 ⇒ 那一支由 CI 的 ubuntu 腿
+    /// 咬住。本机跑 120 轮 0 失败；恒真 / 恒假 / 缺值当属主三个变异本机全部被咬住。
     ///
     /// 整条用例只属 unix：`ps` 与 `getuid` 都在那一侧，Windows 腿上既没有 `ps` 可调用、
     /// `current_uid()` 也恒为 `None` —— 在那里它不守卫任何东西，只是一句必然的 panic。
@@ -2440,12 +2457,19 @@ mod tests {
     /// 判据是**有效** uid，oracle 也就得跟着取同一列：Linux 上 `ps` 的 `uid` 是**真实** uid，
     /// 两者在 setuid 进程上会分叉（CI 实测 pid 898 real=1001 / euid=0，被这条对账误判成
     /// "该报我的却没报"），所以那一侧点 `euid=`。macOS 的 `ps` 没有 `euid` 关键字
-    /// （实测 "keyword not found"），只能拿 `uid` 对；代价是本机若真有一个"我起的、按 root 跑"
-    /// 的进程会在这里报假红 —— 消息带着 pid 和两个 uid，按本注释查即可。
+    /// （实测 "keyword not found"；`ruid=` 倒是可用），只能拿 `uid` 对 —— 它是**有效** uid，
+    /// 与判据同一列，所以不会分叉。
     #[cfg(unix)]
     #[test]
     fn ownership_flag_matches_ps_uid() {
-        let rows = collect_all_rows();
+        // 行与我侧 uid 必须来自**同一份快照**，否则两边比的是两个时刻。
+        let mut sys = process_system();
+        let rows = process_rows(&mut sys);
+        let our_uid: std::collections::HashMap<u32, Option<u32>> = sys
+            .processes()
+            .iter()
+            .map(|(pid, proc_info)| (pid.as_u32(), crate::observe::effective_uid(proc_info)))
+            .collect();
         let me = crate::observe::current_uid().expect("unix 上应取到自己的 uid");
 
         #[cfg(target_os = "linux")]
@@ -2472,29 +2496,49 @@ mod tests {
         }
         assert!(!table.is_empty(), "ps 没读出任何一行，这个对照就是空跑");
 
-        let mut mine_seen = 0;
-        let mut not_mine_seen = 0;
+        let mut mine_checked = 0usize;
+        let mut not_mine_checked = 0usize;
+        let mut blind_checked = 0usize;
         for row in &rows {
-            // ps 看不到（进程刚退出）就跳过，不能算不一致。
-            let Some(&uid) = table.get(&row.pid) else {
+            let Some(&their) = our_uid.get(&row.pid) else {
                 continue;
             };
-            let want = uid == me;
-            assert_eq!(
-                row.owned_by_current_user, want,
-                "pid {} 的属主判定与 ps 不符：flag={} 但 ps uid={uid} (我={me})",
-                row.pid, row.owned_by_current_user
-            );
-            if want {
-                mine_seen += 1;
-            } else {
-                not_mine_seen += 1;
+            match their {
+                Some(_) => {
+                    // ps 看不到（进程刚退出）就跳过，不能算不一致。
+                    let Some(&uid) = table.get(&row.pid) else {
+                        continue;
+                    };
+                    let want = uid == me;
+                    assert_eq!(
+                        row.owned_by_current_user, want,
+                        "pid {} 的属主判定与 ps 不符：flag={} 但 ps uid={uid} (我={me})",
+                        row.pid, row.owned_by_current_user
+                    );
+                    if want {
+                        mine_checked += 1;
+                    } else {
+                        not_mine_checked += 1;
+                    }
+                }
+                None => {
+                    // 读不到 uid ⇒ 只能按"不属主"报（`uid_matches(None, _) == false`）。
+                    assert!(
+                        !row.owned_by_current_user,
+                        "pid {} 的 uid 读不到，却报了'属我' —— 政策是读不到就不报属主",
+                        row.pid
+                    );
+                    blind_checked += 1;
+                }
             }
         }
-        assert!(mine_seen > 0, "样本里一个本用户进程都没有，正向半边空跑");
         assert!(
-            not_mine_seen > 0,
-            "样本里一个非本用户进程都没有，反向半边空跑（恒真就测不出来）"
+            mine_checked > 0,
+            "样本里一个'属我'的进程都没有，正向半边空跑"
+        );
+        assert!(
+            not_mine_checked + blind_checked > 0,
+            "样本里一个'不属我'的进程都没有，反向半边空跑（恒真就测不出来）"
         );
     }
 

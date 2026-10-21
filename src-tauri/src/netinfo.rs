@@ -23,21 +23,23 @@ pub fn list_interfaces() -> Vec<InterfaceAddress> {
     }
 }
 
-fn format_mac(bytes: &[u8]) -> String {
-    bytes
-        .iter()
-        .map(|b| format!("{:02X}", b))
-        .collect::<Vec<_>>()
-        .join(":")
-}
-
 #[cfg(unix)]
 mod unix {
-    use super::{format_mac, InterfaceAddress};
+    use super::InterfaceAddress;
     use std::collections::BTreeMap;
     use std::ffi::CStr;
     use std::net::{Ipv4Addr, Ipv6Addr};
-    use std::{ptr, slice};
+    use std::ptr;
+
+    /// MAC 地址只在 unix 侧采集（Windows 侧无对应通路），所以格式化助手也跟它住在一起，
+    /// 免得在 Windows 编译出一个没人调用的死函数。
+    fn format_mac(bytes: &[u8]) -> String {
+        bytes
+            .iter()
+            .map(|b| format!("{:02X}", b))
+            .collect::<Vec<_>>()
+            .join(":")
+    }
 
     // BSD/macOS 的 sockaddr_dl：sdl_len@0, sdl_family@1, sdl_index@2..3,
     // sdl_type@4, sdl_nlen@5, sdl_alen@6, sdl_slen@7, sdl_data@8。
@@ -139,7 +141,7 @@ mod unix {
         let alen = unsafe { *base.add(6) } as usize;
         if alen == 6 && total >= SDL_DATA_OFFSET + nlen + alen {
             let ptr = unsafe { base.add(SDL_DATA_OFFSET + nlen) };
-            let bytes = unsafe { slice::from_raw_parts(ptr, alen) };
+            let bytes = unsafe { std::slice::from_raw_parts(ptr, alen) };
             if bytes.iter().all(|b| *b == 0) {
                 None
             } else {
@@ -164,18 +166,24 @@ mod unix {
             None
         }
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::format_mac;
+
+        #[test]
+        fn mac_formats_as_uppercase_hex_pairs() {
+            assert_eq!(format_mac(&[0, 17, 255, 0x0a, 1, 2]), "00:11:FF:0A:01:02");
+        }
+    }
 }
 
-#[cfg(test)]
+// 这一组用例都只在 unix 上有意义（Windows 侧没有网卡采集通路），所以整个模块按 unix 收口，
+// 免得在 Windows 上留下一个空的测试模块 + 一条没人用的 glob import。
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
-    #[test]
-    fn mac_formats_as_uppercase_hex_pairs() {
-        assert_eq!(format_mac(&[0, 17, 255, 0x0a, 1, 2]), "00:11:FF:0A:01:02");
-    }
-
-    #[cfg(unix)]
     #[test]
     fn enumerates_loopback_with_real_addresses() {
         let all = list_interfaces();
@@ -190,7 +198,6 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
     #[test]
     fn every_interface_has_a_name() {
         assert!(list_interfaces().iter().all(|i| !i.name.is_empty()));

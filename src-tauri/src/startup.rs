@@ -77,29 +77,30 @@ pub struct Layout {
 }
 
 /// 平台 → 能动的来源。新增一处就要同步 `ipc_contract.ts` 里给界面看的说明。
+///
+/// 这里不用 `mut vec!` + 平台分支 push 的写法：那会让 Windows 上多出
+/// "变量不需要 mut" / "参数没用到" 两条 clippy 告警（Windows 没有可动的启动项）。
+/// 改成"先按平台定死规格表，再统一 join"，任何平台都只有一份同样的代码路径。
 fn platform_sources(home: &Path) -> Vec<(String, PathBuf, String)> {
-    let mut out: Vec<(String, PathBuf, String)> = Vec::new();
-
-    #[cfg(target_os = "macos")]
-    {
-        out.push((
-            "macos-agent".to_string(),
-            home.join("Library/LaunchAgents"),
-            "plist".to_string(),
-        ));
-    }
-    #[cfg(target_os = "linux")]
-    {
-        // XDG autostart 是纯文件判定：文件在目录里就会被会话管理器读，移走即失效，移回即恢复。
-        out.push((
-            "linux-autostart".to_string(),
-            home.join(".config/autostart"),
-            "desktop".to_string(),
-        ));
-    }
     // Windows 的启动项在注册表 Run 键里；没有可覆盖的写入通路，就不摆一个能点的按钮。
-    let _ = &out;
-    out
+    #[cfg(target_os = "macos")]
+    let specs: Vec<(&str, &str, &str)> = vec![("macos-agent", "Library/LaunchAgents", "plist")];
+    #[cfg(target_os = "linux")]
+    // XDG autostart 是纯文件判定：文件在目录里就会被会话管理器读，移走即失效，移回即恢复。
+    let specs: Vec<(&str, &str, &str)> = vec![("linux-autostart", ".config/autostart", "desktop")];
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    let specs: Vec<(&str, &str, &str)> = Vec::new();
+
+    specs
+        .into_iter()
+        .map(|(prefix, relative, extension)| {
+            (
+                prefix.to_string(),
+                home.join(relative),
+                extension.to_string(),
+            )
+        })
+        .collect()
 }
 
 /// 把"来源目录 + 备份根"拼成一份完整布局。备份落点按前缀分目录，避免不同来源同名互相顶掉。
