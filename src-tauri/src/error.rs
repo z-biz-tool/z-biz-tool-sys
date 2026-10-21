@@ -96,7 +96,11 @@ mod tests {
         let start = contract
             .find("export const AppErrorCode = {")
             .expect("前端未登记 AppErrorCode 映射");
-        let block = &contract[start..contract[start..].find("} as const;").expect("AppErrorCode 缺收尾") + start];
+        let block = &contract[start
+            ..contract[start..]
+                .find("} as const;")
+                .expect("AppErrorCode 缺收尾")
+                + start];
 
         let mut front: Vec<String> = block
             .match_indices('"')
@@ -131,7 +135,10 @@ mod tests {
         if cfg!(debug_assertions) {
             assert!(json.contains("\"detail\""), "{json}");
             // 前端契约里字段名是 camelCase
-            assert!(json.contains("\"code\"") && json.contains("\"message\""), "{json}");
+            assert!(
+                json.contains("\"code\"") && json.contains("\"message\""),
+                "{json}"
+            );
         } else {
             assert!(!json.contains("detail"), "release 不得带出 detail: {json}");
         }

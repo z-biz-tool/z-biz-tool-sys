@@ -174,9 +174,7 @@ impl Reply {
     }
 
     fn suggest(&mut self, suggestion: Suggestion) {
-        if self.suggestions.len() < MAX_SUGGESTIONS
-            && !self.suggestions.contains(&suggestion)
-        {
+        if self.suggestions.len() < MAX_SUGGESTIONS && !self.suggestions.contains(&suggestion) {
             self.suggestions.push(suggestion);
         }
     }
@@ -227,28 +225,85 @@ fn normalize(raw: &str) -> String {
 const CPU_WORDS: &[&str] = &["cpu", "处理器", "占用率"];
 const MEM_WORDS: &[&str] = &["内存", "memory", "ram", "运存"];
 const PROCESS_WORDS: &[&str] = &["进程", "process", "程序", "pid"];
-const RANK_WORDS: &[&str] = &["最高", "最大", "最多", "排行", "排名", "top", "谁", "哪个", "哪些", "占用"];
+const RANK_WORDS: &[&str] = &[
+    "最高", "最大", "最多", "排行", "排名", "top", "谁", "哪个", "哪些", "占用",
+];
 const DISK_WORDS: &[&str] = &["磁盘", "硬盘", "分区", "空间", "容量", "disk", "存储"];
-const NET_WORDS: &[&str] = &["网络", "网速", "带宽", "上传", "下载", "网卡", "流量", "network"];
+const NET_WORDS: &[&str] = &[
+    "网络", "网速", "带宽", "上传", "下载", "网卡", "流量", "network",
+];
 const STARTUP_WORDS: &[&str] = &["启动项", "开机", "自启", "startup", "login item"];
 const JUNK_WORDS: &[&str] = &["垃圾", "缓存", "清理", "junk", "临时文件"];
 const TEMP_WORDS: &[&str] = &["温度", "风扇", "过热", "thermal", "temperature"];
-const SLOW_WORDS: &[&str] = &["卡", "慢", "诊断", "为什么", "怎么回事", "报告", "状况", "slow", "lag", "freeze"];
+const SLOW_WORDS: &[&str] = &[
+    "卡",
+    "慢",
+    "诊断",
+    "为什么",
+    "怎么回事",
+    "报告",
+    "状况",
+    "slow",
+    "lag",
+    "freeze",
+];
 /// 归类口径的问题（T6-01）："怎么这么多 java 进程""跑了哪些运行时"。
 ///
 /// 刻意不收"进程"二字本身，也不收"最多/最高"：那些是排行榜的措辞，抢过来会让
 /// `哪个进程占内存最高` 从榜单退化成桶。这里要的是**按类合并**这一层意思。
 const CENSUS_WORDS: &[&str] = &[
-    "归类", "分类", "按类", "哪些类", "哪些种", "种类", "一堆", "这么多", "那么多", "都跑了",
-    "跑了多少", "都在跑", "残留", "孤儿", "脱离", "收养", "常驻", "census", "by category",
-    "how many process", "categories",
+    "归类",
+    "分类",
+    "按类",
+    "哪些类",
+    "哪些种",
+    "种类",
+    "一堆",
+    "这么多",
+    "那么多",
+    "都跑了",
+    "跑了多少",
+    "都在跑",
+    "残留",
+    "孤儿",
+    "脱离",
+    "收养",
+    "常驻",
+    "census",
+    "by category",
+    "how many process",
+    "categories",
 ];
 /// 看起来在要求"代执行"的自由文本。命中即拒绝，只给一句说明。
 const COMMAND_LIKE: &[&str] = &[
-    "sudo", "rm -", "chmod", "chown", "kill ", "killall", "pkill", "bash", "zsh -c",
-    "sh -c", "curl", "wget", "osascript", "执行命令", "运行命令", "跑个命令", "执行脚本",
-    "帮我关", "帮我杀", "终止进程", "结束进程", "杀掉", "强制退出", "关掉进程", "删掉进程",
-    "shell", "命令行", "终端里",
+    "sudo",
+    "rm -",
+    "chmod",
+    "chown",
+    "kill ",
+    "killall",
+    "pkill",
+    "bash",
+    "zsh -c",
+    "sh -c",
+    "curl",
+    "wget",
+    "osascript",
+    "执行命令",
+    "运行命令",
+    "跑个命令",
+    "执行脚本",
+    "帮我关",
+    "帮我杀",
+    "终止进程",
+    "结束进程",
+    "杀掉",
+    "强制退出",
+    "关掉进程",
+    "删掉进程",
+    "shell",
+    "命令行",
+    "终端里",
 ];
 
 /// 只做分类，不做任何"理解"以外的事情：认不出来就是 `Unknown`，
@@ -256,10 +311,18 @@ const COMMAND_LIKE: &[&str] = &[
 pub fn parse(raw: &str) -> Parsed {
     let q = normalize(raw);
     if q.is_empty() {
-        return Parsed { intent: Intent::Unknown, rank_by: None, refused: false };
+        return Parsed {
+            intent: Intent::Unknown,
+            rank_by: None,
+            refused: false,
+        };
     }
     if has(&q, COMMAND_LIKE) {
-        return Parsed { intent: Intent::Unknown, rank_by: None, refused: true };
+        return Parsed {
+            intent: Intent::Unknown,
+            rank_by: None,
+            refused: true,
+        };
     }
 
     let rank_by = if has(&q, CPU_WORDS) {
@@ -271,42 +334,82 @@ pub fn parse(raw: &str) -> Parsed {
     };
     let about_process = has(&q, PROCESS_WORDS);
     let wants_rank = has(&q, RANK_WORDS);
-    let rank = |by: RankBy| Parsed { intent: Intent::RankProcesses, rank_by: Some(by), refused: false };
+    let rank = |by: RankBy| Parsed {
+        intent: Intent::RankProcesses,
+        rank_by: Some(by),
+        refused: false,
+    };
 
     // 先判"我们根本没有数据"的三类，否则会被下面的综合诊断吃掉。
     if has(&q, TEMP_WORDS) {
-        return Parsed { intent: Intent::Temperature, rank_by: None, refused: false };
+        return Parsed {
+            intent: Intent::Temperature,
+            rank_by: None,
+            refused: false,
+        };
     }
     if has(&q, STARTUP_WORDS) {
-        return Parsed { intent: Intent::StartupItems, rank_by: None, refused: false };
+        return Parsed {
+            intent: Intent::StartupItems,
+            rank_by: None,
+            refused: false,
+        };
     }
     if has(&q, JUNK_WORDS) {
-        return Parsed { intent: Intent::JunkFiles, rank_by: None, refused: false };
+        return Parsed {
+            intent: Intent::JunkFiles,
+            rank_by: None,
+            refused: false,
+        };
     }
     // 归类问法排在排行榜**之前**：这类问句里几乎必然同时出现"进程"和某个极值词
     // （"这么多进程""哪个占用最多"），排在后面就会被 `about_process && wants_rank` 吃掉，
     // 用户拿到一份五行榜单，而他要的是"一共哪些类、各占多少"。
     if has(&q, CENSUS_WORDS) {
-        return Parsed { intent: Intent::RuntimeCensus, rank_by: None, refused: false };
+        return Parsed {
+            intent: Intent::RuntimeCensus,
+            rank_by: None,
+            refused: false,
+        };
     }
     // "占用最高的进程""谁最吃内存"：明确的排行榜
     if (about_process && (rank_by.is_some() || wants_rank)) || (wants_rank && rank_by.is_some()) {
         return rank(rank_by.unwrap_or(RankBy::Cpu));
     }
     if has(&q, DISK_WORDS) {
-        return Parsed { intent: Intent::DiskSpace, rank_by: None, refused: false };
+        return Parsed {
+            intent: Intent::DiskSpace,
+            rank_by: None,
+            refused: false,
+        };
     }
     if has(&q, NET_WORDS) {
-        return Parsed { intent: Intent::NetworkThroughput, rank_by: None, refused: false };
+        return Parsed {
+            intent: Intent::NetworkThroughput,
+            rank_by: None,
+            refused: false,
+        };
     }
     // 单独问内存（没有"排行"意味）：给压力判读而不是榜单
     if has(&q, MEM_WORDS) {
-        return Parsed { intent: Intent::MemoryPressure, rank_by: None, refused: false };
+        return Parsed {
+            intent: Intent::MemoryPressure,
+            rank_by: None,
+            refused: false,
+        };
     }
     if has(&q, SLOW_WORDS) || has(&q, CPU_WORDS) {
-        return Parsed { intent: Intent::DiagnoseSlowness, rank_by: None, refused: false };
+        return Parsed {
+            intent: Intent::DiagnoseSlowness,
+            rank_by: None,
+            refused: false,
+        };
     }
-    Parsed { intent: Intent::Unknown, rank_by: None, refused: false }
+    Parsed {
+        intent: Intent::Unknown,
+        rank_by: None,
+        refused: false,
+    }
 }
 
 // ==================== 分析与生成 ====================
@@ -433,7 +536,11 @@ pub fn answer(raw_query: &str, input: &Input) -> Reply {
                 ));
             } else {
                 let mut temps: Vec<&Sensor> = input.thermal.temperatures().collect();
-                temps.sort_by(|a, b| b.value.partial_cmp(&a.value).unwrap_or(std::cmp::Ordering::Equal));
+                temps.sort_by(|a, b| {
+                    b.value
+                        .partial_cmp(&a.value)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
                 for sensor in temps.iter().take(MAX_THERMAL_FINDINGS) {
                     reply.find(thermal_finding(sensor));
                 }
@@ -515,12 +622,25 @@ fn fan_finding(sensor: &Sensor) -> Finding {
     Finding {
         metric: AgentMetric::Thermal,
         text: if stopped {
-            format!("{} 0 {}：这一路风扇当前停转（有读数，不是缺测）", sensor.label, sensor.kind.unit())
+            format!(
+                "{} 0 {}：这一路风扇当前停转（有读数，不是缺测）",
+                sensor.label,
+                sensor.kind.unit()
+            )
         } else {
-            format!("{} {:.0} {}", sensor.label, sensor.value, sensor.kind.unit())
+            format!(
+                "{} {:.0} {}",
+                sensor.label,
+                sensor.value,
+                sensor.kind.unit()
+            )
         },
         value: Some(format!("{:.0} {}", sensor.value, sensor.kind.unit())),
-        level: if stopped { Severity::Warning } else { Severity::Info },
+        level: if stopped {
+            Severity::Warning
+        } else {
+            Severity::Info
+        },
     }
 }
 
@@ -581,7 +701,9 @@ fn usable_disks(snapshot: &MetricsSnapshot) -> impl Iterator<Item = &DiskMetrics
 }
 
 fn disk_report(reply: &mut Reply, input: &Input) {
-    let Some(snapshot) = input.snapshot else { return };
+    let Some(snapshot) = input.snapshot else {
+        return;
+    };
     let mut listed = 0usize;
     let mut skipped = 0usize;
     for disk in usable_disks(snapshot) {
@@ -609,7 +731,9 @@ fn disk_report(reply: &mut Reply, input: &Input) {
         reply.note("没有分区越过告警阈值，磁盘这条线暂时不背锅。".to_string());
     }
     if skipped > 0 {
-        reply.note(format!("另有 {skipped} 个越限分区未列出（最多展示 {MAX_DISK_FINDINGS} 个）。"));
+        reply.note(format!(
+            "另有 {skipped} 个越限分区未列出（最多展示 {MAX_DISK_FINDINGS} 个）。"
+        ));
     }
 }
 
@@ -677,7 +801,9 @@ fn process_report(reply: &mut Reply, by: RankBy, input: &Input) {
         return;
     }
     if all_zero(rows, by) {
-        reply.note(format!("{unit} 采样还在暖机（两次采样的差值未到），这一轮不给出{unit}排行榜。"));
+        reply.note(format!(
+            "{unit} 采样还在暖机（两次采样的差值未到），这一轮不给出{unit}排行榜。"
+        ));
         return;
     }
     for (idx, proc) in ranked(rows, by, MAX_RANK).into_iter().enumerate() {
@@ -745,7 +871,10 @@ fn census_report(reply: &mut Reply, input: &Input) {
         };
         let mut text = format!(
             "{}：{} 个进程 · 合计 {} · 占 {:.1} %",
-            bucket.category, bucket.process_count, human_bytes(bucket.memory_bytes), share
+            bucket.category,
+            bucket.process_count,
+            human_bytes(bucket.memory_bytes),
+            share
         );
         if bucket.detached_count > 0 {
             text.push_str(&format!(" · {} 个已脱离启动者", bucket.detached_count));
@@ -807,7 +936,11 @@ fn human_bytes(bytes: u64) -> String {
 }
 
 fn human_rate(bytes_per_sec: f64) -> String {
-    let rounded = if bytes_per_sec.is_finite() { bytes_per_sec.max(0.0).round() } else { 0.0 };
+    let rounded = if bytes_per_sec.is_finite() {
+        bytes_per_sec.max(0.0).round()
+    } else {
+        0.0
+    };
     format!("{}/s", human_bytes(rounded as u64))
 }
 
@@ -838,7 +971,11 @@ mod tests {
         MetricsSnapshot {
             timestamp_ms: 1,
             uptime_seconds: 60,
-            cpu: CpuMetrics { total: cpu_total, per_core: vec![cpu_total], core_count: 10 },
+            cpu: CpuMetrics {
+                total: cpu_total,
+                per_core: vec![cpu_total],
+                core_count: 10,
+            },
             memory: MemoryMetrics {
                 total_bytes: mem_total,
                 used_bytes: mem_used,
@@ -853,7 +990,13 @@ mod tests {
         }
     }
 
-    fn disk(name: &str, mount: &str, total: u64, used: u64, available: bool) -> crate::monitor::DiskMetrics {
+    fn disk(
+        name: &str,
+        mount: &str,
+        total: u64,
+        used: u64,
+        available: bool,
+    ) -> crate::monitor::DiskMetrics {
         crate::monitor::DiskMetrics {
             name: name.to_string(),
             mount_point: mount.to_string(),
@@ -883,8 +1026,14 @@ mod tests {
         fn default() -> Self {
             Self {
                 snapshot: snapshot_with(42.0, 24 * 1024u64.pow(3), 32 * 1024u64.pow(3)),
-                cpu: vec![proc(11, "Chrome Helper", 30.0, 2 * 1024u64.pow(3)), proc(12, "WindowServer", 12.0, 1024u64.pow(3))],
-                mem: vec![proc(11, "Chrome Helper", 30.0, 2 * 1024u64.pow(3)), proc(13, "idea", 1.0, 6 * 1024u64.pow(3))],
+                cpu: vec![
+                    proc(11, "Chrome Helper", 30.0, 2 * 1024u64.pow(3)),
+                    proc(12, "WindowServer", 12.0, 1024u64.pow(3)),
+                ],
+                mem: vec![
+                    proc(11, "Chrome Helper", 30.0, 2 * 1024u64.pow(3)),
+                    proc(13, "idea", 1.0, 6 * 1024u64.pow(3)),
+                ],
                 alert: AlertConfig::default(),
                 // 默认当作"这台机器给不出温度"，键写死 "macos" 而不是 `env::consts::OS`：
                 // Linux CI 上 probe() 走的是有货那条腿，用当台的值会让下面的 SMC 断言莫名红。
@@ -923,7 +1072,12 @@ mod tests {
 
     fn normal_thermal() -> ThermalReport {
         thermal_report(&[
-            ("cpu_thermal temp1", SensorKind::Temperature, 48.5, Some(95.0)),
+            (
+                "cpu_thermal temp1",
+                SensorKind::Temperature,
+                48.5,
+                Some(95.0),
+            ),
             ("nvme temp1", SensorKind::Temperature, 71.0, Some(75.0)),
             ("CPU FAN", SensorKind::Fan, 2410.0, None),
         ])
@@ -1024,9 +1178,17 @@ mod tests {
         let reply = ask(&fixture, "哪个进程 CPU 占用最高");
         assert_eq!(reply.intent, Intent::RankProcesses);
         assert_eq!(reply.rank_by, Some(RankBy::Cpu));
-        let ranked_rows: Vec<_> = reply.findings.iter().filter(|f| f.metric == AgentMetric::Process).collect();
+        let ranked_rows: Vec<_> = reply
+            .findings
+            .iter()
+            .filter(|f| f.metric == AgentMetric::Process)
+            .collect();
         assert_eq!(ranked_rows.len(), MAX_RANK, "排行榜应被截到 {MAX_RANK} 条");
-        assert!(ranked_rows[0].text.contains("p19"), "第一名应是采集里最高的：{}", ranked_rows[0].text);
+        assert!(
+            ranked_rows[0].text.contains("p19"),
+            "第一名应是采集里最高的：{}",
+            ranked_rows[0].text
+        );
         assert!(ranked_rows[0].value.as_deref().unwrap().starts_with("19"));
     }
 
@@ -1037,8 +1199,15 @@ mod tests {
             ..Default::default()
         };
         let reply = ask(&fixture, "cpu 最高的进程");
-        assert!(!reply.findings.iter().any(|f| f.metric == AgentMetric::Process));
-        assert!(reply.notes.iter().any(|n| n.contains("暖机")), "{:?}", reply.notes);
+        assert!(!reply
+            .findings
+            .iter()
+            .any(|f| f.metric == AgentMetric::Process));
+        assert!(
+            reply.notes.iter().any(|n| n.contains("暖机")),
+            "{:?}",
+            reply.notes
+        );
     }
 
     #[test]
@@ -1057,11 +1226,20 @@ mod tests {
         let invented: Vec<&Finding> = reply
             .findings
             .iter()
-            .filter(|f| matches!(f.metric, AgentMetric::Cpu | AgentMetric::Memory | AgentMetric::Disk))
+            .filter(|f| {
+                matches!(
+                    f.metric,
+                    AgentMetric::Cpu | AgentMetric::Memory | AgentMetric::Disk
+                )
+            })
             .collect();
         assert!(invented.is_empty(), "无来源时不得有指标结论：{invented:?}");
         assert!(!reply.findings.is_empty(), "进程排行榜不该被连带清空");
-        assert!(reply.notes.iter().any(|n| n.contains("不编造")), "{:?}", reply.notes);
+        assert!(
+            reply.notes.iter().any(|n| n.contains("不编造")),
+            "{:?}",
+            reply.notes
+        );
     }
 
     #[test]
@@ -1070,8 +1248,16 @@ mod tests {
         fixture.alert.cpu.warning = 10.0;
         fixture.alert.cpu.critical = 20.0;
         let reply = ask(&fixture, "为什么这么卡");
-        let cpu = reply.findings.iter().find(|f| f.metric == AgentMetric::Cpu).expect("应有 CPU 结论");
-        assert_eq!(cpu.level, Severity::Critical, "42 % 越过自定义 critical=20 %");
+        let cpu = reply
+            .findings
+            .iter()
+            .find(|f| f.metric == AgentMetric::Cpu)
+            .expect("应有 CPU 结论");
+        assert_eq!(
+            cpu.level,
+            Severity::Critical,
+            "42 % 越过自定义 critical=20 %"
+        );
     }
 
     #[test]
@@ -1091,10 +1277,18 @@ mod tests {
     fn mount_points_and_process_names_are_sanitized() {
         let mut fixture = Fixture::default();
         fixture.snapshot.disks = vec![disk("Data", "/Users/zifang/SecretDir", 1000, 990, true)];
-        fixture.mem = vec![proc(7, "/Users/zifang/private_tool", 1.0, 6 * 1024u64.pow(3))];
+        fixture.mem = vec![proc(
+            7,
+            "/Users/zifang/private_tool",
+            1.0,
+            6 * 1024u64.pow(3),
+        )];
         for query in ["磁盘满了吗", "内存占用最高的进程"] {
             let json = serde_json::to_string(&ask(&fixture, query)).unwrap();
-            assert!(!json.contains("zifang"), "{query} 的回显里泄漏了用户名：{json}");
+            assert!(
+                !json.contains("zifang"),
+                "{query} 的回显里泄漏了用户名：{json}"
+            );
             assert!(json.contains("<user>"), "{query} 应看到脱敏占位：{json}");
         }
         // 排行榜第一名必须真的在结论里
@@ -1106,12 +1300,23 @@ mod tests {
     fn unimplemented_temperature_is_answered_honestly() {
         let fixture = Fixture::default();
         let reply = ask(&fixture, "CPU 温度多少");
-        assert!(reply.findings.is_empty(), "没有通路时一条读数结论都不该有：{:?}", reply.findings);
-        assert!(reply.suggestions.is_empty(), "没有可看的东西就不该推着用户去开页面");
+        assert!(
+            reply.findings.is_empty(),
+            "没有通路时一条读数结论都不该有：{:?}",
+            reply.findings
+        );
+        assert!(
+            reply.suggestions.is_empty(),
+            "没有可看的东西就不该推着用户去开页面"
+        );
         assert_eq!(reply.notes.len(), 1, "{:?}", reply.notes);
         // 原因来自 thermal，而不是 Agent 自己写死一句"未实现"
         assert!(reply.notes[0].contains("SMC"), "{:?}", reply.notes);
-        assert!(reply.notes[0].contains("应用内不执行提权"), "{:?}", reply.notes);
+        assert!(
+            reply.notes[0].contains("应用内不执行提权"),
+            "{:?}",
+            reply.notes
+        );
         assert!(reply.notes[0].contains("不会用估算值"), "{:?}", reply.notes);
     }
 
@@ -1130,16 +1335,28 @@ mod tests {
             .filter(|f| f.text.contains("°C"))
             .collect();
         assert_eq!(temps.len(), 2, "{:?}", reply.findings);
-        assert!(temps[0].text.starts_with("nvme"), "71 °C 该排在 48.5 °C 前面：{:?}", temps[0].text);
+        assert!(
+            temps[0].text.starts_with("nvme"),
+            "71 °C 该排在 48.5 °C 前面：{:?}",
+            temps[0].text
+        );
         assert_eq!(temps[0].level, Severity::Warning, "71/75 距上限不足 10 度");
         assert_eq!(temps[1].level, Severity::Info, "48.5/95 还很远");
         assert_eq!(temps[0].value.as_deref(), Some("71.0 °C"));
 
-        let fan = reply.findings.iter().find(|f| f.text.contains("CPU FAN")).expect("应有风扇结论");
+        let fan = reply
+            .findings
+            .iter()
+            .find(|f| f.text.contains("CPU FAN"))
+            .expect("应有风扇结论");
         assert_eq!(fan.level, Severity::Info);
         assert!(fan.text.contains("2410 RPM"), "{:?}", fan.text);
 
-        assert!(reply.notes.is_empty(), "有读数时不该再挂\"没有通路\"的说明：{:?}", reply.notes);
+        assert!(
+            reply.notes.is_empty(),
+            "有读数时不该再挂\"没有通路\"的说明：{:?}",
+            reply.notes
+        );
         assert_eq!(
             reply.suggestions,
             vec![Suggestion::OpenTab {
@@ -1159,7 +1376,11 @@ mod tests {
         let reply = ask(&fixture, "风扇转速");
         let finding = &reply.findings[0];
         assert_eq!(finding.level, Severity::Critical, "{:?}", finding);
-        assert!(finding.text.contains("96.0") && finding.text.contains("95"), "{:?}", finding.text);
+        assert!(
+            finding.text.contains("96.0") && finding.text.contains("95"),
+            "{:?}",
+            finding.text
+        );
     }
 
     /// 传感器没上报自己的上限时，只报读数、不给等级 —— 免得把"不知道"说成"正常"。
@@ -1171,7 +1392,11 @@ mod tests {
         };
         let reply = ask(&fixture, "温度");
         assert_eq!(reply.findings[0].level, Severity::Info);
-        assert!(reply.findings[0].text.contains("没有上报自己的上限"), "{:?}", reply.findings[0].text);
+        assert!(
+            reply.findings[0].text.contains("没有上报自己的上限"),
+            "{:?}",
+            reply.findings[0].text
+        );
     }
 
     /// 停转的风扇是 Warning，不是"没有数据"。
@@ -1183,8 +1408,16 @@ mod tests {
         };
         let reply = ask(&fixture, "风扇");
         assert_eq!(reply.findings[0].level, Severity::Warning);
-        assert!(reply.findings[0].text.contains("停转"), "{:?}", reply.findings[0].text);
-        assert!(reply.findings[0].text.contains("不是缺测"), "{:?}", reply.findings[0].text);
+        assert!(
+            reply.findings[0].text.contains("停转"),
+            "{:?}",
+            reply.findings[0].text
+        );
+        assert!(
+            reply.findings[0].text.contains("不是缺测"),
+            "{:?}",
+            reply.findings[0].text
+        );
         assert_eq!(reply.findings[0].value.as_deref(), Some("0 RPM"));
     }
 
@@ -1200,10 +1433,18 @@ mod tests {
         };
         let reply = ask(&fixture, "温度");
         assert_eq!(
-            reply.findings.iter().filter(|f| f.metric == AgentMetric::Thermal).count(),
+            reply
+                .findings
+                .iter()
+                .filter(|f| f.metric == AgentMetric::Thermal)
+                .count(),
             MAX_THERMAL_FINDINGS
         );
-        assert!(reply.findings[0].text.contains("49.0"), "该列的是最高的那几个：{:?}", reply.findings[0].text);
+        assert!(
+            reply.findings[0].text.contains("49.0"),
+            "该列的是最高的那几个：{:?}",
+            reply.findings[0].text
+        );
     }
 
     /// 建议里那个页签必须真实存在（这条也在 `suggested_tabs_are_all_real_page_keys` 的覆盖面里）。
@@ -1211,14 +1452,22 @@ mod tests {
     fn the_temperature_suggestion_points_at_a_real_tab() {
         let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let app = std::fs::read_to_string(manifest.join("../src/App.tsx")).unwrap();
-        let fixture = Fixture { thermal: normal_thermal(), ..Default::default() };
+        let fixture = Fixture {
+            thermal: normal_thermal(),
+            ..Default::default()
+        };
         let reply = ask(&fixture, "温度");
         let Suggestion::OpenTab { tab, .. } = &reply.suggestions[0] else {
             panic!("温度建议只可能是打开页签：{:?}", reply.suggestions);
         };
-        assert!(app.contains(&format!("key: \"{tab}\"")), "页签 {tab} 在 App.tsx 里不存在");
+        assert!(
+            app.contains(&format!("key: \"{tab}\"")),
+            "页签 {tab} 在 App.tsx 里不存在"
+        );
         // 系统信息页确实接了温度这条链路
-        let tab_src = std::fs::read_to_string(manifest.join("../src/components/tabs/SystemInfoTab.tsx")).unwrap();
+        let tab_src =
+            std::fs::read_to_string(manifest.join("../src/components/tabs/SystemInfoTab.tsx"))
+                .unwrap();
         assert!(tab_src.contains("thermal"), "系统信息页没有展示传感器");
     }
 
@@ -1239,8 +1488,16 @@ mod tests {
             .map(|i| disk(&format!("d{i}"), &format!("/mnt/d{i}"), 1000, 990, true))
             .collect();
         let reply = ask(&fixture, "为什么这么卡");
-        assert!(reply.findings.len() <= MAX_FINDINGS, "{:?}", reply.findings.len());
-        assert!(reply.suggestions.len() <= MAX_SUGGESTIONS, "{:?}", reply.suggestions);
+        assert!(
+            reply.findings.len() <= MAX_FINDINGS,
+            "{:?}",
+            reply.findings.len()
+        );
+        assert!(
+            reply.suggestions.len() <= MAX_SUGGESTIONS,
+            "{:?}",
+            reply.suggestions
+        );
         assert!(reply.notes.len() <= MAX_NOTES, "{:?}", reply.notes);
     }
 
@@ -1250,7 +1507,11 @@ mod tests {
         fixture.snapshot.disks = vec![disk("Macintosh HD", "/", 1000, 400, true)];
         let reply = ask(&fixture, "磁盘空间");
         assert!(reply.findings.is_empty());
-        assert!(reply.notes.iter().any(|n| n.contains("没有分区越过")), "{:?}", reply.notes);
+        assert!(
+            reply.notes.iter().any(|n| n.contains("没有分区越过")),
+            "{:?}",
+            reply.notes
+        );
     }
 
     #[test]
@@ -1272,7 +1533,11 @@ mod tests {
         };
         fixture.snapshot.networks = vec![net("lo0", 1.0, 1.0), net("en0", 5_000_000.0, 900_000.0)];
         let reply = ask(&fixture, "现在网速多少");
-        assert!(reply.findings[0].text.contains("en0"), "{:?}", reply.findings);
+        assert!(
+            reply.findings[0].text.contains("en0"),
+            "{:?}",
+            reply.findings
+        );
         assert!(reply.findings[0].value.as_deref().unwrap().contains("MB"));
         // `human_rate` 自带 "/s"，模板里再写一次就成了 "KB/s/s"（真机 dump 里翻过车）。
         let text = &reply.findings[0].text;
@@ -1319,8 +1584,15 @@ mod tests {
     fn reply_serializes_no_executable_payload() {
         let fixture = Fixture::default();
         let queries = [
-            "哪个进程占 CPU 最高", "为什么这么卡", "磁盘还剩多少", "网速", "内存压力",
-            "启动项", "垃圾清理", "温度", "随便说点什么",
+            "哪个进程占 CPU 最高",
+            "为什么这么卡",
+            "磁盘还剩多少",
+            "网速",
+            "内存压力",
+            "启动项",
+            "垃圾清理",
+            "温度",
+            "随便说点什么",
         ];
         let mut seen = Vec::new();
         for q in queries {
@@ -1328,17 +1600,31 @@ mod tests {
             keys(&value, &mut seen);
         }
         for forbidden in [
-            "command", "argv", "args", "shell", "script", "program", "path", "exec",
-            "executable", "cmd", "arguments", "token", "password", "env",
+            "command",
+            "argv",
+            "args",
+            "shell",
+            "script",
+            "program",
+            "path",
+            "exec",
+            "executable",
+            "cmd",
+            "arguments",
+            "token",
+            "password",
+            "env",
         ] {
-            assert!(!seen.iter().any(|k| k == forbidden), "载荷里出现了可执行/敏感字段 {forbidden}：{seen:?}");
+            assert!(
+                !seen.iter().any(|k| k == forbidden),
+                "载荷里出现了可执行/敏感字段 {forbidden}：{seen:?}"
+            );
         }
         // 建议的种类被封死在两种导航模板里
         let kinds: Vec<String> = queries
             .iter()
             .flat_map(|q| {
-                serde_json::to_value(answer(q, &fixture.input()))
-                    .unwrap()["suggestions"]
+                serde_json::to_value(answer(q, &fixture.input())).unwrap()["suggestions"]
                     .as_array()
                     .cloned()
                     .unwrap_or_default()
@@ -1347,7 +1633,10 @@ mod tests {
             })
             .collect();
         for kind in &kinds {
-            assert!(["openTab", "focusProcess"].contains(&kind.as_str()), "出现未知建议模板 {kind}");
+            assert!(
+                ["openTab", "focusProcess"].contains(&kind.as_str()),
+                "出现未知建议模板 {kind}"
+            );
         }
     }
 
@@ -1370,13 +1659,27 @@ mod tests {
         let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/agent.rs"))
             .expect("agent.rs 必须存在");
         let production = src.split("#[cfg(test)]").next().expect("应有测试模块");
-        assert!(production.len() > 1000, "切分后生产代码段落过短，审计没有意义");
+        assert!(
+            production.len() > 1000,
+            "切分后生产代码段落过短，审计没有意义"
+        );
         for forbidden in [
-            "kill_process(", "cleanup_junk_files(", "cancel_junk_scan(", "flush_dns_cache(",
-            "Command::new", "std::process::", "std::fs::remove", "std::fs::write",
-            "std::env::var", "invoke(", "spawn(",
+            "kill_process(",
+            "cleanup_junk_files(",
+            "cancel_junk_scan(",
+            "flush_dns_cache(",
+            "Command::new",
+            "std::process::",
+            "std::fs::remove",
+            "std::fs::write",
+            "std::env::var",
+            "invoke(",
+            "spawn(",
         ] {
-            assert!(!production.contains(forbidden), "Agent 里出现了执行通路 {forbidden}");
+            assert!(
+                !production.contains(forbidden),
+                "Agent 里出现了执行通路 {forbidden}"
+            );
         }
     }
 
@@ -1385,11 +1688,20 @@ mod tests {
         let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let lib_rs = std::fs::read_to_string(manifest.join("src/lib.rs")).unwrap();
         assert!(lib_rs.contains("mod agent;"), "agent 模块没接进 lib.rs");
-        assert!(lib_rs.contains("commands::agent_query"), "命令没注册进 invoke_handler");
+        assert!(
+            lib_rs.contains("commands::agent_query"),
+            "命令没注册进 invoke_handler"
+        );
         let commands_rs = std::fs::read_to_string(manifest.join("src/commands.rs")).unwrap();
-        assert!(commands_rs.contains("agent::answer"), "commands.rs 未转调 Agent 引擎");
+        assert!(
+            commands_rs.contains("agent::answer"),
+            "commands.rs 未转调 Agent 引擎"
+        );
         let contract = std::fs::read_to_string(manifest.join("../src/ipc_contract.ts")).unwrap();
-        assert!(contract.contains("agentQuery: \"agent_query\""), "前端未登记 agent_query");
+        assert!(
+            contract.contains("agentQuery: \"agent_query\""),
+            "前端未登记 agent_query"
+        );
     }
 
     /// SEC-V09 / A-15 / SEC-T08：Agent 面板必须零 IPC。
@@ -1401,8 +1713,13 @@ mod tests {
         let panel = manifest.join("../src/agent/AgentPanel.tsx");
         let src = std::fs::read_to_string(&panel).expect("AgentPanel.tsx 必须存在");
         for forbidden in [
-            "invoke(", "@tauri-apps/api", "Commands.", "fetch(", "new Function",
-            "dangerouslySetInnerHTML", "localStorage",
+            "invoke(",
+            "@tauri-apps/api",
+            "Commands.",
+            "fetch(",
+            "new Function",
+            "dangerouslySetInnerHTML",
+            "localStorage",
         ] {
             assert!(
                 !src.contains(forbidden),
@@ -1421,7 +1738,15 @@ mod tests {
         let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let app = std::fs::read_to_string(manifest.join("../src/App.tsx")).unwrap();
         let fixture = Fixture::default();
-        for q in ["为什么这么卡", "磁盘", "网速", "内存", "启动项", "垃圾", "cpu 最高的进程"] {
+        for q in [
+            "为什么这么卡",
+            "磁盘",
+            "网速",
+            "内存",
+            "启动项",
+            "垃圾",
+            "cpu 最高的进程",
+        ] {
             let reply = ask(&fixture, q);
             for suggestion in &reply.suggestions {
                 if let Suggestion::OpenTab { tab, .. } = suggestion {
@@ -1474,14 +1799,24 @@ mod tests {
             assert!(
                 matches!(
                     target,
-                    "ipc:" | "http://ipc.localhost" | "ws://localhost:1420" | "http://localhost:1420"
+                    "ipc:"
+                        | "http://ipc.localhost"
+                        | "ws://localhost:1420"
+                        | "http://localhost:1420"
                 ),
                 "connect-src 出现了未预期目标 {target}：外呼通道被打开了"
             );
         }
-        assert!(saw_any, "connect-src 是空的？那说明 CSP 结构变了，这条测试得跟着改");
+        assert!(
+            saw_any,
+            "connect-src 是空的？那说明 CSP 结构变了，这条测试得跟着改"
+        );
 
-        for file in ["../src/agent/AgentPanel.tsx", "../src/App.tsx", "../src/ipc_contract.ts"] {
+        for file in [
+            "../src/agent/AgentPanel.tsx",
+            "../src/App.tsx",
+            "../src/ipc_contract.ts",
+        ] {
             let text = std::fs::read_to_string(manifest.join(file)).unwrap();
             for dial in ["fetch(", "XMLHttpRequest", "new WebSocket", "EventSource"] {
                 assert!(
@@ -1562,17 +1897,27 @@ mod tests {
         // 每一行都得带着"几个进程"和合计，光给类别等于没答。
         assert!(reply.findings[0].text.contains("12 个进程"));
         assert!(reply.findings[0].text.contains("9.00 GB"));
-        assert!(reply.findings[0].text.contains("脱离"), "带脱离数的桶要在同一行里说出来");
+        assert!(
+            reply.findings[0].text.contains("脱离"),
+            "带脱离数的桶要在同一行里说出来"
+        );
     }
 
     /// 空表只能说"没采到"，不能说"机器上没在跑东西" —— 后者是把采集失败包装成结论。
     #[test]
     fn empty_rollup_is_reported_as_missing_data_not_as_an_idle_machine() {
         let reply = ask(&Fixture::default(), "进程按类别归类");
-        assert!(reply.findings.is_empty(), "没数据就不许有桶：{:?}", reply.findings);
+        assert!(
+            reply.findings.is_empty(),
+            "没数据就不许有桶：{:?}",
+            reply.findings
+        );
         let notes = reply.notes.join("\n");
         assert!(notes.contains("没采到"), "{notes}");
-        assert!(!notes.contains("没在跑东西。") || notes.contains("不代表"), "{notes}");
+        assert!(
+            !notes.contains("没在跑东西。") || notes.contains("不代表"),
+            "{notes}"
+        );
     }
 
     /// 口径必须随报告一起出去：ΣRSS 会重复计共享页，也不受 300 行分页影响。
@@ -1600,12 +1945,24 @@ mod tests {
             ..Fixture::default()
         };
         let reply = ask(&fixture, "有残留的 java 进程吗");
-        let all = format!("{}{}", reply.findings.iter().map(|f| f.text.clone()).collect::<Vec<_>>().join("\n"), reply.notes.join("\n"));
+        let all = format!(
+            "{}{}",
+            reply
+                .findings
+                .iter()
+                .map(|f| f.text.clone())
+                .collect::<Vec<_>>()
+                .join("\n"),
+            reply.notes.join("\n")
+        );
         assert!(all.contains("launchd"), "没说明这一条的成因：{all}");
         assert!(all.contains("我不替你判"), "{all}");
         // 反向：不许出现任何"我来收/建议结束"的口吻。
         for forbidden in ["已结束", "已清理", "建议结束", "帮你杀", "已杀死"] {
-            assert!(!all.contains(forbidden), "归类报告替用户做了决定：{forbidden}");
+            assert!(
+                !all.contains(forbidden),
+                "归类报告替用户做了决定：{forbidden}"
+            );
         }
     }
 
@@ -1614,14 +1971,32 @@ mod tests {
     fn dominant_bucket_needs_both_share_and_absolute_size() {
         let cases: &[(&str, Vec<ProcessRollup>, Severity)] = &[
             // 2 GB / 合计 3 GB：既是 66 % 又过 1 GB ⇒ Warning
-            ("big-and-dominant", vec![bucket("A", 1, gb(2), 0), bucket("B", 1, gb(1), 0)], Severity::Warning),
+            (
+                "big-and-dominant",
+                vec![bucket("A", 1, gb(2), 0), bucket("B", 1, gb(1), 0)],
+                Severity::Warning,
+            ),
             // 400 MB / 合计 500 MB：比例够但绝对值不够 ⇒ Info
-            ("share-only", vec![bucket("A", 1, 400 * 1024 * 1024, 0), bucket("B", 1, 100 * 1024 * 1024, 0)], Severity::Info),
+            (
+                "share-only",
+                vec![
+                    bucket("A", 1, 400 * 1024 * 1024, 0),
+                    bucket("B", 1, 100 * 1024 * 1024, 0),
+                ],
+                Severity::Info,
+            ),
             // 2 GB 但合计 20 GB：绝对值够但比例不够 ⇒ Info
-            ("size-only", vec![bucket("A", 1, gb(2), 0), bucket("B", 9, gb(18), 0)], Severity::Info),
+            (
+                "size-only",
+                vec![bucket("A", 1, gb(2), 0), bucket("B", 9, gb(18), 0)],
+                Severity::Info,
+            ),
         ];
         for (label, rollup, want) in cases {
-            let fixture = Fixture { rollup: rollup.clone(), ..Fixture::default() };
+            let fixture = Fixture {
+                rollup: rollup.clone(),
+                ..Fixture::default()
+            };
             let reply = ask(&fixture, "进程归类");
             let top = reply
                 .findings
@@ -1638,10 +2013,21 @@ mod tests {
         let rollup = (0..9)
             .map(|i| bucket(if i == 0 { "A" } else { "filler" }, 1, gb(i as u64 + 1), 0))
             .collect();
-        let fixture = Fixture { rollup, ..Fixture::default() };
+        let fixture = Fixture {
+            rollup,
+            ..Fixture::default()
+        };
         let reply = ask(&fixture, "进程归类");
-        assert_eq!(reply.findings.len(), MAX_CENSUS_FINDINGS, "{:?}", reply.findings);
-        assert!(reply.findings.iter().all(|f| !f.text.starts_with("A：")), "最小的桶反而留下了");
+        assert_eq!(
+            reply.findings.len(),
+            MAX_CENSUS_FINDINGS,
+            "{:?}",
+            reply.findings
+        );
+        assert!(
+            reply.findings.iter().all(|f| !f.text.starts_with("A：")),
+            "最小的桶反而留下了"
+        );
     }
 
     /// 归类也要给"下一步去哪看"：桶顶进程能定位时出一条 FocusProcess（只有 pid 和名字）。
@@ -1682,7 +2068,10 @@ mod tests {
         assert!(!reply.suggestions.is_empty(), "归类不给任何导航");
         for suggestion in &reply.suggestions {
             if let Suggestion::OpenTab { tab, .. } = suggestion {
-                assert!(app.contains(&format!("key: \"{tab}\"")), "不存在的页签 {tab}");
+                assert!(
+                    app.contains(&format!("key: \"{tab}\"")),
+                    "不存在的页签 {tab}"
+                );
             }
         }
     }
@@ -1793,7 +2182,10 @@ mod tests {
             .step_by(2)
             .filter(|s| !s.is_empty())
             .collect();
-        assert!(!union_names.is_empty(), "联合类型没解析出成员，反向半边是空跑");
+        assert!(
+            !union_names.is_empty(),
+            "联合类型没解析出成员，反向半边是空跑"
+        );
         for name in union_names {
             assert!(
                 serialized.iter().any(|v| v == name),

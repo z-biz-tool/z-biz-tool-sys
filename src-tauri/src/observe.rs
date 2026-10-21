@@ -32,9 +32,15 @@ pub const CATEGORY_OTHER: &str = "其他";
 /// 而 IDE 与浏览器的子进程确实常被列成 `node`；排在后面会把人家的账记到 Node 头上。
 const RULES: &[(&str, &[&str])] = &[
     (CATEGORY_QODER, &["qoder"]),
-    (CATEGORY_CHROME, &["google chrome", "chromium", "chrome helper"]),
+    (
+        CATEGORY_CHROME,
+        &["google chrome", "chromium", "chrome helper"],
+    ),
     (CATEGORY_WEBKIT, &["com.apple.webkit"]),
-    (CATEGORY_JVM, &["java", "kotlin", "gradle", "mvn", "openjdk"]),
+    (
+        CATEGORY_JVM,
+        &["java", "kotlin", "gradle", "mvn", "openjdk"],
+    ),
     (CATEGORY_PYTHON, &["python", "hermes"]),
     (
         CATEGORY_NODE,
@@ -42,7 +48,13 @@ const RULES: &[(&str, &[&str])] = &[
     ),
     (
         CATEGORY_SYSTEM,
-        &["launchd", "kernel_task", "windowserver", "/usr/libexec", "com.apple"],
+        &[
+            "launchd",
+            "kernel_task",
+            "windowserver",
+            "/usr/libexec",
+            "com.apple",
+        ],
     ),
 ];
 
@@ -165,16 +177,14 @@ pub fn rollup_from(rows: &[ProcessInfo]) -> Vec<ProcessRollup> {
 
     let mut out: Vec<ProcessRollup> = buckets
         .into_iter()
-        .map(
-            |(category, a)| ProcessRollup {
-                category,
-                process_count: a.count,
-                memory_bytes: a.memory,
-                detached_count: a.detached,
-                top_pid: a.top_pid,
-                top_name: a.top_name,
-            },
-        )
+        .map(|(category, a)| ProcessRollup {
+            category,
+            process_count: a.count,
+            memory_bytes: a.memory,
+            detached_count: a.detached,
+            top_pid: a.top_pid,
+            top_name: a.top_name,
+        })
         .collect();
     out.sort_by(|a, b| {
         b.memory_bytes
@@ -297,7 +307,9 @@ pub fn listening_sockets() -> ListeningReport {
     let sockets = parse_lsof_listeners(&String::from_utf8_lossy(&output.stdout));
     ListeningReport {
         reason: if sockets.is_empty() {
-            Some("当前用户权限下没有 TCP 监听端口（系统服务的 socket 需要 root 才可见）".to_string())
+            Some(
+                "当前用户权限下没有 TCP 监听端口（系统服务的 socket 需要 root 才可见）".to_string(),
+            )
         } else {
             None
         },
@@ -451,11 +463,17 @@ mod tests {
     #[test]
     fn malformed_lines_are_dropped_not_misattributed() {
         // `n` 出现在任何 `p` 之前：没有属主，丢弃。
-        assert!(parse_lsof_listeners("n*:80\n").is_empty(), "无主的 n 不该成记录");
+        assert!(
+            parse_lsof_listeners("n*:80\n").is_empty(),
+            "无主的 n 不该成记录"
+        );
         // `p` 行本身是垃圾：属主置空，其后那条 `n` 必须**不**挂到上一段的 pid 12 上。
         let after_bad_pid = parse_lsof_listeners("p12\nn*:8200\npnotapid\nn*:8201\n");
         assert_eq!(
-            after_bad_pid.iter().map(|s| (s.pid, s.port)).collect::<Vec<_>>(),
+            after_bad_pid
+                .iter()
+                .map(|s| (s.pid, s.port))
+                .collect::<Vec<_>>(),
             vec![(12, 8200)],
             "垃圾 p 行之后的端口被错挂到前一个进程：{after_bad_pid:?}"
         );
@@ -464,7 +482,11 @@ mod tests {
         // 阳性对照：把垃圾 `p` 行拿掉，同一条 8201 就必须解出来。
         // 少了这一支，上面那条断言在"解析器整个坏掉"时也会一起绿。
         let clean = parse_lsof_listeners("p12\nn*:8200\nn*:8201\n");
-        assert_eq!(clean.len(), 2, "去掉垃圾行后仍解不出记录，说明是解析器坏了：{clean:?}");
+        assert_eq!(
+            clean.len(),
+            2,
+            "去掉垃圾行后仍解不出记录，说明是解析器坏了：{clean:?}"
+        );
         assert!(clean.iter().any(|s| s.port == 8201 && s.pid == 12));
     }
 
@@ -483,16 +505,28 @@ mod tests {
             sockets: parse_lsof_listeners("p7\nn*:18090\np99\nn127.0.0.1:53\n"),
             reason: None,
         };
-        assert_eq!(report.sockets.len(), 2, "阳性对照：夹具里得有两条监听才可 join");
+        assert_eq!(
+            report.sockets.len(),
+            2,
+            "阳性对照：夹具里得有两条监听才可 join"
+        );
         assert!(
             report.sockets.iter().all(|s| s.process_name.is_none()),
             "解析阶段就该留空，名字只能来自 join"
         );
         let rows = vec![row(7, "java", 4096, Some(300))];
         attach_process_names(&mut report, &rows);
-        let named = report.sockets.iter().find(|s| s.pid == 7).expect("pid 7 应在表里");
+        let named = report
+            .sockets
+            .iter()
+            .find(|s| s.pid == 7)
+            .expect("pid 7 应在表里");
         assert_eq!(named.process_name.as_deref(), Some("java"));
-        let missing = report.sockets.iter().find(|s| s.pid == 99).expect("pid 99 应在表里");
+        let missing = report
+            .sockets
+            .iter()
+            .find(|s| s.pid == 99)
+            .expect("pid 99 应在表里");
         assert_eq!(missing.process_name, None, "查不到的 pid 不许编名字");
     }
 
@@ -506,11 +540,17 @@ mod tests {
         let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let contract = std::fs::read_to_string(manifest.join("../src/ipc_contract.ts")).unwrap();
 
-        let rows = vec![row(7, "java", 4096, Some(1)), row(8, "node", 2048, Some(300))];
+        let rows = vec![
+            row(7, "java", 4096, Some(1)),
+            row(8, "node", 2048, Some(300)),
+        ];
         let mut rollup = rollup_from(&rows);
         assert_eq!(rollup.len(), 2, "阳性对照：桶都没聚出来，对拍就是空跑");
         let bucket = rollup.remove(0);
-        assert!(bucket.detached_count > 0, "阳性对照：这一份夹具里得真有一个脱离的");
+        assert!(
+            bucket.detached_count > 0,
+            "阳性对照：这一份夹具里得真有一个脱离的"
+        );
         assert_eq!(
             serialized_keys(&serde_json::to_value(&bucket).unwrap()),
             ts_interface_keys(&contract, "ProcessRollup"),
@@ -524,7 +564,10 @@ mod tests {
             ts_interface_keys(&contract, "ListeningSocket"),
             "ListeningSocket 的字段名与前端不一致"
         );
-        let report = ListeningReport { sockets, reason: None };
+        let report = ListeningReport {
+            sockets,
+            reason: None,
+        };
         assert_eq!(
             serialized_keys(&serde_json::to_value(&report).unwrap()),
             ts_interface_keys(&contract, "ListeningReport"),
@@ -533,7 +576,13 @@ mod tests {
 
         // 驼峰值守：`rename_all = "camelCase"` 掉了，前端会默默读到 undefined。
         let raw = serde_json::to_string(&bucket).unwrap();
-        for key in ["processCount", "memoryBytes", "detachedCount", "topPid", "topName"] {
+        for key in [
+            "processCount",
+            "memoryBytes",
+            "detachedCount",
+            "topPid",
+            "topName",
+        ] {
             assert!(raw.contains(key), "序列化里缺驼峰值 {key}：{raw}");
             let snake = match key {
                 "processCount" => "process_count",
@@ -555,13 +604,22 @@ mod tests {
         let lib_rs = std::fs::read_to_string(manifest.join("src/lib.rs")).unwrap();
         let commands_rs = std::fs::read_to_string(manifest.join("src/commands.rs")).unwrap();
         for (front, back) in [
-            ("getProcessRollup: \"get_process_rollup\"", "commands::get_process_rollup"),
-            ("getListeningSockets: \"get_listening_sockets\"", "commands::get_listening_sockets"),
+            (
+                "getProcessRollup: \"get_process_rollup\"",
+                "commands::get_process_rollup",
+            ),
+            (
+                "getListeningSockets: \"get_listening_sockets\"",
+                "commands::get_listening_sockets",
+            ),
         ] {
             assert!(contract.contains(front), "前端未登记 {front}");
             assert!(lib_rs.contains(back), "命令未注册进 invoke_handler：{back}");
             assert!(
-                commands_rs.contains(&format!("pub async fn {}", back.split("::").last().unwrap())),
+                commands_rs.contains(&format!(
+                    "pub async fn {}",
+                    back.split("::").last().unwrap()
+                )),
                 "commands.rs 里没有 {back} 的实现"
             );
         }
@@ -575,17 +633,18 @@ mod tests {
         let report = listening_sockets();
         if report.sockets.is_empty() {
             // 允许在极特殊的容器环境里成立，但必须把原因带出来，不能静默通过。
-            assert!(
-                report.reason.is_some(),
-                "空表必须给出 reason，不能静默为空"
-            );
+            assert!(report.reason.is_some(), "空表必须给出 reason，不能静默为空");
             return;
         }
         assert!(
             report.sockets.iter().all(|s| s.port > 0),
             "端口为 0 说明解析错位"
         );
-        assert!(report.reason.is_none(), "有结果时不该带原因：{:?}", report.reason);
+        assert!(
+            report.reason.is_none(),
+            "有结果时不该带原因：{:?}",
+            report.reason
+        );
     }
 
     /// 两块新视图要**真的挂在进程页上**，且文案不许越过数据能给的结论。
@@ -600,9 +659,10 @@ mod tests {
 
         let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let read = |file: &str| {
-            strip_ts_comments(&std::fs::read_to_string(manifest.join(file)).unwrap_or_else(|_| {
-                panic!("{file} 必须存在")
-            }))
+            strip_ts_comments(
+                &std::fs::read_to_string(manifest.join(file))
+                    .unwrap_or_else(|_| panic!("{file} 必须存在")),
+            )
         };
         let tab = read("../src/components/tabs/ProcessTab.tsx");
         let app = read("../src/App.tsx");
@@ -628,7 +688,10 @@ mod tests {
             assert!(app.contains(needle), "{file} 没接上 {needle}");
         }
         // 口径必须写在界面上，不能只写在代码注释里。
-        assert!(rollup_panel.contains("共享页"), "归类面板没说明内存合计的口径");
+        assert!(
+            rollup_panel.contains("共享页"),
+            "归类面板没说明内存合计的口径"
+        );
         assert!(
             rollup_panel.contains("全量枚举") || rollup_panel.contains("当前这一页"),
             "归类面板没说清数据来自哪一份"
@@ -644,13 +707,23 @@ mod tests {
             rollup_panel.contains("重新观察"),
             "归类面板的可见文案被剥空了，反向断言成了空跑"
         );
-        for forbidden in ["root 进程", "孤儿进程", "残骸", "可安全", "建议结束", "已回收"] {
+        for forbidden in [
+            "root 进程",
+            "孤儿进程",
+            "残骸",
+            "可安全",
+            "建议结束",
+            "已回收",
+        ] {
             for (name, visible) in [
                 ("ProcessTab", &tab),
                 ("ProcessRollupPanel", &rollup_panel),
                 ("ListeningPortsPanel", &ports_panel),
             ] {
-                assert!(!visible.contains(forbidden), "{name} 的文案越界了：{forbidden}");
+                assert!(
+                    !visible.contains(forbidden),
+                    "{name} 的文案越界了：{forbidden}"
+                );
             }
         }
     }

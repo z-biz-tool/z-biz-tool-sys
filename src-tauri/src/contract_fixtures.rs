@@ -59,8 +59,7 @@ pub(crate) fn ts_interface_keys(contract: &str, name: &str) -> Vec<String> {
     let mut out: Vec<String> = body
         .split(';')
         .map(|decl| {
-            decl
-                .split(':')
+            decl.split(':')
                 .next()
                 .unwrap_or_default()
                 .trim()
@@ -136,11 +135,21 @@ export interface Beta {
         assert_eq!(ts_interface_keys(SAMPLE, "Alpha"), ["one", "three", "two"]);
         assert_eq!(ts_interface_keys(SAMPLE, "Beta"), ["items"]);
         // 注释里那句 `two: number;` 只能出现一次，说明注释整段被剥掉了。
-        assert_eq!(ts_interface_keys(SAMPLE, "Alpha").iter().filter(|k| *k == "two").count(), 1);
+        assert_eq!(
+            ts_interface_keys(SAMPLE, "Alpha")
+                .iter()
+                .filter(|k| *k == "two")
+                .count(),
+            1
+        );
         // 两种注释形式都要剥干净：块注释里的 `two` 与行注释里的 `fake`。
-        assert!(!ts_interface_keys(SAMPLE, "Alpha").iter().any(|k| k.contains("fake")));
+        assert!(!ts_interface_keys(SAMPLE, "Alpha")
+            .iter()
+            .any(|k| k.contains("fake")));
         // 可选符不能混进字段名。
-        assert!(!ts_interface_keys(SAMPLE, "Alpha").iter().any(|k| k.ends_with('?')));
+        assert!(!ts_interface_keys(SAMPLE, "Alpha")
+            .iter()
+            .any(|k| k.ends_with('?')));
     }
 
     /// 对**真实**契约文件也得读出字段：`SAMPLE` 之外若只测样例，哪天 `ipc_contract.ts` 的写法
@@ -151,7 +160,13 @@ export interface Beta {
         let contract = std::fs::read_to_string(manifest.join("../src/ipc_contract.ts")).unwrap();
         assert_eq!(
             ts_interface_keys(&contract, "NotifyStatus"),
-            ["deliveryIsReported", "failed", "lastError", "submitted", "suppressed"]
+            [
+                "deliveryIsReported",
+                "failed",
+                "lastError",
+                "submitted",
+                "suppressed"
+            ]
         );
         assert_eq!(
             ts_interface_keys(&contract, "ThermalReport"),
@@ -171,7 +186,11 @@ export interface Beta {
             ["Charlie", "alpha", "delta"],
             "字节序排序：大写在前，与小写混排时的顺序要固定"
         );
-        assert_eq!(serialized_keys(&serde_json::json!({})).len(), 0, "空对象就是没有 key");
+        assert_eq!(
+            serialized_keys(&serde_json::json!({})).len(),
+            0,
+            "空对象就是没有 key"
+        );
     }
 
     /// 剥注释只剥注释：注释里的关键词不该被文案审计读到，但**同一段里注释之后的正文必须留着**。
@@ -179,11 +198,23 @@ export interface Beta {
     fn comment_stripping_keeps_the_visible_copy() {
         let source = "  {/* 这里不能说已送达 */}\n  <Text>已提交 N 条</Text>\n  // 说明：不是已送达\n  <b>兜底</b>\n";
         let visible = strip_ts_comments(source);
-        assert!(!visible.contains("已送达"), "注释里的说明被当成正文了：{visible}");
-        assert!(visible.contains("已提交 N 条"), "正文被一起吃掉了：{visible}");
-        assert!(visible.contains("<b>兜底</b>"), "注释之后的行丢了：{visible}");
+        assert!(
+            !visible.contains("已送达"),
+            "注释里的说明被当成正文了：{visible}"
+        );
+        assert!(
+            visible.contains("已提交 N 条"),
+            "正文被一起吃掉了：{visible}"
+        );
+        assert!(
+            visible.contains("<b>兜底</b>"),
+            "注释之后的行丢了：{visible}"
+        );
         // 没闭合的注释不许把后面全部内容吞掉（那会让文案审计静默变成空扫）
         let broken = "/* 忘了闭合\n  <Text>重要文案</Text>";
-        assert!(strip_ts_comments(broken).contains("重要文案"), "未闭合注释导致后文丢失");
+        assert!(
+            strip_ts_comments(broken).contains("重要文案"),
+            "未闭合注释导致后文丢失"
+        );
     }
 }

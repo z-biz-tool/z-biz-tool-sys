@@ -92,8 +92,7 @@ mod unix {
                         }
                         libc::AF_INET6 => {
                             let sin6 = unsafe { &*(sa as *const libc::sockaddr_in6) };
-                            slot.ipv6 =
-                                Some(Ipv6Addr::from(sin6.sin6_addr.s6_addr).to_string());
+                            slot.ipv6 = Some(Ipv6Addr::from(sin6.sin6_addr.s6_addr).to_string());
                         }
                         family if family == link_family() => {
                             if let Some(mac) = unsafe { hardware_address(sa) } {

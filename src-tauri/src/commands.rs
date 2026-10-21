@@ -81,7 +81,11 @@ pub async fn get_history(
         let Some(store) = state.0.as_ref().cloned() else {
             return Err(AppError::failed("历史存储不可用：应用数据目录无法写入"));
         };
-        Ok(crate::history::query(&store, crate::history::now_ms(), span))
+        Ok(crate::history::query(
+            &store,
+            crate::history::now_ms(),
+            span,
+        ))
     })
     .await
     .map_err(|e| AppError::failed(format!("历史读取线程异常退出：{e}")))?
@@ -127,10 +131,7 @@ pub fn stop_process_stream(state: State<'_, MonitorService>) -> bool {
 /// 前端改动过滤/排序/分页时调用；下一帧（≤ process_interval）生效。
 /// 返回归一化后的查询，前端据此校正越界的 limit/offset。
 #[tauri::command]
-pub fn set_process_query(
-    state: State<'_, MonitorService>,
-    query: ProcessQuery,
-) -> ProcessQuery {
+pub fn set_process_query(state: State<'_, MonitorService>, query: ProcessQuery) -> ProcessQuery {
     state.set_process_query(query)
 }
 
@@ -223,7 +224,11 @@ pub async fn validate_kill(pid: u32) -> CommandResult<KillValidation> {
 
 #[tauri::command]
 pub async fn kill_process(pid: u32, grace_ms: Option<u64>) -> CommandResult<KillOutcome> {
-    safety::terminate(pid, Duration::from_millis(grace_ms.unwrap_or(DEFAULT_KILL_GRACE_MS))).await
+    safety::terminate(
+        pid,
+        Duration::from_millis(grace_ms.unwrap_or(DEFAULT_KILL_GRACE_MS)),
+    )
+    .await
 }
 
 #[derive(Debug, Serialize)]
@@ -249,7 +254,11 @@ pub(crate) fn dns_flush_plan() -> Option<(&'static str, Vec<&'static str>, &'sta
         ));
     }
     if cfg!(target_os = "linux") {
-        return Some(("resolvectl", vec!["flush-caches"], "sudo resolvectl flush-caches"));
+        return Some((
+            "resolvectl",
+            vec!["flush-caches"],
+            "sudo resolvectl flush-caches",
+        ));
     }
     if cfg!(windows) {
         return Some(("ipconfig", vec!["/flushdns"], "ipconfig /flushdns"));
@@ -281,12 +290,10 @@ fn dns_failure(stderr: &str, manual: &str) -> DnsFlushResult {
 pub async fn flush_dns_cache() -> DnsFlushResult {
     tauri::async_runtime::spawn_blocking(run_dns_flush)
         .await
-        .unwrap_or_else(|_| {
-            DnsFlushResult {
-                flushed: false,
-                message: "DNS 刷新线程异常退出".to_string(),
-                manual_command: dns_flush_plan().map(|(_, _, manual)| manual.to_string()),
-            }
+        .unwrap_or_else(|_| DnsFlushResult {
+            flushed: false,
+            message: "DNS 刷新线程异常退出".to_string(),
+            manual_command: dns_flush_plan().map(|(_, _, manual)| manual.to_string()),
         })
 }
 
@@ -450,7 +457,10 @@ fn collect_ranked(by: RankBy) -> Vec<monitor::ProcessInfo> {
 }
 
 /// 两个榜一起取：并发跑，让"为什么这么卡"这类要双榜的意图不必付两份 300 ms。
-fn collect_ranks(need_cpu: bool, need_mem: bool) -> (Vec<monitor::ProcessInfo>, Vec<monitor::ProcessInfo>) {
+fn collect_ranks(
+    need_cpu: bool,
+    need_mem: bool,
+) -> (Vec<monitor::ProcessInfo>, Vec<monitor::ProcessInfo>) {
     match (need_cpu, need_mem) {
         (true, true) => std::thread::scope(|s| {
             let cpu = s.spawn(|| collect_ranked(RankBy::Cpu));
@@ -578,7 +588,9 @@ pub fn notify_status(app: tauri::AppHandle) -> notify::NotifyStatus {
 /// （`AlertSettingsDrawer` 分"测试通知没发出去"与"读不到投递记账"两句）。两边各加一半前缀
 /// 会拼出"系统通知状态读取失败：系统通知投递失败：…"这种重复的错话，浏览器实测抓到过。
 #[tauri::command]
-pub async fn send_test_notification(app: tauri::AppHandle) -> Result<notify::NotifyStatus, AppError> {
+pub async fn send_test_notification(
+    app: tauri::AppHandle,
+) -> Result<notify::NotifyStatus, AppError> {
     // 投递通知要等 osascript/通知中心返回，同步版本会把 IPC 线程按住几百毫秒
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<notify::NotifyState>();
@@ -614,7 +626,7 @@ pub async fn import_prefs_file(path: String) -> CommandResult<prefs::ImportOutco
 mod tests {
     use super::*;
 
-        /// A-04 / SEC：应用内只跑用户态命令，`sudo` 版本只作为**给人复制的兜底**存在。
+    /// A-04 / SEC：应用内只跑用户态命令，`sudo` 版本只作为**给人复制的兜底**存在。
     /// 这条取代原来的 `dns_flush_never_shells_out_to_sudo` —— 那个测试每跑一次套件就真刷一次系统解析器，
     /// 副作用不该由单测产生（要取证见下面的 `#[ignore]` 用例）。
     #[test]
@@ -632,7 +644,10 @@ mod tests {
         assert!(!manual.trim().is_empty(), "必须给出可复制的兜底命令");
         if cfg!(target_os = "macos") {
             assert_eq!(program, "dscacheutil");
-            assert!(manual.contains("mDNSResponder"), "macOS 的兜底要说全两步：{manual}");
+            assert!(
+                manual.contains("mDNSResponder"),
+                "macOS 的兜底要说全两步：{manual}"
+            );
         }
         if cfg!(windows) {
             assert!(
@@ -664,7 +679,10 @@ mod tests {
                 result.message
             );
         }
-        let missing = dns_failure("resolvectl: command not found", "sudo resolvectl flush-caches");
+        let missing = dns_failure(
+            "resolvectl: command not found",
+            "sudo resolvectl flush-caches",
+        );
         assert_eq!(
             missing.manual_command.as_deref(),
             Some("sudo systemd-resolve --flush-caches"),
@@ -686,12 +704,11 @@ mod tests {
         let started = std::time::Instant::now();
         let result = tokio::task::spawn_blocking(run_dns_flush).await.unwrap();
         let elapsed = started.elapsed();
-        println!(
-            "A-04 证据: {:?} 用时 {:.3}s",
-            result,
-            elapsed.as_secs_f64()
+        println!("A-04 证据: {:?} 用时 {:.3}s", result, elapsed.as_secs_f64());
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "DNS 刷新不该挂起：{elapsed:?}"
         );
-        assert!(elapsed < Duration::from_secs(3), "DNS 刷新不该挂起：{elapsed:?}");
         assert!(
             !result.message.contains("sudo: a terminal is required"),
             "不许把提权失败当成结果抛给用户：{}",
@@ -711,7 +728,11 @@ mod tests {
         let mut offenders = Vec::new();
         let mut files = Vec::new();
         collect_rs_files(&src_dir, &mut files);
-        assert!(files.len() > 13, "只找到 {} 个源文件，递归没生效，审计等于空跑", files.len());
+        assert!(
+            files.len() > 13,
+            "只找到 {} 个源文件，递归没生效，审计等于空跑",
+            files.len()
+        );
         for path in files {
             let text = std::fs::read_to_string(&path).expect("源码可读");
             if text.contains("Command::new(\"sudo\")") || text.contains("Command::new(\"su\")") {
@@ -738,13 +759,19 @@ mod tests {
     fn thermal_command_is_registered_on_both_sides() {
         let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let lib_rs = std::fs::read_to_string(manifest.join("src/lib.rs")).unwrap();
-        assert!(lib_rs.contains("mod platform;"), "platform 模块没接进 lib.rs");
+        assert!(
+            lib_rs.contains("mod platform;"),
+            "platform 模块没接进 lib.rs"
+        );
         assert!(
             lib_rs.contains("commands::get_thermal"),
             "get_thermal 没注册进 invoke_handler"
         );
         let contract = std::fs::read_to_string(manifest.join("../src/ipc_contract.ts")).unwrap();
-        assert!(contract.contains("getThermal: \"get_thermal\""), "前端未登记 get_thermal");
+        assert!(
+            contract.contains("getThermal: \"get_thermal\""),
+            "前端未登记 get_thermal"
+        );
         let commands_rs = std::fs::read_to_string(manifest.join("src/commands.rs")).unwrap();
         assert!(
             commands_rs.contains("thermal: &thermal::probe()"),
@@ -756,10 +783,7 @@ mod tests {
     /// 拿它测拒绝逻辑会真的去遍历用户目录。
     #[test]
     fn large_file_scan_rejects_out_of_range_sizes() {
-        assert_eq!(
-            large_file_args(0, None).unwrap_err().code,
-            "INVALID_INPUT"
-        );
+        assert_eq!(large_file_args(0, None).unwrap_err().code, "INVALID_INPUT");
         assert_eq!(
             large_file_args(2_000_000, None).unwrap_err().code,
             "INVALID_INPUT"
@@ -784,9 +808,16 @@ mod tests {
         std::fs::write(dir.join("small.bin"), vec![7u8; 1024]).unwrap();
 
         let files = find_large_files(&dir, 1024 * 1024, 10);
-        let names: Vec<&str> = files.iter().map(|f| f.path.as_str()).map(|p| {
-            std::path::Path::new(p).file_name().and_then(|n| n.to_str()).unwrap_or("")
-        }).collect();
+        let names: Vec<&str> = files
+            .iter()
+            .map(|f| f.path.as_str())
+            .map(|p| {
+                std::path::Path::new(p)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("")
+            })
+            .collect();
         assert!(names.contains(&"big.bin"), "应找到 big.bin，实际 {names:?}");
         assert!(!names.contains(&"small.bin"), "小文件不应出现在结果中");
 
@@ -819,7 +850,8 @@ mod tests {
 
         let mem = collect_ranked(crate::agent::RankBy::Memory);
         assert!(
-            mem.windows(2).all(|w| w[0].memory_bytes >= w[1].memory_bytes),
+            mem.windows(2)
+                .all(|w| w[0].memory_bytes >= w[1].memory_bytes),
             "内存榜必须降序：{:?}",
             mem.iter()
                 .map(|p| (p.pid, p.memory_bytes))
@@ -878,11 +910,20 @@ mod tests {
         let csp = conf["app"]["security"]["csp"]
             .as_str()
             .expect("CSP 必须是字符串（配成 null 等于没有策略）");
-        assert!(csp.contains("script-src 'self'"), "script-src 没收紧：{csp}");
+        assert!(
+            csp.contains("script-src 'self'"),
+            "script-src 没收紧：{csp}"
+        );
         for forbidden in ["unsafe-eval", "https://*", " 'self ' ", "<nonce>", "*"] {
-            assert!(!csp.contains(forbidden), "CSP 里出现了 {forbidden:?}：{csp}");
+            assert!(
+                !csp.contains(forbidden),
+                "CSP 里出现了 {forbidden:?}：{csp}"
+            );
         }
-        assert!(csp.contains("default-src 'self'"), "default-src 兜底没了：{csp}");
+        assert!(
+            csp.contains("default-src 'self'"),
+            "default-src 兜底没了：{csp}"
+        );
     }
 
     /// SEC-T04：命令边界上杀 PID 1 必须被拒，且**在发信号之前**就拒。
@@ -890,11 +931,24 @@ mod tests {
     #[tokio::test]
     async fn sec_t04_killing_pid_one_is_refused_at_the_command_boundary() {
         let err = kill_process(1, None).await.unwrap_err();
-        assert_eq!(err.code, "PERMISSION_DENIED", "PID 1 没在命令层被拦下：{err:?}");
+        assert_eq!(
+            err.code, "PERMISSION_DENIED",
+            "PID 1 没在命令层被拦下：{err:?}"
+        );
         // 低 PID 的理由必须是"系统进程区间"，不能是"属于其他用户"（后者会让人以为换个权限就能杀）
-        assert!(err.message.contains("系统进程") && err.message.contains("禁止"),
-            "PID 1 的拒绝理由说错了：{}", err.message);
-        assert!(!err.message.contains("其他用户"), "PID 1 被判成属主问题：{}", err.message);
-        assert!(err.detail.is_none() || cfg!(debug_assertions), "detail 只许在 debug 构建里出现");
+        assert!(
+            err.message.contains("系统进程") && err.message.contains("禁止"),
+            "PID 1 的拒绝理由说错了：{}",
+            err.message
+        );
+        assert!(
+            !err.message.contains("其他用户"),
+            "PID 1 被判成属主问题：{}",
+            err.message
+        );
+        assert!(
+            err.detail.is_none() || cfg!(debug_assertions),
+            "detail 只许在 debug 构建里出现"
+        );
     }
 }

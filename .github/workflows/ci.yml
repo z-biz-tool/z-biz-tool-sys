@@ -66,7 +66,7 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy
+          components: clippy, rustfmt
           targets: ${{ matrix.platform == 'macos-latest' && 'x86_64-apple-darwin' || '' }}
 
       # 与 build.yml 里同一条 workaround：runner 上新版 token 会破坏 rust-toolchain 写出的 cargo config。
@@ -77,10 +77,18 @@ jobs:
         run: cargo test --lib --manifest-path src-tauri/Cargo.toml
 
       - name: Clippy
-        # 不加 `-D warnings`：只有 macOS 一侧实测过 0 warning，Linux/Windows 会有平台特有的
-        # （例如只在 cfg(unix) 下被调用的 helper 在 Windows 上算 dead_code）。在本机看不到那些
-        # 输出的情况下把 warning 升级成失败，等于交一条永远红、且没人能从本地开始查的 CI。
-        run: cargo clippy --all-targets --manifest-path src-tauri/Cargo.toml
+        # 2026-10-21 收严：原来不带 `-D warnings`，理由是「平台特有告警本地量不到」。
+        # 但本地实测 `cargo clippy --all-targets -- -D warnings` 已经是干净的（rc=0），
+        # 而且**平台差异本来就只能靠 CI 量**（本 job 是多平台矩阵）——
+        # 让 CI 量一次，比永久挂着 advisory 门禁强：
+        # 真出现平台特有告警，那是一条真 lint，该修而不是该藏。
+        run: cargo clippy --all-targets --manifest-path src-tauri/Cargo.toml -- -D warnings
+
+      - name: Format
+        # 新增门禁：rustfmt 差异之前只在本机量得到（2026-10-21 实测本仓有 365 处差异），
+        # CI 完全不跑 ⇒ 谁改乱了格式没人知道，评审只能靠肉眼。
+        # 格式债已在同一次提交里整仓清零（纯排版，Rust 269 条断言全过）。
+        run: cargo fmt --all --check --manifest-path src-tauri/Cargo.toml
 
       # Intel 腿用交叉 check 而不是 macos-13 这台 Intel runner：镜像标签会被下线，且 check 不需要链接。
       # 覆盖的是"能不能编过"，不含 Intel 上的运行时行为。

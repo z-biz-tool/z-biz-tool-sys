@@ -74,8 +74,12 @@ fn extra_writable_roots() -> Vec<PathBuf> {
 
 fn prefs_root_allowed(dir: &Path) -> bool {
     under_allowed_root(dir)
-        || dirs::home_dir().map(|home| dir.starts_with(&home)).unwrap_or(false)
-        || extra_writable_roots().iter().any(|root| dir.starts_with(root))
+        || dirs::home_dir()
+            .map(|home| dir.starts_with(&home))
+            .unwrap_or(false)
+        || extra_writable_roots()
+            .iter()
+            .any(|root| dir.starts_with(root))
 }
 
 /// "受保护与否"要能在目录还不存在时就判出来：从叶子往上找到第一个能 canonicalize 的祖先，
@@ -130,7 +134,9 @@ pub(crate) fn resolve_target_path(
         .map(|ext| ext.eq_ignore_ascii_case(extension))
         != Some(true)
     {
-        return Err(AppError::invalid_input(format!("{kind}必须是一个 .{extension} 文件")));
+        return Err(AppError::invalid_input(format!(
+            "{kind}必须是一个 .{extension} 文件"
+        )));
     }
 
     // 拒判排在存在性之前：一个位置受不受保护只取决于路径本身。原先先 canonicalize 父目录，
@@ -146,12 +152,17 @@ pub(crate) fn resolve_target_path(
         .parent()
         .ok_or_else(|| AppError::invalid_input("路径缺少所在目录"))?;
     let canonical_parent = canonicalize_clean(parent).map_err(|_| {
-        AppError::not_found(format!("目录不存在或不可访问: {}", sanitize(&parent.to_string_lossy())))
+        AppError::not_found(format!(
+            "目录不存在或不可访问: {}",
+            sanitize(&parent.to_string_lossy())
+        ))
     })?;
     let canonical = canonical_parent.join(file_name);
 
     if is_denied(&canonical) {
-        return Err(AppError::path_denied("该位置属于系统或受保护目录，不能读写偏好文件"));
+        return Err(AppError::path_denied(
+            "该位置属于系统或受保护目录，不能读写偏好文件",
+        ));
     }
     if !prefs_root_allowed(&canonical_parent) {
         return Err(AppError::path_denied(format!(
@@ -161,7 +172,10 @@ pub(crate) fn resolve_target_path(
 
     if must_exist {
         let meta = fs::metadata(&canonical).map_err(|_| {
-            AppError::not_found(format!("文件不存在: {}", sanitize(&canonical.to_string_lossy())))
+            AppError::not_found(format!(
+                "文件不存在: {}",
+                sanitize(&canonical.to_string_lossy())
+            ))
         })?;
         if !meta.is_file() {
             return Err(AppError::invalid_input("选中的不是一个普通文件"));
@@ -210,7 +224,9 @@ fn prefs_keys(prefs: &Value) -> usize {
 /// 把前端归一化后的偏好写到指定路径。同目录临时文件 + rename，避免中途失败留下半份配置。
 pub fn write_prefs_file(path: &str, prefs: Value) -> CommandResult<ExportOutcome> {
     if !prefs.is_object() {
-        return Err(AppError::invalid_input("偏好必须是一组键值，无法写入非对象内容"));
+        return Err(AppError::invalid_input(
+            "偏好必须是一组键值，无法写入非对象内容",
+        ));
     }
     let target = resolve_json_path(path, false)?;
     let payload = PrefsFile {
@@ -242,14 +258,18 @@ pub fn write_prefs_file(path: &str, prefs: Value) -> CommandResult<ExportOutcome
 /// 读回一份偏好文件。只负责"认得出这是本应用这份格式"，值合不合法仍由前端白名单判。
 pub fn read_prefs_file(path: &str) -> CommandResult<ImportOutcome> {
     let target = resolve_json_path(path, true)?;
-    let text = fs::read_to_string(&target)
-        .map_err(|e| AppError::failed(format!("读取失败: {}", e)).with_detail(sanitize(&target.to_string_lossy())))?;
+    let text = fs::read_to_string(&target).map_err(|e| {
+        AppError::failed(format!("读取失败: {}", e))
+            .with_detail(sanitize(&target.to_string_lossy()))
+    })?;
     let bytes = text.len() as u64;
     let payload: PrefsFile = match serde_json::from_str(&text) {
         Ok(payload) => payload,
         // 顶层不是对象时 serde 报的是 "invalid type: sequence"，直接给用户一句人话
         Err(e) => {
-            return Err(AppError::invalid_input("这个 JSON 不是一份偏好文件").with_detail(e.to_string()));
+            return Err(
+                AppError::invalid_input("这个 JSON 不是一份偏好文件").with_detail(e.to_string())
+            );
         }
     };
     if payload.app != PREFS_APP_ID {
@@ -284,10 +304,7 @@ mod tests {
     use serde_json::json;
 
     fn fixture(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "zsys-prefs-{}-{tag}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("zsys-prefs-{}-{tag}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).expect("临时目录必须建得出来");
         // 与生产侧同一个 canonicalize：Windows 上 `\\?\` verbatim 前缀会被命令剥掉，
@@ -313,7 +330,8 @@ mod tests {
     fn exported_file_round_trips_through_import() {
         let dir = fixture("roundtrip");
         let target = dir.join("z-prefs.json");
-        let out = write_prefs_file(&target.to_string_lossy(), sample_prefs()).expect("导出应当成功");
+        let out =
+            write_prefs_file(&target.to_string_lossy(), sample_prefs()).expect("导出应当成功");
         assert_eq!(out.keys, 5);
         assert_eq!(out.schema_version, PREFS_SCHEMA_VERSION);
         assert!(out.bytes > 0);
@@ -358,7 +376,10 @@ mod tests {
         let target = dir.join(format!("zsys-t511-{}.json", std::process::id()));
         let out = write_prefs_file(&target.to_string_lossy(), json!({ "darkMode": true }))
             .expect("/tmp 之下的偏好文件必须能写");
-        assert!(PathBuf::from(&out.path).exists(), "返回的路径要就是真正落盘那一条");
+        assert!(
+            PathBuf::from(&out.path).exists(),
+            "返回的路径要就是真正落盘那一条"
+        );
         let back = read_prefs_file(&target.to_string_lossy()).expect("/tmp 之下也要能读回来");
         assert_eq!(back.prefs, json!({ "darkMode": true }));
         let _ = fs::remove_file(&target);
@@ -371,10 +392,7 @@ mod tests {
         let err = write_prefs_file(&target.to_string_lossy(), sample_prefs())
             .expect_err("必须拒掉非 .json 目标");
         assert_eq!(err.code, "INVALID_INPUT", "{err:?}");
-        assert!(
-            !target.exists(),
-            "被拒的导出不能留下任何文件"
-        );
+        assert!(!target.exists(), "被拒的导出不能留下任何文件");
         cleanup(&dir);
     }
 
@@ -382,8 +400,7 @@ mod tests {
     fn denied_system_locations_are_refused() {
         // 这些路径都不存在也无所谓：后缀与黑名单的检查在存在性检查之前
         for raw in ["/System/Volumes/Data/prefs.json", "/etc/prefs.json"] {
-            let err = write_prefs_file(raw, sample_prefs())
-                .expect_err("系统目录必须被拒");
+            let err = write_prefs_file(raw, sample_prefs()).expect_err("系统目录必须被拒");
             assert!(
                 err.code == "PATH_DENIED" || err.code == "NOT_FOUND",
                 "{raw} 的拒绝理由不对: {err:?}"
@@ -394,8 +411,8 @@ mod tests {
     #[test]
     fn a_parent_directory_is_not_treated_as_a_file() {
         let dir = fixture("isdir");
-        let err = write_prefs_file(&dir.to_string_lossy(), sample_prefs())
-            .expect_err("目录不能当文件写");
+        let err =
+            write_prefs_file(&dir.to_string_lossy(), sample_prefs()).expect_err("目录不能当文件写");
         assert_eq!(err.code, "INVALID_INPUT", "{err:?}");
         cleanup(&dir);
     }
@@ -403,7 +420,8 @@ mod tests {
     #[test]
     fn exporting_leaves_no_temp_file_behind() {
         let dir = fixture("tmp");
-        write_prefs_file(&dir.join("a.json").to_string_lossy(), sample_prefs()).expect("导出应当成功");
+        write_prefs_file(&dir.join("a.json").to_string_lossy(), sample_prefs())
+            .expect("导出应当成功");
         let leftovers: Vec<_> = fs::read_dir(&dir)
             .expect("目录可读")
             .filter_map(|entry| entry.ok())
@@ -421,9 +439,14 @@ mod tests {
         let dir = fixture("overwrite");
         let target = dir.join("again.json");
         write_prefs_file(&target.to_string_lossy(), json!({ "darkMode": true })).expect("first");
-        let second = write_prefs_file(&target.to_string_lossy(), json!({ "darkMode": false })).expect("second");
+        let second = write_prefs_file(&target.to_string_lossy(), json!({ "darkMode": false }))
+            .expect("second");
         let back = read_prefs_file(&target.to_string_lossy()).expect("read");
-        assert_eq!(back.prefs, json!({ "darkMode": false }), "第二次导出必须整份覆盖");
+        assert_eq!(
+            back.prefs,
+            json!({ "darkMode": false }),
+            "第二次导出必须整份覆盖"
+        );
         assert_eq!(back.bytes, second.bytes);
         assert_eq!(back.file_keys, 1);
         cleanup(&dir);
@@ -432,7 +455,8 @@ mod tests {
     #[test]
     fn a_missing_file_is_reported_as_not_found_rather_than_empty_prefs() {
         let dir = fixture("missing");
-        let err = read_prefs_file(&dir.join("nope.json").to_string_lossy()).expect_err("不存在的文件必须报错");
+        let err = read_prefs_file(&dir.join("nope.json").to_string_lossy())
+            .expect_err("不存在的文件必须报错");
         assert_eq!(err.code, "NOT_FOUND", "{err:?}");
         cleanup(&dir);
     }
@@ -448,8 +472,8 @@ mod tests {
         ] {
             let path = dir.join(name);
             fs::write(&path, body).expect("夹具要写得进去");
-            let err = read_prefs_file(&path.to_string_lossy())
-                .expect_err("畸形内容应被拒而不是抛异常");
+            let err =
+                read_prefs_file(&path.to_string_lossy()).expect_err("畸形内容应被拒而不是抛异常");
             assert_eq!(err.code, "INVALID_INPUT", "{name}: {err:?}");
         }
         cleanup(&dir);
@@ -480,7 +504,8 @@ mod tests {
         let path = dir.join("future.json");
         fs::write(
             &path,
-            json!({ "app": PREFS_APP_ID, "schemaVersion": 99, "prefs": { "darkMode": true } }).to_string(),
+            json!({ "app": PREFS_APP_ID, "schemaVersion": 99, "prefs": { "darkMode": true } })
+                .to_string(),
         )
         .expect("夹具要写得进去");
         let err = read_prefs_file(&path.to_string_lossy()).expect_err("未定义的版本不能猜");
@@ -523,7 +548,8 @@ mod tests {
     fn prefs_contract_matches_the_frontend_ipc_file() {
         let dir = fixture("ipc");
         let target = dir.join("ipc.json");
-        let exported = write_prefs_file(&target.to_string_lossy(), sample_prefs()).expect("导出应当成功");
+        let exported =
+            write_prefs_file(&target.to_string_lossy(), sample_prefs()).expect("导出应当成功");
         let export_json = serde_json::to_string(&exported).unwrap();
         for key in ["path", "bytes", "keys", "schemaVersion"] {
             assert!(
@@ -533,7 +559,14 @@ mod tests {
         }
         let imported = read_prefs_file(&target.to_string_lossy()).expect("导入应当成功");
         let import_json = serde_json::to_string(&imported).unwrap();
-        for key in ["path", "bytes", "schemaVersion", "exportedAtMs", "prefs", "fileKeys"] {
+        for key in [
+            "path",
+            "bytes",
+            "schemaVersion",
+            "exportedAtMs",
+            "prefs",
+            "fileKeys",
+        ] {
             assert!(
                 import_json.contains(&format!("\"{key}\"")),
                 "ImportOutcome 缺字段 {key}: {import_json}"
@@ -555,8 +588,8 @@ mod tests {
         }
         // 命令按仓库约定集中在 commands.rs，这里锁定"它确实转调本模块"，
         // 否则本模块改签名后 commands.rs 里的调用会静默变成另一套逻辑。
-        let commands_rs = fs::read_to_string(manifest.join("src/commands.rs"))
-            .expect("commands.rs 必须存在");
+        let commands_rs =
+            fs::read_to_string(manifest.join("src/commands.rs")).expect("commands.rs 必须存在");
         for name in ["prefs::write_prefs_file", "prefs::read_prefs_file"] {
             assert!(commands_rs.contains(name), "commands.rs 未转调 {name}");
         }

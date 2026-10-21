@@ -188,8 +188,7 @@ impl ProcessQuery {
         if self.keyword.is_empty() {
             return true;
         }
-        proc.name.to_lowercase().contains(&self.keyword)
-            || proc.pid.to_string() == self.keyword
+        proc.name.to_lowercase().contains(&self.keyword) || proc.pid.to_string() == self.keyword
     }
 
     fn compare(&self, a: &ProcessInfo, b: &ProcessInfo) -> std::cmp::Ordering {
@@ -322,7 +321,12 @@ impl Collector {
     }
 
     pub fn cpu_metrics(&self) -> CpuMetrics {
-        let per_core: Vec<f64> = self.sys.cpus().iter().map(|c| c.cpu_usage() as f64).collect();
+        let per_core: Vec<f64> = self
+            .sys
+            .cpus()
+            .iter()
+            .map(|c| c.cpu_usage() as f64)
+            .collect();
         let total = if per_core.is_empty() {
             self.sys.global_cpu_usage() as f64
         } else {
@@ -363,10 +367,11 @@ impl Collector {
         let window = self.last_network_sample.elapsed();
         self.last_network_sample = Instant::now();
 
-        let addresses: HashMap<String, crate::netinfo::InterfaceAddress> = crate::netinfo::list_interfaces()
-            .into_iter()
-            .map(|iface| (iface.name.clone(), iface))
-            .collect();
+        let addresses: HashMap<String, crate::netinfo::InterfaceAddress> =
+            crate::netinfo::list_interfaces()
+                .into_iter()
+                .map(|iface| (iface.name.clone(), iface))
+                .collect();
 
         let mut out = Vec::new();
         for (name, data) in self.networks.iter() {
@@ -547,9 +552,7 @@ fn detail_refresh_kind() -> ProcessRefreshKind {
 /// 排序断言 `>=` 在全 0 上照样成立，所以旧测试一个都没抓到。
 /// 用这个构造器 + 后续两次带间隔的采样即可拿到真实差值。
 pub fn process_system() -> System {
-    System::new_with_specifics(
-        RefreshKind::nothing().with_processes(process_refresh_kind()),
-    )
+    System::new_with_specifics(RefreshKind::nothing().with_processes(process_refresh_kind()))
 }
 
 /// 一次性采集的**唯一**正确姿势：建表（构造）→ 填基准 → 留出间隔 → 取差值。
@@ -700,9 +703,8 @@ fn non_empty_path(p: Option<&std::path::Path>) -> Option<String> {
 /// 详情是一次性读取，不进 3s 事件流：全量枚举一次 ~700 进程约几十毫秒，只在点击时发生。
 pub fn collect_process_detail(pid: u32) -> Option<ProcessDetail> {
     // 详情口径带 exe / cwd（抽屉要展示这两项），仍然不带 cmd / environ。
-    let mut sys = System::new_with_specifics(
-        RefreshKind::nothing().with_processes(detail_refresh_kind()),
-    );
+    let mut sys =
+        System::new_with_specifics(RefreshKind::nothing().with_processes(detail_refresh_kind()));
     // H-06：构造只完成"建表"，CPU 还要一次填基准、一次取差值 —— 只采一次的话抽屉里是 0。
     sys.refresh_processes_specifics(ProcessesToUpdate::All, true, detail_refresh_kind());
     let started = Instant::now();
@@ -807,7 +809,8 @@ impl MonitorService {
 
     /// 缓存帧是否已反映当前查询；落后时调用方应自行重采集，否则 `get_processes` 会返回上一次的关键字/分页。
     pub fn processes_match_query(&self) -> bool {
-        self.process_page_gen.load(Ordering::Relaxed) >= self.process_query_gen.load(Ordering::Relaxed)
+        self.process_page_gen.load(Ordering::Relaxed)
+            >= self.process_query_gen.load(Ordering::Relaxed)
     }
 
     pub fn set_process_stream(&self, enabled: bool) {
@@ -835,7 +838,10 @@ impl MonitorService {
             eprintln!(
                 "[monitor] 进程查询变更: 关键字={:?} 排序={:?} desc={} offset={} limit={}",
                 crate::log_sanitize::sanitize(&format!("{:?}", normalized.keyword)),
-                normalized.sort_by, normalized.desc, normalized.offset, normalized.limit
+                normalized.sort_by,
+                normalized.desc,
+                normalized.offset,
+                normalized.limit
             );
         }
         normalized
@@ -854,10 +860,13 @@ impl MonitorService {
         if epoch_ms().saturating_sub(page.timestamp_ms) > PROCESS_CACHE_TTL.as_millis() as u64 {
             return None;
         }
-        page.items.iter().find(|p| p.pid == pid).map(|p| ProcessSummary {
-            name: p.name.clone(),
-            memory_bytes: p.memory_bytes,
-        })
+        page.items
+            .iter()
+            .find(|p| p.pid == pid)
+            .map(|p| ProcessSummary {
+                name: p.name.clone(),
+                memory_bytes: p.memory_bytes,
+            })
     }
 
     /// 启动两个采集循环。前端未 listen 时 emit 失败会被静默丢弃。
@@ -945,7 +954,11 @@ async fn run_metrics_loop(
                 if let Err(e) = app.emit(METRICS_EVENT, &snapshot) {
                     static EMIT_WARNED: std::sync::Once = std::sync::Once::new();
                     EMIT_WARNED.call_once(|| {
-                        eprintln!("[monitor] 事件 {} 推送失败: {}", METRICS_EVENT, crate::log_sanitize::sanitize(&e.to_string()))
+                        eprintln!(
+                            "[monitor] 事件 {} 推送失败: {}",
+                            METRICS_EVENT,
+                            crate::log_sanitize::sanitize(&e.to_string())
+                        )
                     });
                 }
                 #[cfg(debug_assertions)]
@@ -988,7 +1001,10 @@ async fn run_metrics_loop(
                     if let Err(e) = app.emit(crate::alert::ALERT_EVENT, &event) {
                         static ALERT_EMIT_WARNED: std::sync::Once = std::sync::Once::new();
                         ALERT_EMIT_WARNED.call_once(|| {
-                            eprintln!("[alert] 事件推送失败: {}", crate::log_sanitize::sanitize(&e.to_string()))
+                            eprintln!(
+                                "[alert] 事件推送失败: {}",
+                                crate::log_sanitize::sanitize(&e.to_string())
+                            )
                         });
                     }
                     // 落盘（T5-03）与推送是两件事：界面没打开、事件没人接，历史照样要留下。
@@ -1041,28 +1057,18 @@ async fn run_process_loop(
             continue;
         }
 
-        let interval = config
-            .read()
-            .map(|g| g.process_interval_ms)
-            .unwrap_or(3000);
+        let interval = config.read().map(|g| g.process_interval_ms).unwrap_or(3000);
 
         // 刚开启时先用一个短间隔暖机，让 CPU 列立刻可信。
         if !warmed {
-            sys.refresh_processes_specifics(
-                ProcessesToUpdate::All,
-                true,
-                process_refresh_kind(),
-            );
+            sys.refresh_processes_specifics(ProcessesToUpdate::All, true, process_refresh_kind());
             tokio::time::sleep(Duration::from_millis(350)).await;
             warmed = true;
         }
 
         // 先取代数再读查询：两者之间发生的变更才不会被漏掉。
         let seen_gen = process_query_gen.load(Ordering::Relaxed);
-        let query = process_query
-            .read()
-            .map(|g| g.clone())
-            .unwrap_or_default();
+        let query = process_query.read().map(|g| g.clone()).unwrap_or_default();
 
         let frame = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             collect_processes(&mut sys, warmed, &query)
@@ -1310,10 +1316,18 @@ mod tests {
                 assert_eq!(mac.matches(':').count(), 5);
             }
             if let Some(ip) = &n.ipv4 {
-                assert!(ip.parse::<std::net::Ipv4Addr>().is_ok(), "bad ipv4 {:?}", ip);
+                assert!(
+                    ip.parse::<std::net::Ipv4Addr>().is_ok(),
+                    "bad ipv4 {:?}",
+                    ip
+                );
             }
             if let Some(ip) = &n.ipv6 {
-                assert!(ip.parse::<std::net::Ipv6Addr>().is_ok(), "bad ipv6 {:?}", ip);
+                assert!(
+                    ip.parse::<std::net::Ipv6Addr>().is_ok(),
+                    "bad ipv6 {:?}",
+                    ip
+                );
             }
         }
     }
@@ -1329,7 +1343,11 @@ mod tests {
             for d in &disks {
                 seen_total |= d.total_bytes > 0;
                 assert_eq!(d.read_bytes_per_sec, None, "未刷新窗口不得给出读速 {:?}", d);
-                assert_eq!(d.write_bytes_per_sec, None, "未刷新窗口不得给出写速 {:?}", d);
+                assert_eq!(
+                    d.write_bytes_per_sec, None,
+                    "未刷新窗口不得给出写速 {:?}",
+                    d
+                );
             }
             std::thread::sleep(Duration::from_millis(50));
         }
@@ -1373,7 +1391,13 @@ mod tests {
         let pick = |frames: &[DiskMetrics]| {
             frames
                 .iter()
-                .map(|d| (d.mount_point.clone(), d.read_bytes_per_sec, d.write_bytes_per_sec))
+                .map(|d| {
+                    (
+                        d.mount_point.clone(),
+                        d.read_bytes_per_sec,
+                        d.write_bytes_per_sec,
+                    )
+                })
                 .collect::<Vec<_>>()
         };
         assert_eq!(pick(&first), pick(&second));
@@ -1662,8 +1686,8 @@ mod tests {
     ///    挑最满的分区，界面就不能自己再算一次，否则会出现"告警报的盘"和"迷你条上的盘"不是一块。
     #[test]
     fn mini_menubar_is_a_pure_projection_of_existing_streams() {
-        let mini =
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../src/components/MiniMenuBar.tsx");
+        let mini = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../src/components/MiniMenuBar.tsx");
         let src = std::fs::read_to_string(&mini).expect("MiniMenuBar.tsx 必须存在");
         for forbidden in [
             "invoke(",
@@ -1769,9 +1793,7 @@ mod tests {
             let as_string = payload.downcast_ref::<String>().cloned();
             let as_str = payload.downcast_ref::<&str>().copied().map(String::from);
             let reason = panic_reason(payload);
-            shapes.push(format!(
-                "String={as_string:?} &str={as_str:?} -> {reason}"
-            ));
+            shapes.push(format!("String={as_string:?} &str={as_str:?} -> {reason}"));
             if !reason.starts_with("未知") {
                 readable += 1;
             }
@@ -1797,7 +1819,9 @@ mod tests {
         assert!(engine.evaluate(&hot_frame(2_000), &cfg).is_empty());
 
         // 走真实的恢复入口（循环里调的就是它），不是重抄一遍。
-        let boom = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| panic!("注入：采集器 panic")));
+        let boom = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            panic!("注入：采集器 panic")
+        }));
         recover_metrics_after_panic(
             &mut collector,
             &mut engine,
@@ -1823,7 +1847,9 @@ mod tests {
         let mut engine = crate::alert::AlertEngine::new();
         let _ = collector.snapshot(Duration::from_millis(0));
 
-        let boom = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| panic!("注入：重建用的采集器")));
+        let boom = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            panic!("注入：重建用的采集器")
+        }));
         recover_metrics_after_panic(
             &mut collector,
             &mut engine,
@@ -1834,7 +1860,11 @@ mod tests {
         // 磁盘刷新间隔用生产同款：`Collector::new()` 刚把 `last_disk_sample` 设成 now，
         // 所以这一帧没有窗口可算速率 —— 必须是 `None`，写 0 就是造数。
         let frame = collector.snapshot(Duration::from_secs(5));
-        assert!(frame.cpu.total >= 0.0 && frame.cpu.total <= 100.0, "{:?}", frame.cpu.total);
+        assert!(
+            frame.cpu.total >= 0.0 && frame.cpu.total <= 100.0,
+            "{:?}",
+            frame.cpu.total
+        );
         assert!(frame.cpu.core_count > 0);
         assert!(frame.memory.total_bytes > 0, "重建后拿不到内存容量就是空壳");
         assert!(!frame.networks.is_empty(), "重建后网卡列表为空");
@@ -1843,7 +1873,11 @@ mod tests {
             assert!(
                 disk.read_bytes_per_sec.is_none() && disk.write_bytes_per_sec.is_none(),
                 "刚重建就报出速率 = 造数：{:?}",
-                (disk.mount_point.clone(), disk.read_bytes_per_sec, disk.write_bytes_per_sec)
+                (
+                    disk.mount_point.clone(),
+                    disk.read_bytes_per_sec,
+                    disk.write_bytes_per_sec
+                )
             );
         }
     }
@@ -1856,7 +1890,9 @@ mod tests {
         let mut warmed = true;
         let query = ProcessQuery::default();
 
-        let boom = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| panic!("注入：进程帧 panic")));
+        let boom = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            panic!("注入：进程帧 panic")
+        }));
         recover_processes_after_panic(
             &mut sys,
             &mut warmed,
@@ -1865,7 +1901,10 @@ mod tests {
         assert!(!warmed, "恢复后必须回到暖机");
 
         let page = collect_processes(&mut sys, warmed, &query);
-        assert!(page.warming, "恢复后的第一帧要标明还在暖机，不能让一排 0 % 冒充排行");
+        assert!(
+            page.warming,
+            "恢复后的第一帧要标明还在暖机，不能让一排 0 % 冒充排行"
+        );
         assert!(page.total > 0, "进程表本身就是空的，这条注入没跑到真枚举");
     }
 
@@ -1890,10 +1929,17 @@ mod tests {
             2,
             "两个采集循环都该走恢复函数，多一处少一处都要重新看一眼"
         );
-        assert!(production.contains("recover_metrics_after_panic(&mut collector, &mut alerts, panic_reason(payload))"));
-        assert!(production.contains("recover_processes_after_panic(&mut sys, &mut warmed, panic_reason(payload))"));
+        assert!(production.contains(
+            "recover_metrics_after_panic(&mut collector, &mut alerts, panic_reason(payload))"
+        ));
+        assert!(production.contains(
+            "recover_processes_after_panic(&mut sys, &mut warmed, panic_reason(payload))"
+        ));
 
-        for name in ["recover_metrics_after_panic", "recover_processes_after_panic"] {
+        for name in [
+            "recover_metrics_after_panic",
+            "recover_processes_after_panic",
+        ] {
             let needle = format!("fn {name}(");
             let body = production
                 .split(needle.as_str())
@@ -1914,7 +1960,10 @@ mod tests {
             .next()
             .unwrap()
             .to_string();
-        assert!(reason_fn.contains("log_sanitize::sanitize"), "panic 原因没脱敏");
+        assert!(
+            reason_fn.contains("log_sanitize::sanitize"),
+            "panic 原因没脱敏"
+        );
     }
 
     /// FI-04：拿不到容量的分区只标记它自己。
@@ -1939,12 +1988,32 @@ mod tests {
 
         // 同一批里其它分区完全不受影响。
         let siblings = [
-            disk_entry("Data".to_string(), "/System/Volumes/Data".to_string(), "apfs".to_string(), 500, 100, (Some(1.0), Some(2.0))),
-            disk_entry("全满".to_string(), "/Volumes/Full".to_string(), "apfs".to_string(), 100, 0, (None, None)),
+            disk_entry(
+                "Data".to_string(),
+                "/System/Volumes/Data".to_string(),
+                "apfs".to_string(),
+                500,
+                100,
+                (Some(1.0), Some(2.0)),
+            ),
+            disk_entry(
+                "全满".to_string(),
+                "/Volumes/Full".to_string(),
+                "apfs".to_string(),
+                100,
+                0,
+                (None, None),
+            ),
         ];
-        assert!(siblings.iter().all(|d| d.available), "有容量的分区不该被邻居带崩");
+        assert!(
+            siblings.iter().all(|d| d.available),
+            "有容量的分区不该被邻居带崩"
+        );
         assert_eq!(siblings[0].usage_percent, 80.0);
-        assert_eq!(siblings[1].usage_percent, 100.0, "可用 0 但容量已知的分区是真的全满");
+        assert_eq!(
+            siblings[1].usage_percent, 100.0,
+            "可用 0 但容量已知的分区是真的全满"
+        );
 
         // 荒谬组合（容量报 0、可用却 > 0）：仍然只标记这一块不可用，
         // 且 `used` 走 saturating_sub，不许把 u64 减成一个巨大的已用量。
@@ -1981,15 +2050,26 @@ mod tests {
             .iter()
             .filter(|e| e.metric == crate::alert::AlertMetric::Disk)
             .collect();
-        assert_eq!(disk_alerts.len(), 1, "一块全满 + 一块不可用 + 一块 80 %：只该报一条， got {fired:?}");
+        assert_eq!(
+            disk_alerts.len(),
+            1,
+            "一块全满 + 一块不可用 + 一块 80 %：只该报一条， got {fired:?}"
+        );
         assert_eq!(disk_alerts[0].target.as_deref(), Some("/Volumes/Full"));
 
         // 显示层的同一口径也要钉住：`available: false` 那一行不许把 `usagePercent` 的 0.0
         // 画成"用了 0 %"的进度条 —— 后端类型上给不出 `None`，这一列就是最后一道闸。
         let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let tab = std::fs::read_to_string(manifest.join("../src/components/tabs/DiskTab.tsx")).unwrap();
-        assert!(tab.contains("const MISSING = \"—\""), "分区表没有统一的缺测画法");
-        assert!(tab.contains("disk.available"), "分区表没再看 available 标志");
+        let tab =
+            std::fs::read_to_string(manifest.join("../src/components/tabs/DiskTab.tsx")).unwrap();
+        assert!(
+            tab.contains("const MISSING = \"—\""),
+            "分区表没有统一的缺测画法"
+        );
+        assert!(
+            tab.contains("disk.available"),
+            "分区表没再看 available 标志"
+        );
         let usage_col = tab
             .split("title: \"使用率\"")
             .nth(1)
@@ -2058,7 +2138,10 @@ mod tests {
         // 而"使用上次缓存 + 标 stale"由前端的采集停滞检测承担（>3 个周期无帧）。
         let mut collector = Collector::new();
         let frame = collector.snapshot(Duration::from_millis(0));
-        assert!(frame.timestamp_ms > 0, "没有错误通道时，唯一可信的失败信号就是'这一帧根本没出来'");
+        assert!(
+            frame.timestamp_ms > 0,
+            "没有错误通道时，唯一可信的失败信号就是'这一帧根本没出来'"
+        );
     }
 
     // ==================== IT-01~IT-03（06 的集成矩阵）====================
@@ -2081,10 +2164,22 @@ mod tests {
         let frame = collector.snapshot(Duration::from_secs(5));
         let json = serde_json::to_string(&frame).unwrap();
         for key in [
-            "timestampMs", "uptimeSeconds", "cpu", "memory", "disks", "networks",
-            "total", "perCore", "coreCount", "usagePercent", "pressure",
+            "timestampMs",
+            "uptimeSeconds",
+            "cpu",
+            "memory",
+            "disks",
+            "networks",
+            "total",
+            "perCore",
+            "coreCount",
+            "usagePercent",
+            "pressure",
         ] {
-            assert!(json.contains(&format!("\"{key}\"")), "metrics 载荷缺字段 {key}：{json}");
+            assert!(
+                json.contains(&format!("\"{key}\"")),
+                "metrics 载荷缺字段 {key}：{json}"
+            );
         }
         assert!(!json.contains('_'), "metrics 载荷必须全 camelCase：{json}");
     }
@@ -2110,7 +2205,11 @@ mod tests {
             paused: false,
         };
         let effective = service.set_config(requested);
-        let seen = loop_side.config.read().map(|g| g.clone()).unwrap_or_default();
+        let seen = loop_side
+            .config
+            .read()
+            .map(|g| g.clone())
+            .unwrap_or_default();
         assert_eq!(
             seen.interval_ms, effective.interval_ms,
             "循环那份配置没跟着变 ⇒ 改间隔只改了界面"
@@ -2123,7 +2222,10 @@ mod tests {
             interval_ms: 1,
             ..Default::default()
         });
-        assert!(dirty.interval_ms > 1, "1 ms 这种脏输入必须被夹掉：{dirty:?}");
+        assert!(
+            dirty.interval_ms > 1,
+            "1 ms 这种脏输入必须被夹掉：{dirty:?}"
+        );
         assert_eq!(
             loop_side.config.read().unwrap().interval_ms,
             dirty.interval_ms,
@@ -2145,9 +2247,15 @@ mod tests {
 
         assert!(!service.process_stream_enabled(), "默认不该开着枚举");
         service.set_process_stream(true);
-        assert!(loop_side.process_stream.load(Ordering::Relaxed), "开启没传到循环那份");
+        assert!(
+            loop_side.process_stream.load(Ordering::Relaxed),
+            "开启没传到循环那份"
+        );
         service.set_process_stream(false);
-        assert!(!loop_side.process_stream.load(Ordering::Relaxed), "停止没传到循环那份");
+        assert!(
+            !loop_side.process_stream.load(Ordering::Relaxed),
+            "停止没传到循环那份"
+        );
         assert!(!service.process_stream_enabled());
     }
 
@@ -2187,7 +2295,11 @@ mod tests {
         use Duration as D;
         assert_eq!(bytes_per_sec(1_000_000, D::from_secs(1)), 1_000_000.0);
         assert_eq!(bytes_per_sec(1_000_000, D::from_secs(2)), 500_000.0);
-        assert_eq!(bytes_per_sec(0, D::from_secs(10)), 0.0, "真空闲要报 0，不是 None");
+        assert_eq!(
+            bytes_per_sec(0, D::from_secs(10)),
+            0.0,
+            "真空闲要报 0，不是 None"
+        );
         // 窗口被连打两次时夹到 1 ms：这是刻意的下限，不夹会算出天文数字
         assert_eq!(bytes_per_sec(500, D::from_nanos(10)), 500_000.0);
         assert!(bytes_per_sec(u64::MAX, D::from_secs(1)).is_finite());
@@ -2198,7 +2310,11 @@ mod tests {
         for (a, b) in first.iter().zip(second.iter()) {
             assert_eq!(a.interface, b.interface);
             for value in [b.rx_bytes_per_sec, b.tx_bytes_per_sec] {
-                assert!(value.is_finite() && value >= 0.0, "{:?}", (&a.interface, value));
+                assert!(
+                    value.is_finite() && value >= 0.0,
+                    "{:?}",
+                    (&a.interface, value)
+                );
             }
             assert!(
                 b.total_received_bytes >= a.total_received_bytes,
@@ -2452,8 +2568,14 @@ mod tests {
         );
         // 下划线没换掉的话，前端读到的就是 undefined；这一条把驼峰值守也钉住。
         let raw = serde_json::to_string(&sample).unwrap();
-        assert!(raw.contains("ownedByCurrentUser") && !raw.contains("owned_by_current_user"), "{raw}");
+        assert!(
+            raw.contains("ownedByCurrentUser") && !raw.contains("owned_by_current_user"),
+            "{raw}"
+        );
         let raw = serde_json::to_string(&ProcessQuery::default()).unwrap();
-        assert!(raw.contains("onlyDetached") && !raw.contains("only_detached"), "{raw}");
+        assert!(
+            raw.contains("onlyDetached") && !raw.contains("only_detached"),
+            "{raw}"
+        );
     }
 }

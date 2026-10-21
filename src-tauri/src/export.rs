@@ -18,7 +18,8 @@ use serde::Serialize;
 
 /// 表头。列全是数值，不含路径、挂载点、进程名 —— 导出文件会被用户随手发到别处，
 /// 少一类字段就少一类泄漏面，而且这些列对"看趋势"本来也没用。
-pub const CSV_HEADER: &str = "timestamp_ms,cpu_percent,memory_percent,rx_bytes_per_sec,tx_bytes_per_sec,bucket_seconds\n";
+pub const CSV_HEADER: &str =
+    "timestamp_ms,cpu_percent,memory_percent,rx_bytes_per_sec,tx_bytes_per_sec,bucket_seconds\n";
 /// 写之前的体积上限。当前保留窗口（7 天 + 分桶压缩）导出的量级约 1 万行 / 数百 KB，
 /// 这道闸平时不会碰到 —— 它是防止以后窗口或分辨率变大时**静默写出一个巨大文件**的兜底。
 pub const MAX_CSV_BYTES: u64 = 16 * 1024 * 1024;
@@ -49,14 +50,24 @@ pub fn build_csv(page: &HistoryPage) -> String {
     for point in &page.points {
         out.push_str(&format!(
             "{},{:.2},{:.2},{:.0},{:.0},{}\n",
-            point.t, point.cpu, point.memory, point.rx_bytes_per_sec, point.tx_bytes_per_sec, page.bucket_seconds
+            point.t,
+            point.cpu,
+            point.memory,
+            point.rx_bytes_per_sec,
+            point.tx_bytes_per_sec,
+            page.bucket_seconds
         ));
     }
     out
 }
 
 /// 导出到用户选定的路径。`now_ms` 由调用方给（测试要能钉住时间窗口）。
-pub fn write_history_csv(store: &HistoryStore, path: &str, now_ms: u64, span_secs: u64) -> CommandResult<CsvExportOutcome> {
+pub fn write_history_csv(
+    store: &HistoryStore,
+    path: &str,
+    now_ms: u64,
+    span_secs: u64,
+) -> CommandResult<CsvExportOutcome> {
     write_history_csv_with_limit(store, path, now_ms, span_secs, MAX_CSV_BYTES)
 }
 
@@ -146,15 +157,17 @@ mod tests {
     #[test]
     fn the_csv_is_a_header_plus_one_line_per_point_with_its_bucket_width() {
         let text = build_csv(&page(
-            vec![point(1_700_000_000_000, 12.5, 60.25), point(1_700_000_010_000, 100.0, 0.0)],
+            vec![
+                point(1_700_000_000_000, 12.5, 60.25),
+                point(1_700_000_010_000, 100.0, 0.0),
+            ],
             10,
         ));
         let lines: Vec<&str> = text.trim_end().split('\n').collect();
         assert_eq!(lines[0], CSV_HEADER.trim_end());
         assert_eq!(lines.len(), 3, "两行数据 + 一行表头：{lines:?}");
         assert_eq!(
-            lines[1],
-            "1700000000000,12.50,60.25,100,120,10",
+            lines[1], "1700000000000,12.50,60.25,100,120,10",
             "数值精度或列序变了：{}",
             lines[1]
         );
@@ -183,7 +196,10 @@ mod tests {
     fn the_exported_file_carries_no_paths_or_names() {
         let text = build_csv(&page(vec![point(1_700_000_000_000, 1.0, 2.0)], 10));
         for forbidden in ["/Users", "/Volumes", "\\", "mount", "name"] {
-            assert!(!text.contains(forbidden), "导出内容里出现了 {forbidden:?}：{text}");
+            assert!(
+                !text.contains(forbidden),
+                "导出内容里出现了 {forbidden:?}：{text}"
+            );
         }
     }
 
@@ -194,14 +210,24 @@ mod tests {
         let store = HistoryStore::new(&store_dir);
         let now = 1_700_000_000_000;
         for i in 0..12u64 {
-            store.append(point(now - i * SAMPLE_INTERVAL_MS, 33.3, 44.4)).unwrap();
+            store
+                .append(point(now - i * SAMPLE_INTERVAL_MS, 33.3, 44.4))
+                .unwrap();
         }
         let target = store_dir.join("out.csv");
         let err = write_history_csv_with_limit(&store, &target.to_string_lossy(), now, 3_600, 64)
             .unwrap_err();
         assert_eq!(err.code, "INVALID_INPUT", "超限必须拒而不是截断：{err:?}");
-        assert!(err.message.contains("缩小"), "得告诉用户怎么补救：{}", err.message);
-        assert!(err.message.contains("12 行"), "要报出真实行数而不是含糊带过：{}", err.message);
+        assert!(
+            err.message.contains("缩小"),
+            "得告诉用户怎么补救：{}",
+            err.message
+        );
+        assert!(
+            err.message.contains("12 行"),
+            "要报出真实行数而不是含糊带过：{}",
+            err.message
+        );
         assert!(!target.exists(), "拒掉之后不该留下半个文件");
         let leftovers: Vec<String> = fs::read_dir(&store_dir)
             .unwrap()
@@ -209,10 +235,20 @@ mod tests {
             .map(|e| e.file_name().to_string_lossy().to_string())
             .filter(|name| name.contains(".tmp-"))
             .collect();
-        assert!(leftovers.is_empty(), "拒掉时也不该留下临时文件：{leftovers:?}");
+        assert!(
+            leftovers.is_empty(),
+            "拒掉时也不该留下临时文件：{leftovers:?}"
+        );
 
         // 同一份数据放在够用的上限下要真的写出来（否则上面的拒可能是别的原因）
-        let ok = write_history_csv_with_limit(&store, &target.to_string_lossy(), now, 3_600, MAX_CSV_BYTES).unwrap();
+        let ok = write_history_csv_with_limit(
+            &store,
+            &target.to_string_lossy(),
+            now,
+            3_600,
+            MAX_CSV_BYTES,
+        )
+        .unwrap();
         assert_eq!(ok.rows, 12, "{ok:?}");
         assert!(target.exists());
         let _ = fs::remove_dir_all(&store_dir);
@@ -226,12 +262,27 @@ mod tests {
         store.append(point(1_700_000_000_000, 1.0, 1.0)).unwrap();
 
         let wrong_suffix = dir.join("out.txt");
-        let err = write_history_csv(&store, &wrong_suffix.to_string_lossy(), 1_700_000_000_000 + 10, 3_600)
-            .unwrap_err();
+        let err = write_history_csv(
+            &store,
+            &wrong_suffix.to_string_lossy(),
+            1_700_000_000_000 + 10,
+            3_600,
+        )
+        .unwrap_err();
         assert_eq!(err.code, "INVALID_INPUT");
-        assert!(err.message.contains(".csv"), "错误要指明后缀要求：{}", err.message);
+        assert!(
+            err.message.contains(".csv"),
+            "错误要指明后缀要求：{}",
+            err.message
+        );
 
-        let err = write_history_csv(&store, &dir.to_string_lossy(), 1_700_000_000_000 + 10, 3_600).unwrap_err();
+        let err = write_history_csv(
+            &store,
+            &dir.to_string_lossy(),
+            1_700_000_000_000 + 10,
+            3_600,
+        )
+        .unwrap_err();
         assert_eq!(err.code, "INVALID_INPUT", "指向目录必须被拒：{err:?}");
 
         // 受保护位置分两种：本机真有的目录，和"这个平台上根本不存在"的目录。
@@ -249,14 +300,21 @@ mod tests {
         };
         for denied in [present_dir, missing_dir] {
             let err = write_history_csv(&store, denied, 1_700_000_000_000 + 10, 3_600).unwrap_err();
-            assert_eq!(err.code, "PATH_DENIED", "受保护位置不该被写（{denied}）：{err:?}");
+            assert_eq!(
+                err.code, "PATH_DENIED",
+                "受保护位置不该被写（{denied}）：{err:?}"
+            );
         }
 
         let missing_parent = std::env::temp_dir()
             .join(format!("zsys-csv-不存在-{}", std::process::id()))
             .join("history.csv");
-        let err = write_history_csv(&store, &missing_parent.to_string_lossy(), 1, 3_600).unwrap_err();
-        assert_eq!(err.code, "NOT_FOUND", "所在目录不存在时不该顺手创建：{err:?}");
+        let err =
+            write_history_csv(&store, &missing_parent.to_string_lossy(), 1, 3_600).unwrap_err();
+        assert_eq!(
+            err.code, "NOT_FOUND",
+            "所在目录不存在时不该顺手创建：{err:?}"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -303,7 +361,11 @@ mod tests {
             .filter(|name| name.contains(".tmp-"))
             .collect();
         assert!(leftovers.is_empty(), "留下了临时文件：{leftovers:?}");
-        assert_eq!(fs::read_dir(&dir).unwrap().count(), 2, "目录里应只有历史文件与导出的 CSV");
+        assert_eq!(
+            fs::read_dir(&dir).unwrap().count(),
+            2,
+            "目录里应只有历史文件与导出的 CSV"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -352,11 +414,10 @@ mod tests {
             commands_rs.contains("export::write_history_csv"),
             "命令没有转调 export 模块"
         );
-        let overview = std::fs::read_to_string(manifest.join("../src/components/tabs/OverviewTab.tsx")).unwrap();
-        assert!(
-            overview.contains("onExportCsv"),
-            "概览上的导出按钮没接回调"
-        );
+        let overview =
+            std::fs::read_to_string(manifest.join("../src/components/tabs/OverviewTab.tsx"))
+                .unwrap();
+        assert!(overview.contains("onExportCsv"), "概览上的导出按钮没接回调");
         let app = std::fs::read_to_string(manifest.join("../src/App.tsx")).unwrap();
         assert!(
             app.contains("Commands.exportHistoryCsv"),

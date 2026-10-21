@@ -47,13 +47,17 @@ pub(crate) fn is_denied(path: &Path) -> bool {
             text.starts_with(prefix)
         } else {
             // 组件级黑名单（如 ~/.ssh）按路径片段匹配，避免误伤 my.ssh-notes 之类目录。
-            text.split(['/', '\\']).any(|seg| seg.eq_ignore_ascii_case(prefix))
+            text.split(['/', '\\'])
+                .any(|seg| seg.eq_ignore_ascii_case(prefix))
         }
     })
 }
 
 pub(crate) fn under_allowed_root(canonical: &Path) -> bool {
-    allowed_roots().iter().filter_map(|r| canonicalize_clean(r).ok()).any(|root| canonical.starts_with(&root))
+    allowed_roots()
+        .iter()
+        .filter_map(|r| canonicalize_clean(r).ok())
+        .any(|root| canonical.starts_with(&root))
 }
 
 /// Windows 的 canonical 形式（`\\?\C:\Users\...`）会绕过按字符串前缀判定的黑名单：
@@ -69,7 +73,8 @@ fn strip_verbatim(path: PathBuf) -> PathBuf {
         return path;
     };
     let bytes = rest.as_bytes();
-    let drive_form = bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'\\';
+    let drive_form =
+        bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'\\';
     if drive_form {
         PathBuf::from(rest)
     } else {
@@ -91,12 +96,24 @@ mod verbatim_tests {
     /// 纯字符串处理，所以在任何平台上都能验 —— Windows 腿跑的就是这条断言的形状。
     #[test]
     fn the_verbatim_drive_prefix_is_stripped_and_nothing_else_moves() {
-        assert_eq!(strip_verbatim(PathBuf::from(r"\\?\C:\Users\a")), PathBuf::from(r"C:\Users\a"));
+        assert_eq!(
+            strip_verbatim(PathBuf::from(r"\\?\C:\Users\a")),
+            PathBuf::from(r"C:\Users\a")
+        );
         // 只认盘符式
-        assert_eq!(strip_verbatim(PathBuf::from(r"\\?\UNC\srv\share\x")), PathBuf::from(r"\\?\UNC\srv\share\x"));
-        assert_eq!(strip_verbatim(PathBuf::from(r"\\?\Global\x")), PathBuf::from(r"\\?\Global\x"));
+        assert_eq!(
+            strip_verbatim(PathBuf::from(r"\\?\UNC\srv\share\x")),
+            PathBuf::from(r"\\?\UNC\srv\share\x")
+        );
+        assert_eq!(
+            strip_verbatim(PathBuf::from(r"\\?\Global\x")),
+            PathBuf::from(r"\\?\Global\x")
+        );
         // 非 verbatim 原样返回
-        assert_eq!(strip_verbatim(PathBuf::from(r"C:\Users\a")), PathBuf::from(r"C:\Users\a"));
+        assert_eq!(
+            strip_verbatim(PathBuf::from(r"C:\Users\a")),
+            PathBuf::from(r"C:\Users\a")
+        );
     }
 
     /// 这条是"黑名单为什么会被绕过"的证据：剥前缀之后才谈得上前缀匹配。
@@ -116,7 +133,10 @@ pub fn expand_tilde(raw: &str) -> Option<PathBuf> {
     if trimmed == "~" || trimmed == "~/" {
         return dirs::home_dir();
     }
-    if let Some(rest) = trimmed.strip_prefix("~/").or_else(|| trimmed.strip_prefix("~\\")) {
+    if let Some(rest) = trimmed
+        .strip_prefix("~/")
+        .or_else(|| trimmed.strip_prefix("~\\"))
+    {
         return dirs::home_dir().map(|home| home.join(rest));
     }
     Some(PathBuf::from(trimmed))
@@ -126,20 +146,29 @@ pub fn expand_tilde(raw: &str) -> Option<PathBuf> {
 pub fn resolve_scan_path(raw: Option<&str>) -> CommandResult<PathBuf> {
     let home = dirs::home_dir();
     let candidate = match raw {
-        None | Some("") => home.clone().ok_or_else(|| AppError::failed("无法定位用户主目录"))?,
-        Some(input) => expand_tilde(input)
-            .ok_or_else(|| AppError::invalid_input("扫描路径不能为空"))?,
+        None | Some("") => home
+            .clone()
+            .ok_or_else(|| AppError::failed("无法定位用户主目录"))?,
+        Some(input) => {
+            expand_tilde(input).ok_or_else(|| AppError::invalid_input("扫描路径不能为空"))?
+        }
     };
 
     if !candidate.exists() {
-        return Err(AppError::not_found(format!("路径不存在: {}", crate::log_sanitize::sanitize(&candidate.to_string_lossy()))));
+        return Err(AppError::not_found(format!(
+            "路径不存在: {}",
+            crate::log_sanitize::sanitize(&candidate.to_string_lossy())
+        )));
     }
     let canonical = canonicalize_clean(&candidate)
         .map_err(|e| AppError::failed(format!("无法解析路径: {}", e)))?;
     if is_denied(&canonical) {
-        return Err(AppError::path_denied("该目录属于系统或受保护位置，不允许扫描"));
+        return Err(AppError::path_denied(
+            "该目录属于系统或受保护位置，不允许扫描",
+        ));
     }
-    if !(under_allowed_root(&canonical) || home.map(|h| canonical.starts_with(&h)).unwrap_or(false)) {
+    if !(under_allowed_root(&canonical) || home.map(|h| canonical.starts_with(&h)).unwrap_or(false))
+    {
         return Err(AppError::path_denied(
             "仅允许扫描用户主目录或临时目录之下的路径",
         ));
@@ -186,9 +215,9 @@ pub struct JunkCategory {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum RiskLevel {
-    Safe,      // 可安全清理 (临时文件、缓存)
-    Moderate,  // 中等风险 (缩略图、最近文档)
-    Risky,     // 高风险 (日志、数据库)
+    Safe,     // 可安全清理 (临时文件、缓存)
+    Moderate, // 中等风险 (缩略图、最近文档)
+    Risky,    // 高风险 (日志、数据库)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -338,7 +367,7 @@ pub struct StartupItem {
     pub id: String,
     pub name: String,
     pub command: String,
-    pub source: String,       // 注册表/LaunchAgents/cron 等
+    pub source: String, // 注册表/LaunchAgents/cron 等
     pub enabled: bool,
     pub location: String,
     /// 后端能不能安全地操作这一项（T3-08）。false 时界面不给按钮，而不是点了再报错。
@@ -347,7 +376,13 @@ pub struct StartupItem {
 
 /// 组装一枚扫描出来的启动项。`enabled` 的口径是"文件此刻在不在启动目录里"：
 /// 我们不去猜 plist 里的 `Disabled` 键，所以界面说的也是"在启动目录中"。
-fn startup_item(id: String, name: String, command: String, source: String, location: String) -> StartupItem {
+fn startup_item(
+    id: String,
+    name: String,
+    command: String,
+    source: String,
+    location: String,
+) -> StartupItem {
     StartupItem {
         operable: crate::startup::id_is_operable(&id),
         enabled: true,
@@ -374,13 +409,18 @@ fn get_junk_paths() -> Vec<(String, String, String, RiskLevel)> {
         paths.push((
             "user_temp".to_string(),
             "用户临时文件".to_string(),
-            std::env::temp_dir().join("z-biz-tool-sys").to_string_lossy().to_string(),
+            std::env::temp_dir()
+                .join("z-biz-tool-sys")
+                .to_string_lossy()
+                .to_string(),
             RiskLevel::Safe,
         ));
         paths.push((
             "recent_files".to_string(),
             "最近文件列表".to_string(),
-            home.join(".local/share/Recent").to_string_lossy().to_string(),
+            home.join(".local/share/Recent")
+                .to_string_lossy()
+                .to_string(),
             RiskLevel::Moderate,
         ));
         paths.push((
@@ -392,19 +432,25 @@ fn get_junk_paths() -> Vec<(String, String, String, RiskLevel)> {
         paths.push((
             "trash".to_string(),
             "回收站".to_string(),
-            home.join(".local/share/Trash").to_string_lossy().to_string(),
+            home.join(".local/share/Trash")
+                .to_string_lossy()
+                .to_string(),
             RiskLevel::Moderate,
         ));
         paths.push((
             "browser_cache".to_string(),
             "浏览器缓存".to_string(),
-            home.join(".cache/google-chrome").to_string_lossy().to_string(),
+            home.join(".cache/google-chrome")
+                .to_string_lossy()
+                .to_string(),
             RiskLevel::Moderate,
         ));
         paths.push((
             "browser_cache".to_string(),
             "浏览器缓存".to_string(),
-            home.join(".cache/BraveSoftware").to_string_lossy().to_string(),
+            home.join(".cache/BraveSoftware")
+                .to_string_lossy()
+                .to_string(),
             RiskLevel::Moderate,
         ));
         paths.push((
@@ -441,13 +487,17 @@ fn get_junk_paths() -> Vec<(String, String, String, RiskLevel)> {
             paths.push((
                 "macos_xcode".to_string(),
                 "Xcode 派生数据".to_string(),
-                home.join("Library/Developer/Xcode/DerivedData").to_string_lossy().to_string(),
+                home.join("Library/Developer/Xcode/DerivedData")
+                    .to_string_lossy()
+                    .to_string(),
                 RiskLevel::Moderate,
             ));
             paths.push((
                 "macos_simulator".to_string(),
                 "iOS 模拟器临时文件".to_string(),
-                home.join("Library/Developer/CoreSimulator/Caches").to_string_lossy().to_string(),
+                home.join("Library/Developer/CoreSimulator/Caches")
+                    .to_string_lossy()
+                    .to_string(),
                 RiskLevel::Moderate,
             ));
         }
@@ -736,7 +786,6 @@ fn cleanup_declared(declared: &[String]) -> CleanupResult {
         .collect();
 
     for path in target_paths {
-
         let (size_before, _count_before) = dir_size(&path);
 
         for entry in WalkDir::new(&path).into_iter().filter_map(Result::ok) {
@@ -757,7 +806,10 @@ fn cleanup_declared(declared: &[String]) -> CleanupResult {
         }
 
         // 清理空目录
-        if let Ok(rd) = WalkDir::new(&path).into_iter().collect::<Result<Vec<_>, _>>() {
+        if let Ok(rd) = WalkDir::new(&path)
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+        {
             for entry in rd.iter().rev() {
                 if entry.file_type().is_dir() && entry.path() != path.as_path() {
                     let _ = fs::remove_dir(entry.path());
@@ -814,7 +866,10 @@ pub fn get_startup_items() -> Vec<StartupItem> {
     #[cfg(target_os = "macos")]
     {
         if let Ok(output) = std::process::Command::new("osascript")
-            .args(["-e", "tell application \"System Events\" to get name of every login item"])
+            .args([
+                "-e",
+                "tell application \"System Events\" to get name of every login item",
+            ])
             .output()
         {
             if let Ok(s) = String::from_utf8(output.stdout) {
@@ -841,7 +896,10 @@ pub fn get_startup_items() -> Vec<StartupItem> {
     {
         // 读取注册表 Run 项
         if let Ok(output) = std::process::Command::new("reg")
-            .args(["query", "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run"])
+            .args([
+                "query",
+                "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+            ])
             .output()
         {
             if let Ok(s) = String::from_utf8(output.stdout) {
@@ -856,7 +914,8 @@ pub fn get_startup_items() -> Vec<StartupItem> {
                                 name,
                                 command,
                                 "Registry Run".to_string(),
-                                "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run".to_string(),
+                                "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run"
+                                    .to_string(),
                             ));
                         }
                     }
@@ -877,7 +936,8 @@ pub fn get_startup_items() -> Vec<StartupItem> {
                         let path = entry.path();
                         if let Some(ext) = path.extension() {
                             if ext == "service" {
-                                let name = path.file_name()
+                                let name = path
+                                    .file_name()
                                     .and_then(|s| s.to_str())
                                     .unwrap_or("")
                                     .to_string();
@@ -909,12 +969,8 @@ mod tests {
     /// 每个用例拿自己的临时目录，避免并行用例互相看到对方的文件。
     fn fixture(tag: &str) -> PathBuf {
         let n = SEQ.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "zsys-scan-{}-{}-{}",
-            std::process::id(),
-            tag,
-            n
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("zsys-scan-{}-{}-{}", std::process::id(), tag, n));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -1073,8 +1129,15 @@ mod tests {
         );
 
         let mut frames = Vec::new();
-        scan_targets(&[target(&dir, "r")], &mut |f| frames.push(f.clone()), &guard);
-        assert!(frames.iter().all(|f| !f.cancelled), "未取消时帧里不应出现取消态");
+        scan_targets(
+            &[target(&dir, "r")],
+            &mut |f| frames.push(f.clone()),
+            &guard,
+        );
+        assert!(
+            frames.iter().all(|f| !f.cancelled),
+            "未取消时帧里不应出现取消态"
+        );
 
         // 认领之后按下的取消必须立刻对扫描线程可见
         assert!(flags.request_cancel(), "认领后取消请求必须被受理");
@@ -1082,7 +1145,10 @@ mod tests {
 
         // 丢掉凭证即复位：否则下一轮取消会打到空处、并继承上一轮的取消标记
         drop(guard);
-        assert!(!flags.request_cancel(), "结束后必须复位，否则取消会打到空处");
+        assert!(
+            !flags.request_cancel(),
+            "结束后必须复位，否则取消会打到空处"
+        );
         let again = flags.begin().expect("复位后应能再次认领");
         assert!(!again.cancelled(), "新一轮不应继承上一轮的取消标记");
 
@@ -1265,12 +1331,14 @@ mod tests {
             "done",
         ];
         for key in keys {
-            assert!(json.contains(&format!("\"{key}\"")), "进度帧缺字段 {key}：{json}");
+            assert!(
+                json.contains(&format!("\"{key}\"")),
+                "进度帧缺字段 {key}：{json}"
+            );
         }
         assert!(!json.contains('_'), "进度帧必须全 camelCase：{json}");
 
-        let ts = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../src/ipc_contract.ts");
+        let ts = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../src/ipc_contract.ts");
         let contract = fs::read_to_string(&ts).expect("前端 IPC 契约文件必须存在");
         assert!(
             contract.contains(&format!("\"{SCAN_PROGRESS_EVENT}\"")),
@@ -1295,12 +1363,19 @@ mod tests {
         fs::create_dir_all(&nested).unwrap();
         write_files(&dir, 3, 100);
         write_files(&nested, 2, 50);
-        assert_eq!(dir_size(&dir), (400, 5), "夹具本身没造对，后面的断言就没有意义");
+        assert_eq!(
+            dir_size(&dir),
+            (400, 5),
+            "夹具本身没造对，后面的断言就没有意义"
+        );
 
         let result = cleanup_declared(&[dir.to_string_lossy().to_string()]);
         assert_eq!(result.deleted_files, 5, "{result:?}");
         assert_eq!(result.failed_files, 0, "{result:?}");
-        assert_eq!(result.skipped_paths, 0, "临时目录下的夹具应当过闸：{result:?}");
+        assert_eq!(
+            result.skipped_paths, 0,
+            "临时目录下的夹具应当过闸：{result:?}"
+        );
         assert_eq!(result.freed_bytes, 400, "{result:?}");
         assert!(!dir.join("f0.bin").exists());
         assert!(!nested.exists(), "清完剩下的空目录也要收掉");
@@ -1338,7 +1413,10 @@ mod tests {
             "家目录成了合法的清理根 —— 后面那步就不该在这里执行"
         );
         assert!(approved_cleanup_root(&tmp.to_string_lossy()).is_none());
-        assert!(approved_cleanup_root(denied).is_none(), "{denied} 在黑名单里，不该过闸");
+        assert!(
+            approved_cleanup_root(denied).is_none(),
+            "{denied} 在黑名单里，不该过闸"
+        );
         let ok = fixture("gate");
         assert!(
             approved_cleanup_root(&ok.to_string_lossy()).is_some(),
@@ -1348,7 +1426,9 @@ mod tests {
         // 再量"整条删除路径"确实一个字节都没动：只喂被拒的那两类，不喂任何允许根。
         let declared = vec![
             denied.to_string(),
-            tmp.join("zsys-从不存在的-目录").to_string_lossy().into_owned(),
+            tmp.join("zsys-从不存在的-目录")
+                .to_string_lossy()
+                .into_owned(),
         ];
         let result = cleanup_declared(&declared);
         assert_eq!(result.deleted_files, 0, "{result:?}");
@@ -1360,7 +1440,10 @@ mod tests {
             "每一条被拒都要说清为什么：{:?}",
             result.errors
         );
-        assert!(home.exists() && fs::read_dir(&home).is_ok(), "家目录被动过了");
+        assert!(
+            home.exists() && fs::read_dir(&home).is_ok(),
+            "家目录被动过了"
+        );
 
         let _ = fs::remove_dir_all(&ok);
     }
@@ -1392,7 +1475,10 @@ mod tests {
         let home = dirs::home_dir().expect("测试需要家目录");
         assert_eq!(expand_tilde("~"), Some(home.clone()));
         assert_eq!(expand_tilde("~/"), Some(home.clone()));
-        assert_eq!(expand_tilde("~/Library/Caches"), Some(home.join("Library/Caches")));
+        assert_eq!(
+            expand_tilde("~/Library/Caches"),
+            Some(home.join("Library/Caches"))
+        );
         // 非 ~ 前缀不动；`~user` 也不猜（猜错就会把别人的家目录当成扫描根）
         assert_eq!(expand_tilde("/tmp/x"), Some(PathBuf::from("/tmp/x")));
         assert_eq!(expand_tilde("~other/x"), Some(PathBuf::from("~other/x")));
@@ -1416,8 +1502,13 @@ mod tests {
             "指向 {target} 的符号链接被当成了合法清理目标"
         );
         let err = resolve_scan_path(Some(&link.to_string_lossy())).unwrap_err();
-        assert_eq!(err.code, "PATH_DENIED", "扫描入口顺着符号链接爬进了 {target}");
-        let home = dirs::home_dir().map(|h| h.to_string_lossy().to_string()).unwrap_or_default();
+        assert_eq!(
+            err.code, "PATH_DENIED",
+            "扫描入口顺着符号链接爬进了 {target}"
+        );
+        let home = dirs::home_dir()
+            .map(|h| h.to_string_lossy().to_string())
+            .unwrap_or_default();
         assert!(!home.is_empty() || !err.message.contains(&home));
 
         let _ = fs::remove_dir_all(&dir);
@@ -1431,7 +1522,11 @@ mod tests {
         fs::create_dir_all(dir.join("只有一层空目录")).unwrap();
         assert_eq!(dir_size(&dir), (0, 0), "只有空子目录时也该报 0/0");
         write_files(&dir, 2, 7);
-        assert_eq!(dir_size(&dir), (14, 2), "夹具本身不对，后面的断言就没有意义");
+        assert_eq!(
+            dir_size(&dir),
+            (14, 2),
+            "夹具本身不对，后面的断言就没有意义"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1447,7 +1542,10 @@ mod tests {
             "/".to_string(),
         ];
         for declared in &traversals {
-            assert!(approved_cleanup_root(declared).is_none(), "{declared} 被当成了合法清理目标");
+            assert!(
+                approved_cleanup_root(declared).is_none(),
+                "{declared} 被当成了合法清理目标"
+            );
         }
         let result = cleanup_declared(&traversals);
         assert_eq!(result.deleted_files, 0, "{result:?}");

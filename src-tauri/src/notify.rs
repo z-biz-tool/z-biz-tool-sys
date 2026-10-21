@@ -174,8 +174,7 @@ pub fn post<R: tauri::Runtime>(
 /// 只读 getter ⇒ **capabilities 一条都不用加**（与投递走 Rust API 同一个理由）。
 /// 报错或取不到窗口时一律按"不在全屏"处理：宁可多弹一条横幅，也不静默吞掉一次告警。
 pub fn in_presentation<R: tauri::Runtime>(app: &AppHandle<R>) -> bool {
-    app
-        .get_webview_window("main")
+    app.get_webview_window("main")
         .and_then(|window| window.is_fullscreen().ok())
         .unwrap_or(false)
 }
@@ -237,9 +236,16 @@ mod tests {
                 "前端 Toast 模板里找不到 {piece:?}，两条通道的句子已经分岔"
             );
         }
-        let (title, body) = alert_texts(&event(AlertMetric::Disk, AlertLevel::Critical, Some("/Volumes/Data")));
+        let (title, body) = alert_texts(&event(
+            AlertMetric::Disk,
+            AlertLevel::Critical,
+            Some("/Volumes/Data"),
+        ));
         assert_eq!(title, "资源告警 · 严重");
-        assert_eq!(body, "磁盘使用率（/Volumes/Data） 连续 3 帧越过严重阈值：98.7 % ≥ 95 %");
+        assert_eq!(
+            body,
+            "磁盘使用率（/Volumes/Data） 连续 3 帧越过严重阈值：98.7 % ≥ 95 %"
+        );
     }
 
     /// 三个指标、两个档位都得有自己的词，不许出现"两个档位都叫警告"这种含糊。
@@ -260,7 +266,10 @@ mod tests {
         .collect();
         assert_eq!(bodies.len(), 3);
         let critical = alert_texts(&event(AlertMetric::Cpu, AlertLevel::Critical, None)).1;
-        assert!(critical.contains("严重阈值") && !critical.contains("警告阈值"), "{critical}");
+        assert!(
+            critical.contains("严重阈值") && !critical.contains("警告阈值"),
+            "{critical}"
+        );
     }
 
     /// 没有目标的告警不能凭空多出一对括号（那会被读成"目标是空字符串"）。
@@ -278,9 +287,16 @@ mod tests {
             return;
         };
         let target = format!("{home}/Volumes/外置盘");
-        let (_, body) = alert_texts(&event(AlertMetric::Disk, AlertLevel::Critical, Some(&target)));
+        let (_, body) = alert_texts(&event(
+            AlertMetric::Disk,
+            AlertLevel::Critical,
+            Some(&target),
+        ));
         assert!(!body.contains(&home), "家目录整条漏进通知正文：{body}");
-        assert!(body.contains("<user>"), "脱敏后的挂载点应带 <user> 标记：{body}");
+        assert!(
+            body.contains("<user>"),
+            "脱敏后的挂载点应带 <user> 标记：{body}"
+        );
     }
 
     /// 数值精度也是口径的一部分：正文保留一位小数、阈值取整数档，与前端 `toFixed(1)/toFixed(0)` 对齐。
@@ -290,7 +306,10 @@ mod tests {
     fn the_numbers_keep_the_same_precision_as_the_toast() {
         let (_, body) = alert_texts(&event(AlertMetric::Memory, AlertLevel::Warning, None));
         assert!(body.contains("98.7 % ≥ 95 %"), "{body}");
-        assert!(!body.contains("98.65"), "正文里出现了未取整的原始值：{body}");
+        assert!(
+            !body.contains("98.65"),
+            "正文里出现了未取整的原始值：{body}"
+        );
     }
 
     /// 记账只有"提交/失败"，而且失败必须留着原文，否则用户无从分辨"没告警"与"通知没通路"。
@@ -302,7 +321,10 @@ mod tests {
         let status = state.status();
         assert_eq!(status.submitted, 2, "两次调用都该记成已提交");
         assert_eq!(status.failed, 1);
-        assert_eq!(status.last_error.as_deref(), Some("通知后端拒绝：not authorized"));
+        assert_eq!(
+            status.last_error.as_deref(),
+            Some("通知后端拒绝：not authorized")
+        );
     }
 
     /// 从没失败过时 `lastError` 是 `None`：界面要显示"没有失败记录"，不许当成"全都送达"。
@@ -325,7 +347,10 @@ mod tests {
     fn macos_may_not_claim_that_it_knows_the_delivery_result() {
         let status = NotifyStatus::default();
         if cfg!(target_os = "macos") {
-            assert!(!status.delivery_is_reported, "macOS 上这条是谎话：投递结果拿不到");
+            assert!(
+                !status.delivery_is_reported,
+                "macOS 上这条是谎话：投递结果拿不到"
+            );
         }
     }
 
@@ -355,7 +380,10 @@ mod tests {
             lib_rs.contains("tauri_plugin_notification::init()"),
             "插件没注册，app.notification() 会 panic"
         );
-        assert!(lib_rs.contains("commands::notify_status"), "notify_status 没注册");
+        assert!(
+            lib_rs.contains("commands::notify_status"),
+            "notify_status 没注册"
+        );
         let monitor_rs = std::fs::read_to_string(manifest.join("src/monitor.rs")).unwrap();
         assert_eq!(
             monitor_rs.matches("notify::post_alert(").count(),
@@ -404,10 +432,7 @@ mod tests {
             !perms.iter().any(|p| p.contains("notification")),
             "系统通知走的是后端 Rust API；出现 notification 权限说明有人改走了 JS 通道"
         );
-        assert!(
-            !raw.contains('*'),
-            "权限清单里不许出现通配项"
-        );
+        assert!(!raw.contains('*'), "权限清单里不许出现通配项");
     }
 
     /// 测试通知不许接任何参数：否则它就成了一条"前端可指定任意文本进系统通知"的通道。
@@ -435,7 +460,10 @@ mod tests {
             );
         }
         let (title, body) = test_texts();
-        assert!(title.contains("测试") && body.contains("不含任何采集数据"), "{title} / {body}");
+        assert!(
+            title.contains("测试") && body.contains("不含任何采集数据"),
+            "{title} / {body}"
+        );
     }
 
     /// 记账载荷的字段名必须与前端 `interface NotifyStatus` 逐一对齐。
@@ -467,7 +495,9 @@ mod tests {
         use crate::contract_fixtures::strip_ts_comments;
 
         let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let raw = std::fs::read_to_string(manifest.join("../src/components/AlertSettingsDrawer.tsx")).unwrap();
+        let raw =
+            std::fs::read_to_string(manifest.join("../src/components/AlertSettingsDrawer.tsx"))
+                .unwrap();
         let visible = strip_ts_comments(&raw);
         for forbidden in ["已送达", "已授权", "通知成功"] {
             assert!(
@@ -509,7 +539,8 @@ mod tests {
     fn no_frontend_path_builds_its_own_alert_notice() {
         let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let drawer =
-            std::fs::read_to_string(manifest.join("../src/components/AlertSettingsDrawer.tsx")).unwrap();
+            std::fs::read_to_string(manifest.join("../src/components/AlertSettingsDrawer.tsx"))
+                .unwrap();
         assert!(
             !drawer.contains("new Notification") && !drawer.contains("plugin-notification"),
             "前端不许再开一条通知通路：那样会有第二个「要不要通知」的判断"
@@ -531,7 +562,10 @@ mod tests {
         state.record(&Err("通知中心拒收".to_string()));
         let status = state.status();
         assert_eq!(status.suppressed, 2, "{status:?}");
-        assert_eq!(status.submitted, 2, "静默的那两条不该算进已提交：{status:?}");
+        assert_eq!(
+            status.submitted, 2,
+            "静默的那两条不该算进已提交：{status:?}"
+        );
         assert_eq!(status.failed, 1, "{status:?}");
         assert_eq!(status.last_error.as_deref(), Some("通知中心拒收"));
     }
@@ -562,7 +596,8 @@ mod tests {
             "取不到状态时必须按不静默处理（宁可多弹一条，也不静默吞掉告警）"
         );
         let drawer =
-            std::fs::read_to_string(manifest.join("../src/components/AlertSettingsDrawer.tsx")).unwrap();
+            std::fs::read_to_string(manifest.join("../src/components/AlertSettingsDrawer.tsx"))
+                .unwrap();
         use crate::contract_fixtures::strip_ts_comments;
         let visible = strip_ts_comments(&drawer);
         assert!(

@@ -47,7 +47,12 @@ const PROTECTED_NAMES: &[&str] = &[
 
 /// 结束这些进程会立刻中断用户图形会话，要求逐字输入进程名确认。
 const CRITICAL_NAMES: &[&str] = &[
-    "Finder", "Dock", "ControlCenter", "WindowServer", "explorer.exe", "dwm.exe",
+    "Finder",
+    "Dock",
+    "ControlCenter",
+    "WindowServer",
+    "explorer.exe",
+    "dwm.exe",
 ];
 
 /// PID 不超过该值视为系统进程，禁止结束。
@@ -383,13 +388,26 @@ mod tests {
         // 名单本身是**按平台**分的（Windows 侧没有 launchd），所以"大小写不敏感"这件事
         // 拿本平台必然在册的第一项当探针，而不是把某个平台的名字当成全平台事实。
         let probe = PROTECTED_NAMES[0];
-        assert!(is_protected(&probe.to_uppercase()), "{probe} 的大写形式必须同样命中");
-        assert!(is_protected(&probe.to_lowercase()), "{probe} 的小写形式必须同样命中");
+        assert!(
+            is_protected(&probe.to_uppercase()),
+            "{probe} 的大写形式必须同样命中"
+        );
+        assert!(
+            is_protected(&probe.to_lowercase()),
+            "{probe} 的小写形式必须同样命中"
+        );
         #[cfg(not(windows))]
         assert!(is_protected("LAUNCHD"));
         assert!(is_critical("Finder"));
         assert!(!is_critical("Safari"));
-        assert_eq!(PROTECTED_NAMES.len(), std::collections::HashSet::<_>::from_iter(PROTECTED_NAMES.iter().map(|s| s.to_lowercase())).len(), "protected list has duplicates");
+        assert_eq!(
+            PROTECTED_NAMES.len(),
+            std::collections::HashSet::<_>::from_iter(
+                PROTECTED_NAMES.iter().map(|s| s.to_lowercase())
+            )
+            .len(),
+            "protected list has duplicates"
+        );
     }
 
     #[tokio::test]
@@ -405,8 +423,14 @@ mod tests {
     fn ut03_every_protected_name_on_this_platform_is_blocked() {
         for name in PROTECTED_NAMES {
             assert!(is_protected(name), "名单里的 {name} 没被拦住");
-            assert!(is_protected(&name.to_uppercase()), "{name} 的大写形式没被拦住");
-            assert!(is_protected(&name.to_lowercase()), "{name} 的小写形式没被拦住");
+            assert!(
+                is_protected(&name.to_uppercase()),
+                "{name} 的大写形式没被拦住"
+            );
+            assert!(
+                is_protected(&name.to_lowercase()),
+                "{name} 的小写形式没被拦住"
+            );
         }
         if cfg!(not(windows)) {
             // 规划点名的四个里，`systemd` 在**非 Windows 这一份共用名单**里（macOS 腿也在跑它），
@@ -414,7 +438,10 @@ mod tests {
             for name in ["launchd", "kernel_task", "WindowServer", "systemd"] {
                 assert!(is_protected(name), "规划点名的 {name} 不在名单里");
             }
-            assert!(!is_protected("csrss.exe"), "Windows 名单漏进了非 Windows 平台");
+            assert!(
+                !is_protected("csrss.exe"),
+                "Windows 名单漏进了非 Windows 平台"
+            );
         }
         assert!(!is_protected("TextEditor"), "普通应用名不该进保护名单");
     }
@@ -429,7 +456,11 @@ mod tests {
             .expect("需要一个真的子进程来验放行分支");
         let pid = child.id();
         let verdict = validate_kill(pid).expect("普通进程应当可读元信息");
-        assert!(verdict.allowed, "普通用户进程被拒了：{:?}", verdict.denied_reason);
+        assert!(
+            verdict.allowed,
+            "普通用户进程被拒了：{:?}",
+            verdict.denied_reason
+        );
         // 映像名按平台原样上报：同一个 `sleep` 在 Windows 上的真身是 `sleep.exe`。
         // 这条断言钉的是"名称取自内核给的映像名、没被截断或改写"，不是"名字必须等于命令名"。
         assert_eq!(
@@ -437,7 +468,11 @@ mod tests {
             format!("sleep{}", std::env::consts::EXE_SUFFIX),
             "进程名要就是本平台这个可执行文件的映像名"
         );
-        assert_eq!(verdict.risk_level, KillRiskLevel::Standard, "sleep 不该被判成关键进程");
+        assert_eq!(
+            verdict.risk_level,
+            KillRiskLevel::Standard,
+            "sleep 不该被判成关键进程"
+        );
         drop(child);
     }
 }

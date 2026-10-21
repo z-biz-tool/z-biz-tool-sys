@@ -187,7 +187,11 @@ impl AlertEngine {
         self.states.clear();
     }
 
-    pub fn evaluate(&mut self, snapshot: &MetricsSnapshot, config: &AlertConfig) -> Vec<AlertEvent> {
+    pub fn evaluate(
+        &mut self,
+        snapshot: &MetricsSnapshot,
+        config: &AlertConfig,
+    ) -> Vec<AlertEvent> {
         if !config.enabled {
             // 静默期间连计数也不攒：否则关掉再打开会把静默期的旧状态当成"已连续越限"立刻弹出。
             self.reset();
@@ -213,7 +217,8 @@ impl AlertEngine {
         for (metric, target, value) in observations {
             let key = (metric, target.clone());
             seen.push(key.clone());
-            if let Some(event) = self.observe(metric, target, value, &config, snapshot.timestamp_ms) {
+            if let Some(event) = self.observe(metric, target, value, &config, snapshot.timestamp_ms)
+            {
                 events.push(event);
             }
         }
@@ -252,9 +257,17 @@ impl AlertEngine {
         }
 
         let (level, threshold, streak) = if state.critical_streak >= consecutive {
-            (AlertLevel::Critical, thresholds.critical, state.critical_streak)
+            (
+                AlertLevel::Critical,
+                thresholds.critical,
+                state.critical_streak,
+            )
         } else if state.warning_streak >= consecutive {
-            (AlertLevel::Warning, thresholds.warning, state.warning_streak)
+            (
+                AlertLevel::Warning,
+                thresholds.warning,
+                state.warning_streak,
+            )
         } else {
             return None;
         };

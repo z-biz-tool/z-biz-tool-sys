@@ -55,16 +55,8 @@ impl HistoryPoint {
             t: snapshot.timestamp_ms,
             cpu: snapshot.cpu.total,
             memory: snapshot.memory.usage_percent,
-            rx_bytes_per_sec: snapshot
-                .networks
-                .iter()
-                .map(|n| n.rx_bytes_per_sec)
-                .sum(),
-            tx_bytes_per_sec: snapshot
-                .networks
-                .iter()
-                .map(|n| n.tx_bytes_per_sec)
-                .sum(),
+            rx_bytes_per_sec: snapshot.networks.iter().map(|n| n.rx_bytes_per_sec).sum(),
+            tx_bytes_per_sec: snapshot.networks.iter().map(|n| n.tx_bytes_per_sec).sum(),
         }
     }
 }
@@ -146,7 +138,10 @@ impl<T: Serialize + DeserializeOwned> Jsonl<T> {
 
     pub fn append(&self, record: &T) -> std::io::Result<()> {
         self.ensure_parent()?;
-        let mut file = OpenOptions::new().create(true).append(true).open(&self.path)?;
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)?;
         let line = serde_json::to_string(record)
             .map_err(|e| std::io::Error::other(format!("序列化失败: {e}")))?;
         writeln!(file, "{line}")
@@ -291,7 +286,10 @@ impl HistoryRecorder {
         if let Some(err) = &read.io_error {
             // 整个文件打不开时 `points` 是空的，照常修剪等于用空集合覆盖历史文件 ——
             // 那会把"暂时读不到"变成"永久没了"。宁可这一轮不修剪。
-            eprintln!("[history] 读取失败，跳过修剪: {}", sanitize(&err.to_string()));
+            eprintln!(
+                "[history] 读取失败，跳过修剪: {}",
+                sanitize(&err.to_string())
+            );
             return 0;
         }
         let total = read.points.len();
@@ -357,7 +355,11 @@ pub fn query(store: &HistoryStore, now_ms: u64, span_secs: u64) -> HistoryPage {
 }
 
 /// 按固定宽度分段取均值，时间戳取该段最后一帧 —— 与前端的 `downsampleHistory` 同一约定。
-fn average_into_buckets(points: &[HistoryPoint], from_ms: u64, bucket_ms: u64) -> Vec<HistoryPoint> {
+fn average_into_buckets(
+    points: &[HistoryPoint],
+    from_ms: u64,
+    bucket_ms: u64,
+) -> Vec<HistoryPoint> {
     let mut out: Vec<HistoryPoint> = Vec::new();
     let mut bucket_index = u64::MAX;
     let mut group: Vec<HistoryPoint> = Vec::new();
@@ -553,9 +555,7 @@ impl AlertRecorder {
         };
         match self.last_prune_ms {
             // 检查节奏不比保留窗口更粗：否则注入的短保留期测试永远等不到第二次检查
-            Some(last) => {
-                now.saturating_sub(last) >= self.check_every_ms.min(self.retention_ms)
-            }
+            Some(last) => now.saturating_sub(last) >= self.check_every_ms.min(self.retention_ms),
             None => true,
         }
     }
@@ -639,10 +639,7 @@ pub fn alert_store_for(app: &tauri::AppHandle) -> Option<AlertStore> {
     let dir = match app.path().app_data_dir() {
         Ok(dir) => dir.join(ALERT_DIR_NAME),
         Err(e) => {
-            eprintln!(
-                "[alert] 无法解析应用数据目录: {}",
-                sanitize(&e.to_string())
-            );
+            eprintln!("[alert] 无法解析应用数据目录: {}", sanitize(&e.to_string()));
             return None;
         }
     };
@@ -667,12 +664,19 @@ pub fn store_for(app: &tauri::AppHandle) -> Option<HistoryStore> {
     let dir = match app.path().app_data_dir() {
         Ok(dir) => dir.join(HISTORY_DIR_NAME),
         Err(e) => {
-            eprintln!("[history] 无法解析应用数据目录: {}", sanitize(&e.to_string()));
+            eprintln!(
+                "[history] 无法解析应用数据目录: {}",
+                sanitize(&e.to_string())
+            );
             return None;
         }
     };
     if let Err(e) = fs::create_dir_all(&dir) {
-        eprintln!("[history] 创建 {} 失败: {}", sanitize(&dir.display().to_string()), sanitize(&e.to_string()));
+        eprintln!(
+            "[history] 创建 {} 失败: {}",
+            sanitize(&dir.display().to_string()),
+            sanitize(&e.to_string())
+        );
         return None;
     }
     Some(HistoryStore::new(dir))
@@ -693,12 +697,8 @@ mod tests {
 
     fn fixture(tag: &str) -> PathBuf {
         let n = SEQ.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "zsys-hist-{}-{}-{}",
-            std::process::id(),
-            tag,
-            n
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("zsys-hist-{}-{}-{}", std::process::id(), tag, n));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
@@ -735,7 +735,10 @@ mod tests {
             "差 1 ms 到 10 s 仍不该写"
         );
         assert!(recorder.observe(point(base + 10_000, 40.0)), "整 10 s 应写");
-        assert!(recorder.observe(point(base + 25_000, 50.0)), "超过 10 s 应写");
+        assert!(
+            recorder.observe(point(base + 25_000, 50.0)),
+            "超过 10 s 应写"
+        );
 
         let read = store.read_all();
         let ts: Vec<u64> = read.points.iter().map(|p| p.t).collect();
@@ -751,7 +754,9 @@ mod tests {
         let store = HistoryStore::new(&dir);
         let base = 1_700_000_000_000;
         for i in 0..5 {
-            store.append(point(base + i * SAMPLE_INTERVAL_MS, i as f64)).unwrap();
+            store
+                .append(point(base + i * SAMPLE_INTERVAL_MS, i as f64))
+                .unwrap();
         }
         // 未过期时不得重写文件：一次写入触发一次全量重写是纯粹的浪费
         let mut recorder = HistoryRecorder::open(store.clone());
@@ -764,10 +769,7 @@ mod tests {
 
         let way_past = base + RETENTION_MS + 1;
         assert!(recorder.observe(point(way_past, 9.0)), "新点应落盘");
-        assert!(
-            recorder.pruned_points > 0,
-            "超过 7 天的点必须被剪掉"
-        );
+        assert!(recorder.pruned_points > 0, "超过 7 天的点必须被剪掉");
 
         let read = store.read_all();
         assert!(
@@ -834,7 +836,11 @@ mod tests {
     #[test]
     fn a_missing_file_is_an_empty_page_not_zero_filled_series() {
         let dir = fixture("empty");
-        let page = query(&HistoryStore::new(dir.join("nope")), 1_700_000_000_000, 3600);
+        let page = query(
+            &HistoryStore::new(dir.join("nope")),
+            1_700_000_000_000,
+            3600,
+        );
         assert!(page.points.is_empty());
         assert_eq!(page.stored_points, 0);
         assert_eq!(page.oldest_ms, None);
@@ -851,7 +857,9 @@ mod tests {
         let base = 1_700_000_000_000;
         // 只有最近 10 分钟数据
         for i in 0..60 {
-            store.append(point(base + i * SAMPLE_INTERVAL_MS, i as f64)).unwrap();
+            store
+                .append(point(base + i * SAMPLE_INTERVAL_MS, i as f64))
+                .unwrap();
         }
         let now = base + 59 * SAMPLE_INTERVAL_MS;
 
@@ -864,7 +872,10 @@ mod tests {
         let hour = query(&store, now, 3600);
         assert_eq!(hour.stored_points, 60);
         assert_eq!(hour.oldest_ms, Some(base), "oldestMs 要能暴露真实起点");
-        assert_eq!(hour.bucket_seconds, 10, "点数未超上限时保持原始 10 s 分辨率");
+        assert_eq!(
+            hour.bucket_seconds, 10,
+            "点数未超上限时保持原始 10 s 分辨率"
+        );
         assert_eq!(hour.points.len(), 60);
         cleanup(&dir);
     }
@@ -878,7 +889,10 @@ mod tests {
         const TOTAL: usize = 3000;
         for i in 0..TOTAL {
             store
-                .append(point(base + i as u64 * SAMPLE_INTERVAL_MS, (i % 100) as f64))
+                .append(point(
+                    base + i as u64 * SAMPLE_INTERVAL_MS,
+                    (i % 100) as f64,
+                ))
                 .unwrap();
         }
         let now = base + (TOTAL as u64 - 1) * SAMPLE_INTERVAL_MS;
@@ -926,7 +940,11 @@ mod tests {
         assert_eq!(sparse.stored_points, 60);
         assert_eq!(sparse.bucket_seconds, SAMPLE_INTERVAL_MS / 1000);
         assert_eq!(sparse.points.len(), 60);
-        assert_eq!(sparse.oldest_ms, Some(base), "oldestMs 应是文件里真正的最早点");
+        assert_eq!(
+            sparse.oldest_ms,
+            Some(base),
+            "oldestMs 应是文件里真正的最早点"
+        );
         assert!(
             sparse.newest_ms.unwrap() < now,
             "newestMs 应暴露'数据其实没覆盖到 now'，让调用方自己判断缺口"
@@ -1069,7 +1087,10 @@ mod tests {
             .iter()
             .find(|e| e.metric == AlertMetric::Disk)
             .unwrap();
-        assert_eq!((disk.value, disk.threshold, disk.consecutive), (98.72, 95.0, 3));
+        assert_eq!(
+            (disk.value, disk.threshold, disk.consecutive),
+            (98.72, 95.0, 3)
+        );
         assert_eq!(disk.level, AlertLevel::Critical);
         assert_eq!(
             disk.target.as_deref(),
@@ -1077,7 +1098,11 @@ mod tests {
             "普通挂载点不该被改写"
         );
         assert_eq!(
-            page.events.iter().find(|e| e.metric == AlertMetric::Cpu).unwrap().target,
+            page.events
+                .iter()
+                .find(|e| e.metric == AlertMetric::Cpu)
+                .unwrap()
+                .target,
             None,
             "CPU 告警没有挂载点，读回来也不该冒出一个空串"
         );
@@ -1092,7 +1117,13 @@ mod tests {
         let store = AlertStore::new(&dir);
         let mut recorder = AlertRecorder::open(store.clone());
         let base = 1_700_000_000_000;
-        assert!(recorder.record(&event(base + 30_000, AlertMetric::Cpu, AlertLevel::Warning, 91.0, None)));
+        assert!(recorder.record(&event(
+            base + 30_000,
+            AlertMetric::Cpu,
+            AlertLevel::Warning,
+            91.0,
+            None
+        )));
         // 时钟回调 1 小时后的帧
         assert!(
             recorder.record(&event(
@@ -1108,7 +1139,9 @@ mod tests {
         let page = query_alerts(&store, base + 60_000, 7200);
         assert_eq!(page.events.len(), 2);
         assert!(
-            page.events.windows(2).all(|w| w[0].timestamp_ms >= w[1].timestamp_ms),
+            page.events
+                .windows(2)
+                .all(|w| w[0].timestamp_ms >= w[1].timestamp_ms),
             "查询要按时间戳重排，不能信任追加顺序"
         );
         assert_eq!(page.newest_ms, Some(base + 30_000));
@@ -1117,7 +1150,10 @@ mod tests {
         // 窗口收窄时那条"更旧"的记录只是不在窗口里，不是被丢了：两个数必须分得开
         let narrow = query_alerts(&store, base + 60_000, 3600);
         assert_eq!(narrow.stored_events, 1);
-        assert_eq!(narrow.total_events, 2, "文件里现存两条，不能因为窗口窄就说成一条");
+        assert_eq!(
+            narrow.total_events, 2,
+            "文件里现存两条，不能因为窗口窄就说成一条"
+        );
         // 修剪基准取"见过的最新一帧"，那条更旧的近期记录不该被当成过期剪掉
         assert_eq!(store.read().records.len(), 2);
         cleanup(&dir);
@@ -1129,15 +1165,31 @@ mod tests {
         let store = AlertStore::new(&dir);
         let raw = "/Users/tester/MyPassport";
         let base = 1_700_000_000_000;
-        let original = event(base, AlertMetric::Disk, AlertLevel::Warning, 92.0, Some(raw));
+        let original = event(
+            base,
+            AlertMetric::Disk,
+            AlertLevel::Warning,
+            92.0,
+            Some(raw),
+        );
         assert!(AlertRecorder::open(store.clone()).record(&original));
         // 落盘那份过 sanitize（文件会长期留在磁盘上），推给界面的那份保持原样
         let on_disk = fs::read_to_string(dir.join(ALERT_FILE_NAME)).unwrap();
-        assert!(on_disk.contains("/Users/<user>/MyPassport"), "实际内容: {on_disk}");
+        assert!(
+            on_disk.contains("/Users/<user>/MyPassport"),
+            "实际内容: {on_disk}"
+        );
         assert!(!on_disk.contains("tester"), "用户名不得进文件");
-        assert_eq!(original.target.as_deref(), Some(raw), "内存里的事件不该被改写");
+        assert_eq!(
+            original.target.as_deref(),
+            Some(raw),
+            "内存里的事件不该被改写"
+        );
         let page = query_alerts(&store, base, 3600);
-        assert_eq!(page.events[0].target.as_deref(), Some("/Users/<user>/MyPassport"));
+        assert_eq!(
+            page.events[0].target.as_deref(),
+            Some("/Users/<user>/MyPassport")
+        );
         cleanup(&dir);
     }
 
@@ -1156,10 +1208,7 @@ mod tests {
                 None
             )));
         }
-        assert!(
-            recorder.pruned_records > 0,
-            "超过条数上限必须剪"
-        );
+        assert!(recorder.pruned_records > 0, "超过条数上限必须剪");
         let read = store.read();
         assert!(
             read.records.len() <= 15,
@@ -1187,7 +1236,13 @@ mod tests {
         let store = AlertStore::new(&dir);
         let base = 1_700_000_000_000;
         store
-            .append(&event(base, AlertMetric::Cpu, AlertLevel::Critical, 99.0, None))
+            .append(&event(
+                base,
+                AlertMetric::Cpu,
+                AlertLevel::Critical,
+                99.0,
+                None,
+            ))
             .unwrap();
         let mut recorder = AlertRecorder::with_limits(store.clone(), 60_000, 100, 90, 1);
         // 10 分钟后的一条：上一条已超出 60 s 的保留窗口
@@ -1211,7 +1266,13 @@ mod tests {
         let store = AlertStore::new(&dir);
         let base = 1_700_000_000_000;
         store
-            .append(&event(base, AlertMetric::Cpu, AlertLevel::Warning, 90.0, None))
+            .append(&event(
+                base,
+                AlertMetric::Cpu,
+                AlertLevel::Warning,
+                90.0,
+                None,
+            ))
             .unwrap();
         {
             // 模拟进程被强杀时只剩半行的尾部
@@ -1223,7 +1284,13 @@ mod tests {
             f.write_all(b"\n").unwrap();
         }
         store
-            .append(&event(base + 5_000, AlertMetric::Disk, AlertLevel::Critical, 99.0, None))
+            .append(&event(
+                base + 5_000,
+                AlertMetric::Disk,
+                AlertLevel::Critical,
+                99.0,
+                None,
+            ))
             .unwrap();
         let page = query_alerts(&store, base + 5_000, 3600);
         assert_eq!(page.events.len(), 2, "坏行前后的完整记录仍要读出来");
@@ -1252,7 +1319,13 @@ mod tests {
         let store = AlertStore::new(&dir);
         let base = 1_700_000_000_000;
         store
-            .append(&event(base, AlertMetric::Cpu, AlertLevel::Warning, 90.0, None))
+            .append(&event(
+                base,
+                AlertMetric::Cpu,
+                AlertLevel::Warning,
+                90.0,
+                None,
+            ))
             .unwrap();
         let huge = query_alerts(&store, base, MAX_ALERT_SPAN_SECS * 4);
         assert_eq!(huge.span_seconds, MAX_ALERT_SPAN_SECS, "跨度应夹到保留窗口");
@@ -1381,9 +1454,10 @@ mod tests {
             let guard = body
                 .find("if let Some(err) = &read.io_error")
                 .unwrap_or_else(|| panic!("{fn_name} 里读失败不再跳过修剪了"));
-            let ret = guard + body[guard..]
-                .find("return 0")
-                .unwrap_or_else(|| panic!("{fn_name} 的 io_error 守卫没有退出：读失败时会拿空集合去修剪"));
+            let ret = guard
+                + body[guard..].find("return 0").unwrap_or_else(|| {
+                    panic!("{fn_name} 的 io_error 守卫没有退出：读失败时会拿空集合去修剪")
+                });
             if let Some(rewrite) = body.find(".rewrite(") {
                 assert!(
                     ret < rewrite,
@@ -1456,8 +1530,7 @@ mod tests {
 
         assert_eq!(dropped, 0);
         assert_eq!(
-            recorder.on_disk,
-            3,
+            recorder.on_disk, 3,
             "读不出来时把计数当 0，之后触顶判断会以为文件还早着呢"
         );
         assert_eq!(store.read().records.len(), 3);
@@ -1480,9 +1553,17 @@ mod tests {
 
         // ① 生产形态：同一个线程按顺序写两份文件
         for i in 0..120u64 {
-            history.append(point(base + i * SAMPLE_INTERVAL_MS, 33.0)).unwrap();
+            history
+                .append(point(base + i * SAMPLE_INTERVAL_MS, 33.0))
+                .unwrap();
             alerts
-                .append(&event(base + i * 1_000, AlertMetric::Memory, AlertLevel::Warning, 91.0, None))
+                .append(&event(
+                    base + i * 1_000,
+                    AlertMetric::Memory,
+                    AlertLevel::Warning,
+                    91.0,
+                    None,
+                ))
                 .unwrap();
         }
         let serial_history = history.read_all();
@@ -1504,7 +1585,13 @@ mod tests {
                         let at = base + 10_000_000 + (t * PER_THREAD + i) as u64 * 1_000;
                         history.append(point(at, t as f64 + 1.0)).unwrap();
                         alerts
-                            .append(&event(at, AlertMetric::Cpu, AlertLevel::Critical, 99.0, None))
+                            .append(&event(
+                                at,
+                                AlertMetric::Cpu,
+                                AlertLevel::Critical,
+                                99.0,
+                                None,
+                            ))
                             .unwrap();
                     }
                 })
@@ -1545,8 +1632,15 @@ mod tests {
         );
 
         let alerts_accounted = after_alerts.records.len() + after_alerts.unreadable_lines;
-        assert!(alerts_accounted <= 120 + written, "告警侧同理：{alerts_accounted}");
-        let mut alert_stamps: Vec<u64> = after_alerts.records.iter().map(|e| e.timestamp_ms).collect();
+        assert!(
+            alerts_accounted <= 120 + written,
+            "告警侧同理：{alerts_accounted}"
+        );
+        let mut alert_stamps: Vec<u64> = after_alerts
+            .records
+            .iter()
+            .map(|e| e.timestamp_ms)
+            .collect();
         let alerts_before_dedupe = alert_stamps.len();
         alert_stamps.sort_unstable();
         alert_stamps.dedup();
@@ -1572,9 +1666,17 @@ mod tests {
         let alerts = AlertStore::new(&dir);
         let base = 1_700_000_000_000;
         for i in 0..6 {
-            history.append(point(base + i * SAMPLE_INTERVAL_MS, 30.0)).unwrap();
+            history
+                .append(point(base + i * SAMPLE_INTERVAL_MS, 30.0))
+                .unwrap();
             alerts
-                .append(&event(base + i * 1_000, AlertMetric::Cpu, AlertLevel::Critical, 99.0, None))
+                .append(&event(
+                    base + i * 1_000,
+                    AlertMetric::Cpu,
+                    AlertLevel::Critical,
+                    99.0,
+                    None,
+                ))
                 .unwrap();
         }
         let history_path = dir.join(HISTORY_FILE_NAME);
@@ -1603,9 +1705,13 @@ mod tests {
 
         // 反向：修剪告警文件也不得碰历史文件
         let history_before = fs::read(&history_path).unwrap();
-        let mut alert_recorder = AlertRecorder::with_limits(alerts.clone(), ALERT_RETENTION_MS, 3, 2, 0);
+        let mut alert_recorder =
+            AlertRecorder::with_limits(alerts.clone(), ALERT_RETENTION_MS, 3, 2, 0);
         let dropped = alert_recorder.prune_if_needed(base + 10_000);
-        assert!(dropped > 0, "6 条超出上限 3 却没剪掉，这条测试什么都没测到：{dropped}");
+        assert!(
+            dropped > 0,
+            "6 条超出上限 3 却没剪掉，这条测试什么都没测到：{dropped}"
+        );
         assert_eq!(
             fs::read(&history_path).unwrap(),
             history_before,

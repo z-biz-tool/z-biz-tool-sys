@@ -8,9 +8,7 @@ fn home_dir_re() -> &'static Regex {
 
 fn ipv4_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(r"\b(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})\b").unwrap()
-    })
+    RE.get_or_init(|| Regex::new(r"\b(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})\b").unwrap())
 }
 
 fn secret_re() -> &'static Regex {
@@ -24,7 +22,11 @@ fn secret_re() -> &'static Regex {
 /// 返回给前端 / 写入日志的文本先脱敏：错误信息常带完整用户路径、局域网 IP 与凭据。
 pub fn sanitize(input: &str) -> String {
     let step = secret_re().replace_all(input, |c: &regex::Captures| {
-        format!("{}{}***", c.get(1).unwrap().as_str(), c.get(2).unwrap().as_str())
+        format!(
+            "{}{}***",
+            c.get(1).unwrap().as_str(),
+            c.get(2).unwrap().as_str()
+        )
     });
     let step = home_dir_re().replace_all(&step, "$1<user>");
     ipv4_re()
@@ -140,8 +142,14 @@ mod tests {
             }
         }
         const ALLOWED: &[(&str, &str)] = &[
-            ("[monitor] {} 首帧: cpu=", "只有百分比、核心数与分区/网卡条数（{} 是事件名）"),
-            ("[monitor] 采集帧 panic", "原因取自 panic_reason()，那里已经 sanitize 过"),
+            (
+                "[monitor] {} 首帧: cpu=",
+                "只有百分比、核心数与分区/网卡条数（{} 是事件名）",
+            ),
+            (
+                "[monitor] 采集帧 panic",
+                "原因取自 panic_reason()，那里已经 sanitize 过",
+            ),
             ("[monitor] 进程帧 panic", "同上"),
             ("[notify] ", "Err 分支的原文在 map_err 里就 sanitize 过"),
         ];
@@ -149,7 +157,11 @@ mod tests {
         let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let mut files = Vec::new();
         collect(&manifest.join("src"), &mut files);
-        assert!(files.len() > 15, "只找到 {} 个源文件，递归没生效", files.len());
+        assert!(
+            files.len() > 15,
+            "只找到 {} 个源文件，递归没生效",
+            files.len()
+        );
 
         let mut checked = 0usize;
         let mut offenders = Vec::new();
@@ -182,6 +194,9 @@ mod tests {
             }
         }
         assert!(checked >= 8, "只扫到 {checked} 条日志，扫描逻辑可能失效");
-        assert!(offenders.is_empty(), "这些日志点既没脱敏也不在白名单里：{offenders:?}");
+        assert!(
+            offenders.is_empty(),
+            "这些日志点既没脱敏也不在白名单里：{offenders:?}"
+        );
     }
 }

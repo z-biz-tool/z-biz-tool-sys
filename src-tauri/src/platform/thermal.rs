@@ -287,7 +287,8 @@ fn discover_thermal_zones(dir: &Path) -> Vec<Located> {
     for zone in sub_dirs(dir) {
         let name = file_name(&zone);
         let ordinal = dir_ordinal(&name);
-        let Some(value) = read_node(&zone.join("temp")).and_then(|raw| scaled_reading(&raw, SensorKind::Temperature))
+        let Some(value) = read_node(&zone.join("temp"))
+            .and_then(|raw| scaled_reading(&raw, SensorKind::Temperature))
         else {
             continue;
         };
@@ -362,7 +363,10 @@ fn sub_dirs(dir: &Path) -> Vec<PathBuf> {
 }
 
 fn sub_files(dir: &Path) -> Vec<PathBuf> {
-    entries_of(dir).into_iter().filter(|p| p.is_file()).collect()
+    entries_of(dir)
+        .into_iter()
+        .filter(|p| p.is_file())
+        .collect()
 }
 
 #[cfg(test)]
@@ -450,14 +454,21 @@ mod tests {
         assert!(report.reason.is_none());
 
         let temp = tree.sensor(&report, "CPU0");
-        assert!((temp.value - 52.34).abs() < 1e-9, "毫摄氏度要除以 1000：{}", temp.value);
+        assert!(
+            (temp.value - 52.34).abs() < 1e-9,
+            "毫摄氏度要除以 1000：{}",
+            temp.value
+        );
         assert_eq!(temp.critical, Some(95.0), "传感器自己声明的上限要带出去");
         assert_eq!(temp.kind, SensorKind::Temperature);
         // Windows 上 std 的 read_dir 会把短路径名展成对应的长路径（runner 的 TEMP 环境变量写作
         // `C:\Users\RUNNER~1\...`，目录实际叫 `...\runneradmin\...`），`source` 里 root 那一段的
         // 字面拼写因此由 OS 决定，不是产品能选的。这条断言要钉的是"读的是哪个节点"：
         // 按路径组件比尾部，再单独确认它落在本测试这棵唯一命名的临时树里。
-        let node = Path::new("class").join("hwmon").join("hwmon0").join("temp1_input");
+        let node = Path::new("class")
+            .join("hwmon")
+            .join("hwmon0")
+            .join("temp1_input");
         assert!(
             Path::new(&temp.source).ends_with(&node),
             "读数要指回它真正来自的节点，实际：{}",
@@ -473,7 +484,10 @@ mod tests {
         let fan = tree.sensor(&report, "CPU FAN");
         assert_eq!(fan.value, 2410.0, "风扇已经是 RPM，不能再除 1000");
         assert_eq!(fan.kind, SensorKind::Fan);
-        assert_eq!(fan.critical, None, "`fanN_min` 不是\"临界上限\"，不该塞进同一个字段");
+        assert_eq!(
+            fan.critical, None,
+            "`fanN_min` 不是\"临界上限\"，不该塞进同一个字段"
+        );
     }
 
     /// 芯片没给 `tempN_label` 时退到芯片名 + 槽位号，而不是留空字符串（界面会显示成一行没有名字的数据）。
@@ -506,7 +520,12 @@ mod tests {
         );
 
         let report = probe_at(&tree.root);
-        assert_eq!(report.sensors.len(), 1, "四个坏槽位都不该变成一行：{:?}", report.sensors);
+        assert_eq!(
+            report.sensors.len(),
+            1,
+            "四个坏槽位都不该变成一行：{:?}",
+            report.sensors
+        );
         assert!((report.sensors[0].value - 45.0).abs() < 1e-9);
         assert_eq!(report.sensors[0].label, "coretemp temp5");
     }
@@ -527,15 +546,33 @@ mod tests {
         let report = probe_at(&tree.root);
         let values: Vec<f64> = report.fans().map(|s| s.value).collect();
         assert_eq!(values, vec![0.0, 30_000.0], "{:?}", values);
-        assert_eq!(report.temperatures().count(), 0, "没有温度节点就不该有温度行");
+        assert_eq!(
+            report.temperatures().count(),
+            0,
+            "没有温度节点就不该有温度行"
+        );
     }
 
     /// `read_dir` 的顺序不保证：排两次必须一模一样，且同芯片内按温度→风扇、槽位号升序。
     #[test]
     fn sensor_order_is_stable_even_though_readdir_is_not() {
         let tree = Tree::new("order");
-        tree.hwmon("hwmon10", &[("name", "btt"), ("fan1_input", "800"), ("temp2_input", "40000")]);
-        tree.hwmon("hwmon2", &[("name", "atc"), ("temp10_input", "60000"), ("temp1_input", "50000")]);
+        tree.hwmon(
+            "hwmon10",
+            &[
+                ("name", "btt"),
+                ("fan1_input", "800"),
+                ("temp2_input", "40000"),
+            ],
+        );
+        tree.hwmon(
+            "hwmon2",
+            &[
+                ("name", "atc"),
+                ("temp10_input", "60000"),
+                ("temp1_input", "50000"),
+            ],
+        );
 
         let first = probe_at(&tree.root);
         let second = probe_at(&tree.root);
@@ -553,12 +590,20 @@ mod tests {
     #[test]
     fn thermal_zones_only_fill_in_when_hwmon_has_nothing() {
         let tree = Tree::new("fallback");
-        tree.hwmon("hwmon0", &[("name", "cpu_thermal"), ("temp1_input", "50000")]);
+        tree.hwmon(
+            "hwmon0",
+            &[("name", "cpu_thermal"), ("temp1_input", "50000")],
+        );
         tree.thermal_zone("thermal_zone0", "cpu-thermal", "50000");
         tree.thermal_zone("thermal_zone1", "acpitz", "47000");
 
         let report = probe_at(&tree.root);
-        assert_eq!(report.sensors.len(), 1, "hwmon 有货时不该混进 thermal_zone：{:?}", report.sensors);
+        assert_eq!(
+            report.sensors.len(),
+            1,
+            "hwmon 有货时不该混进 thermal_zone：{:?}",
+            report.sensors
+        );
 
         let only_zones = Tree::new("fallback2");
         only_zones.thermal_zone("thermal_zone0", "x86_pkg_temp", "66500");
@@ -566,7 +611,10 @@ mod tests {
         assert_eq!(zones.sensors.len(), 1);
         assert_eq!(zones.sensors[0].label, "x86_pkg_temp");
         assert!((zones.sensors[0].value - 66.5).abs() < 1e-9);
-        assert_eq!(zones.sensors[0].critical, None, "thermal_zone 不上报自己的上限");
+        assert_eq!(
+            zones.sensors[0].critical, None,
+            "thermal_zone 不上报自己的上限"
+        );
     }
 
     /// 有的驱动导出几十个空槽位，条数要封顶（且封顶是**先排序后截断**，截的是稳定的尾部）。
@@ -577,7 +625,10 @@ mod tests {
         for i in 1..=40 {
             nodes.push((format!("temp{i}_input"), format!("{}", 30_000 + i)));
         }
-        let refs: Vec<(&str, &str)> = nodes.iter().map(|(f, v)| (f.as_str(), v.as_str())).collect();
+        let refs: Vec<(&str, &str)> = nodes
+            .iter()
+            .map(|(f, v)| (f.as_str(), v.as_str()))
+            .collect();
         tree.hwmon("hwmon0", &refs);
 
         let report = probe_at(&tree.root);
@@ -593,13 +644,19 @@ mod tests {
         assert!(report.sensors.is_empty());
         let reason = report.reason.unwrap();
         assert!(reason.contains("没有给出可读"), "{reason}");
-        assert!(reason.contains("/nonexistent-zsys-thermal-root"), "原因里要带上查的是哪个根：{reason}");
+        assert!(
+            reason.contains("/nonexistent-zsys-thermal-root"),
+            "原因里要带上查的是哪个根：{reason}"
+        );
 
         let empty = Tree::new("empty");
         let report = probe_at(&empty.root);
         assert!(report.sensors.is_empty());
         let reason = report.reason.unwrap();
-        assert!(reason.contains("class"), "原因里该说到查过 hwmon/thermal：{reason}");
+        assert!(
+            reason.contains("class"),
+            "原因里该说到查过 hwmon/thermal：{reason}"
+        );
     }
 
     /// 芯片名与 label 来自内核，仍按 04 的口径过一遍脱敏（用户目录名不该从传感器标签里漏出去）。
@@ -624,11 +681,20 @@ mod tests {
     /// `temp1_max`（不是读数）都不能进来 —— 否则电压会被当成温度显示成 °C。
     #[test]
     fn only_temperature_and_fan_slots_are_recognised() {
-        assert_eq!(sensor_slot("temp12_input"), Some((SensorKind::Temperature, 12)));
+        assert_eq!(
+            sensor_slot("temp12_input"),
+            Some((SensorKind::Temperature, 12))
+        );
         assert_eq!(sensor_slot("fan3_input"), Some((SensorKind::Fan, 3)));
         for name in [
-            "temp1_max", "temp1_label", "in0_input", "power1_input", "temp_input", "tempX_input",
-            "temp1_input_hyst", "crit_temp_input",
+            "temp1_max",
+            "temp1_label",
+            "in0_input",
+            "power1_input",
+            "temp_input",
+            "tempX_input",
+            "temp1_input_hyst",
+            "crit_temp_input",
         ] {
             assert_eq!(sensor_slot(name), None, "{name} 不该被认成读数节点");
         }
@@ -648,7 +714,10 @@ mod tests {
     #[test]
     fn the_only_root_free_source_is_linux_sysfs() {
         assert_eq!(root_free_source("linux"), Some(SYSFS_ROOT));
-        assert_eq!(SYSFS_ROOT, "/sys", "root 一旦改动，下面所有 sysfs 路径的说明都要跟着改");
+        assert_eq!(
+            SYSFS_ROOT, "/sys",
+            "root 一旦改动，下面所有 sysfs 路径的说明都要跟着改"
+        );
         for os in ["linux", "macos", "windows", "freebsd"] {
             let reason = unsupported_reason(os);
             assert!(!reason.is_empty(), "{os} 没有原因可给？");
@@ -665,9 +734,14 @@ mod tests {
     #[test]
     fn the_apple_arm_is_keyed_on_the_string_rust_actually_reports() {
         if cfg!(target_os = "macos") {
-            let reason = probe().reason.expect("macOS 没有免提权通路，空报告必须带着原因");
+            let reason = probe()
+                .reason
+                .expect("macOS 没有免提权通路，空报告必须带着原因");
             assert!(reason.contains("SMC"), "macOS 上落到了兜底文案：{reason}");
-            assert!(reason.contains("应用内不执行提权"), "要说清这里不提权：{reason}");
+            assert!(
+                reason.contains("应用内不执行提权"),
+                "要说清这里不提权：{reason}"
+            );
         }
         // 兜底句只该留给 Rust 真会报出的其它系统名
         assert!(unsupported_reason("freebsd").contains("freebsd"));
@@ -682,7 +756,11 @@ mod tests {
             return;
         }
         let report = probe();
-        assert!(report.sensors.is_empty(), "本平台不该有读数：{:?}", report.sensors);
+        assert!(
+            report.sensors.is_empty(),
+            "本平台不该有读数：{:?}",
+            report.sensors
+        );
         assert!(report.reason.is_some());
     }
 
@@ -716,8 +794,19 @@ mod tests {
         assert_eq!(report.fans().count(), 1);
         let temps: Vec<f64> = report.temperatures().map(|s| s.value).collect();
         assert_eq!(temps, vec![40.0, 78.0], "温度榜里不该出现转速：{temps:?}");
-        assert_eq!(report.sensors.iter().filter(|s| s.kind == SensorKind::Fan).count(), 1);
-        assert_eq!(report.sensors.last().unwrap().label, "mix fan1", "同芯片里风扇排在温度之后");
+        assert_eq!(
+            report
+                .sensors
+                .iter()
+                .filter(|s| s.kind == SensorKind::Fan)
+                .count(),
+            1
+        );
+        assert_eq!(
+            report.sensors.last().unwrap().label,
+            "mix fan1",
+            "同芯片里风扇排在温度之后"
+        );
     }
 
     #[test]
@@ -730,14 +819,37 @@ mod tests {
     /// `unknown` 必须是一个显式状态 —— 把"这块传感器没说上限"渲染成绿色就是编数据。
     #[test]
     fn severity_uses_only_the_limit_the_hardware_reports() {
-        assert_eq!(severity_of(SensorKind::Temperature, 96.0, Some(95.0)), SensorSeverity::Critical);
-        assert_eq!(severity_of(SensorKind::Temperature, 95.0, Some(95.0)), SensorSeverity::Critical, "等于上限就是越限");
-        assert_eq!(severity_of(SensorKind::Temperature, 85.0, Some(95.0)), SensorSeverity::Warning);
-        assert_eq!(severity_of(SensorKind::Temperature, 84.9, Some(95.0)), SensorSeverity::Ok);
-        assert_eq!(severity_of(SensorKind::Temperature, 40.0, None), SensorSeverity::Unknown);
+        assert_eq!(
+            severity_of(SensorKind::Temperature, 96.0, Some(95.0)),
+            SensorSeverity::Critical
+        );
+        assert_eq!(
+            severity_of(SensorKind::Temperature, 95.0, Some(95.0)),
+            SensorSeverity::Critical,
+            "等于上限就是越限"
+        );
+        assert_eq!(
+            severity_of(SensorKind::Temperature, 85.0, Some(95.0)),
+            SensorSeverity::Warning
+        );
+        assert_eq!(
+            severity_of(SensorKind::Temperature, 84.9, Some(95.0)),
+            SensorSeverity::Ok
+        );
+        assert_eq!(
+            severity_of(SensorKind::Temperature, 40.0, None),
+            SensorSeverity::Unknown
+        );
         // 风扇没有"上限"，但 0 转是故障
-        assert_eq!(severity_of(SensorKind::Fan, 0.0, None), SensorSeverity::Warning);
-        assert_eq!(severity_of(SensorKind::Fan, 1_200.0, Some(5_000.0)), SensorSeverity::Ok, "风扇不该按上限判");
+        assert_eq!(
+            severity_of(SensorKind::Fan, 0.0, None),
+            SensorSeverity::Warning
+        );
+        assert_eq!(
+            severity_of(SensorKind::Fan, 1_200.0, Some(5_000.0)),
+            SensorSeverity::Ok,
+            "风扇不该按上限判"
+        );
     }
 
     /// 读数与等级必须一起出门（`Sensor::new` 是唯一构造口），且真实采集出来的行也带着等级。
@@ -777,7 +889,10 @@ mod tests {
     fn the_temperature_verdict_lives_in_exactly_one_place() {
         let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let agent_rs = std::fs::read_to_string(manifest.join("src/agent.rs")).unwrap();
-        let agent_production = agent_rs.split("#[cfg(test)]").next().expect("agent.rs 应有测试模块");
+        let agent_production = agent_rs
+            .split("#[cfg(test)]")
+            .next()
+            .expect("agent.rs 应有测试模块");
         assert!(
             agent_production.contains("sensor.severity"),
             "Agent 该读后端算好的等级，而不是自己比大小"
@@ -799,7 +914,9 @@ mod tests {
             "阈值定义该只有一处"
         );
 
-        let tab = std::fs::read_to_string(manifest.join("../src/components/tabs/SystemInfoTab.tsx")).unwrap();
+        let tab =
+            std::fs::read_to_string(manifest.join("../src/components/tabs/SystemInfoTab.tsx"))
+                .unwrap();
         assert!(tab.contains("severity"), "系统信息页要按后端给的等级上色");
         assert!(!tab.contains("HEADROOM"), "界面又算了一遍温度阈值");
     }
@@ -814,11 +931,19 @@ mod tests {
             .split("export function severityText")
             .nth(1)
             .expect("状态文案该集中在 severityText 一个函数里");
-        assert!(wording.contains("停转"), "风扇的 warning 要说停转，不能说偏高");
+        assert!(
+            wording.contains("停转"),
+            "风扇的 warning 要说停转，不能说偏高"
+        );
         assert!(wording.contains(r#"kind === "fan""#), "分岔只看传感器种类");
 
-        let tab = std::fs::read_to_string(manifest.join("../src/components/tabs/SystemInfoTab.tsx")).unwrap();
-        assert!(tab.contains("severityText(sensor)"), "状态列要走 severityText");
+        let tab =
+            std::fs::read_to_string(manifest.join("../src/components/tabs/SystemInfoTab.tsx"))
+                .unwrap();
+        assert!(
+            tab.contains("severityText(sensor)"),
+            "状态列要走 severityText"
+        );
         assert!(
             !tab.contains("SEVERITY_TEXT["),
             "界面不要再自己查表拼文案，否则同一等级会有两套说法"
@@ -863,9 +988,19 @@ mod tests {
 
         let kinds: Vec<String> = [SensorKind::Temperature, SensorKind::Fan]
             .iter()
-            .map(|k| serde_json::to_value(k).unwrap().as_str().unwrap().to_string())
+            .map(|k| {
+                serde_json::to_value(k)
+                    .unwrap()
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
             .collect();
-        assert_eq!(kinds, ["temperature", "fan"], "SensorKind 的序列化值与 TS 联合类型漂移了");
+        assert_eq!(
+            kinds,
+            ["temperature", "fan"],
+            "SensorKind 的序列化值与 TS 联合类型漂移了"
+        );
         assert!(
             contract.contains(r#"export type SensorKind = "temperature" | "fan";"#),
             "前端 SensorKind 的取值集合变了，上面那条断言就得跟着改"
@@ -878,7 +1013,13 @@ mod tests {
             SensorSeverity::Unknown,
         ]
         .iter()
-        .map(|s| serde_json::to_value(s).unwrap().as_str().unwrap().to_string())
+        .map(|s| {
+            serde_json::to_value(s)
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
         .collect();
         assert_eq!(
             severities,
@@ -886,10 +1027,10 @@ mod tests {
             "SensorSeverity 的序列化值与 TS 联合类型漂移了"
         );
         assert!(
-            contract.contains(r#"export type SensorSeverity = "ok" | "warning" | "critical" | "unknown";"#),
+            contract.contains(
+                r#"export type SensorSeverity = "ok" | "warning" | "critical" | "unknown";"#
+            ),
             "前端 SensorSeverity 的取值集合变了"
         );
     }
 }
-
-
