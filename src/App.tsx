@@ -72,6 +72,7 @@ import { ErrorBoundary } from "./components/ErrorBoundary";
 import { KillConfirmModal } from "./components/KillConfirmModal";
 import { MiniMenuBar } from "./components/MiniMenuBar";
 import { PrefsTransferModal } from "./components/PrefsTransferModal";
+import UpdaterGate from "./components/UpdaterDialog";
 import { ProcessDetailDrawer } from "./components/ProcessDetailDrawer";
 import { AgentPanel } from "./agent/AgentPanel";
 import { CleanupTab } from "./components/tabs/CleanupTab";
@@ -1302,6 +1303,9 @@ function App() {
           onNotice={(level, text) => msgApi[level](text)}
         />
       </Layout>
+
+      {/* 自动更新闸门：窗口 ready 后延时检查，有更新才弹窗 */}
+      <UpdaterGate />
     </ConfigProvider>
   );
 }

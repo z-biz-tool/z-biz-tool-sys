@@ -31,6 +31,12 @@ pub fn run() {
         // 通知只从后端 Rust API 投（`notify` 模块头写了为什么不走 JS 通道），
         // 所以 capabilities 不需要加任何 notification 权限项。
         .plugin(tauri_plugin_notification::init())
+        // 自动更新（2026-10-25 接入，方案与 z-biz-tool-file 一致）：启动后由前端
+        // UpdaterDialog 延时调用 check()，endpoint 与 pubkey 见 tauri.conf.json。
+        // pubkey 目前是占位符，CEO 填入真实公钥前 check() 会失败并按设计静默降级。
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        // 更新安装完成后的「立即重启」
+        .plugin(tauri_plugin_process::init())
         .manage(service.clone())
         .manage(alert_config.clone())
         .manage(notify.clone())
