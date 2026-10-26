@@ -1,4 +1,5 @@
-import { Input, Modal, Space, Typography } from "antd";
+import { Input, Modal, Space, Typography, type ButtonProps } from "antd";
+import { useRef } from "react";
 import type { KillValidation } from "../ipc_contract";
 import { formatBytes } from "../lib/format";
 
@@ -24,6 +25,8 @@ export function KillConfirmModal({
   afterClose,
 }: Props) {
   const critical = target?.riskLevel === "critical";
+  // 破坏性操作的默认焦点必须落在"取消"上：回车不会误杀
+  const cancelRef = useRef<HTMLButtonElement>(null);
   return (
     <Modal
       open={!!target}
@@ -35,6 +38,11 @@ export function KillConfirmModal({
         danger: true,
         loading: killing,
         disabled: critical && confirmText !== target?.processName,
+      }}
+      cancelText="取消"
+      cancelButtonProps={{ ref: cancelRef } as ButtonProps}
+      afterOpenChange={(open) => {
+        if (open) cancelRef.current?.focus();
       }}
       afterClose={afterClose}
     >

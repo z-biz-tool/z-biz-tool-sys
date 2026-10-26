@@ -49,6 +49,7 @@ const SENSOR_COLUMNS = [
 
 export function SystemInfoTab({
   staticInfo,
+  staticError,
   snapshot,
   thermal,
   thermalLoading,
@@ -56,6 +57,8 @@ export function SystemInfoTab({
   onTransferPrefs,
 }: {
   staticInfo: StaticInfo | null;
+  /** 读静态信息失败的原因；null 表示没失败过（可能还在读） */
+  staticError: string | null;
   snapshot: MetricsSnapshot | null;
   /** null = 还没查过；空 sensors + reason = 查过但这台机器给不出读数，两种状态要分开显示 */
   thermal: ThermalReport | null;
@@ -113,6 +116,13 @@ export function SystemInfoTab({
             <Statistic title="当前用户" value={staticInfo.currentUserName ?? "—"} />
           </Col>
         </Row>
+      ) : staticError ? (
+        <Alert
+          type="warning"
+          showIcon
+          title={`读不到系统信息：${staticError}`}
+          description="实时采集与其它页面不受影响；静态信息只会在后端恢复后出现，这里不会用默认值顶替。"
+        />
       ) : (
         <Alert type="info" showIcon title="正在读取系统信息…" />
       )}

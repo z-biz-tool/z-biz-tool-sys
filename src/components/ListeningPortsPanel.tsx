@@ -88,7 +88,7 @@ export function ListeningPortsPanel({ report, loading, onRefresh, onOpenDetail }
             pagination={false}
             scroll={{ x: 700, y: 320 }}
           />
-          <Space direction="vertical" size={2} style={{ marginTop: 10 }}>
+          <Space orientation="vertical" size={2} style={{ marginTop: 10 }}>
             <Text type="secondary" style={{ fontSize: 12 }}>
               来源是一次 <Text code>lsof -nP -iTCP -sTCP:LISTEN</Text>，只在点「重新读取」时才跑，
               不在 1 秒的采集循环里。

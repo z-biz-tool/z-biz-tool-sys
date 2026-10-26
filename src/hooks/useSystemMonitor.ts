@@ -46,6 +46,8 @@ export interface NetSessionTotals {
 
 export function useSystemMonitor(historyLimit = 120, intervalMs = 1000, paused = false) {
   const [staticInfo, setStaticInfo] = useState<StaticInfo | null>(null);
+  // 读不到静态信息时，界面要能说"为什么只有占位符"，而不是永远"正在读取…"
+  const [staticError, setStaticError] = useState<string | null>(null);
   const [snapshot, setSnapshot] = useState<MetricsSnapshot | null>(null);
   const [history, setHistory] = useState<HistoryPoint[]>([]);
   const [seedInfo, setSeedInfo] = useState<HistorySeedInfo | null>(null);
@@ -109,10 +111,15 @@ export function useSystemMonitor(historyLimit = 120, intervalMs = 1000, paused =
 
     invoke<StaticInfo>(Commands.getStaticInfo)
       .then((info) => {
-        if (!disposed) setStaticInfo(info);
+        if (!disposed) {
+          setStaticInfo(info);
+          setStaticError(null);
+        }
       })
-      .catch(() => {
-        /* 静态信息缺失时界面保持占位，不伪造数据 */
+      .catch((e) => {
+        // 静态信息缺失时界面保持占位，不伪造数据；但原因要留得下来
+        console.warn("静态系统信息没读到：", e);
+        if (!disposed) setStaticError(describeError(e));
       });
 
     // 事件订阅建立前可能已有帧，先取一次缓存兜底。
@@ -120,7 +127,7 @@ export function useSystemMonitor(historyLimit = 120, intervalMs = 1000, paused =
       .then((res) => {
         if (!disposed && res.snapshot) push(res.snapshot);
       })
-      .catch(() => undefined);
+      .catch((e) => console.warn("首帧缓存没读到（实时链路照常等待）：", e));
 
     // 回填已落盘的历史：否则重启后 1 小时窗口要重新攒满一小时才有数据。
     const mountedAt = Date.now();
@@ -160,7 +167,8 @@ export function useSystemMonitor(historyLimit = 120, intervalMs = 1000, paused =
         if (disposed) fn();
         else unlisten = fn;
       })
-      .catch(() => {
+      .catch((e) => {
+        console.warn("指标事件订阅失败：", e);
         if (!disposed) setStatus("stalled");
       });
 
@@ -177,5 +185,5 @@ export function useSystemMonitor(historyLimit = 120, intervalMs = 1000, paused =
     };
   }, [historyLimit, intervalMs]);
 
-  return { staticInfo, snapshot, history, status, seedInfo, netSession };
+  return { staticInfo, staticError, snapshot, history, status, seedInfo, netSession };
 }

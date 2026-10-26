@@ -1,5 +1,5 @@
-import { Alert, Modal, Space, Tag, Typography } from "antd";
-import { useMemo } from "react";
+import { Alert, Modal, Space, Tag, Typography, type ButtonProps } from "antd";
+import { useMemo, useRef } from "react";
 import type { JunkReport } from "../ipc_contract";
 import { formatBytes } from "../lib/format";
 
@@ -33,6 +33,8 @@ export function CleanupConfirmModal({
     () => Array.from(new Set(selected.flatMap((c) => c.paths))).sort(),
     [selected]
   );
+  // 永久删除不可撤销：默认焦点停在"取消"
+  const cancelRef = useRef<HTMLButtonElement>(null);
 
   return (
     <Modal
@@ -41,6 +43,11 @@ export function CleanupConfirmModal({
       width={640}
       okText="永久删除"
       okButtonProps={{ danger: true, loading: cleaning }}
+      cancelText="取消"
+      cancelButtonProps={{ ref: cancelRef } as ButtonProps}
+      afterOpenChange={(next) => {
+        if (next) cancelRef.current?.focus();
+      }}
       onCancel={onCancel}
       onOk={onConfirm}
     >

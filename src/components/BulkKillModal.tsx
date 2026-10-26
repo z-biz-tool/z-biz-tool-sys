@@ -1,4 +1,5 @@
-import { Alert, Modal, Space, Table, Tag, Typography } from "antd";
+import { Alert, Modal, Space, Table, Tag, Typography, type ButtonProps } from "antd";
+import { useRef } from "react";
 import { formatBytes } from "../lib/format";
 
 const { Text } = Typography;
@@ -50,6 +51,8 @@ export function BulkKillModal({
   const started = rows.length > 0;
   const succeeded = rows.filter((r) => r.ok).length;
   const failed = rows.filter((r) => !r.ok).length;
+  // 结束进程不可撤销：确认态的默认焦点停在"取消"
+  const cancelRef = useRef<HTMLButtonElement>(null);
   return (
     <Modal
       open={open}
@@ -58,11 +61,16 @@ export function BulkKillModal({
       onOk={onConfirm}
       okText={started ? "完成" : `确认结束 ${targets.length} 个`}
       okButtonProps={{ danger: !started, loading: running }}
+      cancelText="取消"
+      cancelButtonProps={{ ref: cancelRef } as ButtonProps}
+      afterOpenChange={(open) => {
+        if (open) cancelRef.current?.focus();
+      }}
       afterClose={onAfterClose}
       width={640}
     >
       {!started ? (
-        <Space direction="vertical" size="small" style={{ width: "100%" }}>
+        <Space orientation="vertical" size="small" style={{ width: "100%" }}>
           <Text type="danger">
             将逐个发送 SIGTERM，未响应的升级为 SIGKILL；未保存的数据会丢失。
           </Text>
@@ -95,7 +103,7 @@ export function BulkKillModal({
           />
         </Space>
       ) : (
-        <Space direction="vertical" size="small" style={{ width: "100%" }}>
+        <Space orientation="vertical" size="small" style={{ width: "100%" }}>
           <Alert
             type={failed ? "warning" : "info"}
             showIcon

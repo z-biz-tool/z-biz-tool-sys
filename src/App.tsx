@@ -29,6 +29,7 @@ import {
   ThunderboltOutlined,
 } from "@ant-design/icons";
 import dayjs from "dayjs";
+import zhCN from "antd/locale/zh_CN";
 import { invoke } from "@tauri-apps/api/core";
 import { save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
@@ -131,6 +132,10 @@ function App() {
   useEffect(() => {
     applyDocumentLanguage(language);
   }, [language]);
+  // antd 只切自身 token；body 与 .monitor-card 的底色由 index.css 按这个属性切
+  useEffect(() => {
+    document.documentElement.dataset.theme = darkMode ? "dark" : "light";
+  }, [darkMode]);
 
   const [msgApi, msgContext] = message.useMessage();
   // 迷你模式（T5-07）：刻意只做会话级开关，不进 `usePrefs` 的那 5 项快照 ——
@@ -148,7 +153,7 @@ function App() {
     [msgApi]
   );
 
-  const { staticInfo, snapshot, history, status, seedInfo, netSession } = useSystemMonitor(
+  const { staticInfo, staticError, snapshot, history, status, seedInfo, netSession } = useSystemMonitor(
     HISTORY_LIMIT,
     intervalMs,
     paused
@@ -236,6 +241,8 @@ function App() {
   const [largeFiles, setLargeFiles] = useState<LargeFile[]>([]);
   const [largeFileMinSize, setLargeFileMinSize] = useState<number>(100);
   const [scanningLarge, setScanningLarge] = useState(false);
+  // "扫过但没找到"与"还没扫过"在界面上必须是两种说法
+  const [largeScanned, setLargeScanned] = useState(false);
 
   const [startupItems, setStartupItems] = useState<StartupItem[]>([]);
   const [loadingStartup, setLoadingStartup] = useState(false);
@@ -316,8 +323,9 @@ function App() {
       unlisten = await listen<ScanProgress>(MonitorEvent.cleanupScanProgress, ({ payload }) =>
         setScanProgress(payload)
       );
-    } catch {
+    } catch (e) {
       // 事件通道不可用时只是没有进度条，扫描本身照常
+      console.warn("扫描进度订阅失败（扫描照常，界面只少进度条）：", e);
     }
     try {
       const report = await invoke<JunkReport>(Commands.scanJunkFiles);
@@ -395,6 +403,7 @@ function App() {
         limit: 50,
       });
       setLargeFiles(files);
+      setLargeScanned(true);
       if (files.length === 0) {
         msgApi.info(`主目录之下没有大于 ${largeFileMinSize} MB 的文件`);
       } else {
@@ -513,7 +522,8 @@ function App() {
     }
   }, [activeTab, observationTried, loadObservation]);
 
-  const flushDns = useCallback(async () => {    try {
+  const flushDns = useCallback(async () => {
+    try {
       const result = await invoke<DnsFlushResult>(Commands.flushDns);
       if (result.flushed) {
         msgApi.success(result.message);
@@ -586,7 +596,7 @@ function App() {
 
   const openBulkKill = useCallback(() => {
     if (!selectedPids.length) {
-      msgApi.info("先在进程表里勾选要结束的工程");
+      msgApi.info("先在进程表里勾选要结束的进程");
       return;
     }
     setBulkRows([]);
@@ -768,6 +778,7 @@ function App() {
           <ProcessTab
             page={processes.page}
             streaming={processes.streaming}
+            streamError={processes.error}
             hasSnapshot={snapshot !== null}
             keyword={processKeyword}
             onKeywordChange={changeProcessKeyword}
@@ -850,6 +861,7 @@ function App() {
             minSizeMb={largeFileMinSize}
             onMinSizeChange={setLargeFileMinSize}
             scanning={scanningLarge}
+            scanned={largeScanned}
             onScan={scanLargeFiles}
           />
         </ErrorBoundary>
@@ -883,6 +895,7 @@ function App() {
         <ErrorBoundary label="系统信息页">
           <SystemInfoTab
             staticInfo={staticInfo}
+            staticError={staticError}
             snapshot={snapshot}
             thermal={thermal}
             thermalLoading={loadingThermal}
@@ -897,6 +910,7 @@ function App() {
     // 所以配套的回调全部走 useCallback（见 openCleanupConfirm / refreshObservation）。
     [
       staticInfo,
+      staticError,
       snapshot,
       history,
       trendRange,
@@ -912,6 +926,7 @@ function App() {
       setActiveTab,
       processes.page,
       processes.streaming,
+      processes.error,
       processes.refresh,
       processKeyword,
       changeProcessKeyword,
@@ -947,6 +962,7 @@ function App() {
       largeFileMinSize,
       setLargeFileMinSize,
       scanningLarge,
+      largeScanned,
       scanLargeFiles,
       startupItems,
       loadingStartup,
@@ -1088,28 +1104,35 @@ function App() {
 
   return (
     <ConfigProvider
+      locale={zhCN}
       theme={{ algorithm: darkMode ? theme.darkAlgorithm : theme.defaultAlgorithm }}
     >
       {msgContext}
       <Layout style={{ height: "100vh" }}>
         {!miniMode && (
         <Header
+          className="zm-header"
           style={{
             background: cardBgGradient,
-            padding: "0 24px",
+            padding: "8px 24px",
+            height: "auto",
+            minHeight: 64,
             borderBottom: "1px solid var(--ant-color-border-secondary)",
             display: "flex",
             justifyContent: "space-between",
             alignItems: "center",
+            flexWrap: "wrap",
+            rowGap: 8,
+            columnGap: 16,
           }}
         >
-          <Space>
+          <Space className="zm-brand" style={{ flexShrink: 0 }}>
             <DashboardOutlined style={{ fontSize: 24, ...gradientText }} />
-            <Title level={4} style={{ margin: 0, ...gradientText }}>
+            <Title level={4} style={{ margin: 0, whiteSpace: "nowrap", ...gradientText }}>
               系统监控仪表盘
             </Title>
           </Space>
-          <Space size="middle">
+          <Space className="zm-actions" size="middle" wrap style={{ marginInlineStart: "auto" }}>
             <Select
               value={language}
               onChange={setLanguage}
@@ -1131,7 +1154,7 @@ function App() {
             >
               <Badge status={LINK_BADGE[status].status} text={LINK_BADGE[status].text} />
             </Tooltip>
-            <Text type="secondary">
+            <Text type="secondary" className="zm-host">
               {staticInfo
                 ? `${staticInfo.hostname} | ${staticInfo.osName} ${staticInfo.osVersion}`
                 : "读取系统信息…"}
@@ -1147,13 +1170,14 @@ function App() {
                 <Button
                   icon={<BellOutlined />}
                   style={{ borderRadius: 6 }}
+                  aria-label="告警阈值"
                   onClick={() => {
                     setAlertPanelOpen(true);
                     // 打开面板才回读落盘文件：告警是低频事件，没必要为此每秒起一次 IPC
                     alerts.refreshHistory();
                   }}
                 >
-                  告警阈值
+                  <span className="zm-action-label">告警阈值</span>
                 </Button>
               </Badge>
             </Tooltip>
@@ -1161,9 +1185,10 @@ function App() {
               <Button
                 icon={<CompressOutlined />}
                 style={{ borderRadius: 6 }}
+                aria-label="迷你模式"
                 onClick={() => setMiniMode(true)}
               >
-                迷你模式
+                <span className="zm-action-label">迷你模式</span>
               </Button>
             </Tooltip>
             <Tooltip
@@ -1176,9 +1201,10 @@ function App() {
               <Button
                 icon={paused ? <PlayCircleOutlined /> : <PauseCircleOutlined />}
                 style={{ borderRadius: 6 }}
+                aria-label={paused ? "恢复采集" : "暂停采集"}
                 onClick={togglePause}
               >
-                {paused ? "恢复采集" : "暂停采集"}
+                <span className="zm-action-label">{paused ? "恢复采集" : "暂停采集"}</span>
               </Button>
             </Tooltip>
             <Tooltip title={HOTKEY_HELP}>
@@ -1202,8 +1228,8 @@ function App() {
               description="只会执行用户态命令，失败时会给出手动命令"
               onConfirm={flushDns}
             >
-              <Button icon={<SyncOutlined />} style={{ borderRadius: 6 }}>
-                刷新 DNS
+              <Button icon={<SyncOutlined />} style={{ borderRadius: 6 }} aria-label="刷新 DNS">
+                <span className="zm-action-label">刷新 DNS</span>
               </Button>
             </Popconfirm>
           </Space>

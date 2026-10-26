@@ -11,6 +11,7 @@ import {
   Statistic,
   Typography,
   message,
+  theme,
 } from "antd";
 import {
   CheckCircleOutlined,
@@ -50,6 +51,8 @@ export default function UpdaterGate({ delayMs = 5000 }: { delayMs?: number }) {
   const [received, setReceived] = useState(0);
   const [total, setTotal] = useState(0);
   const [restarting, setRestarting] = useState(false);
+  const [msgApi, msgContext] = message.useMessage();
+  const { token } = theme.useToken();
 
   useEffect(() => {
     let cancelled = false;
@@ -95,10 +98,10 @@ export default function UpdaterGate({ delayMs = 5000 }: { delayMs?: number }) {
       setPhase("done");
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : String(e);
-      message.error("更新下载失败: " + msg);
+      msgApi.error("更新下载失败: " + msg);
       setPhase("idle");
     }
-  }, [update]);
+  }, [update, msgApi]);
 
   const restart = useCallback(async () => {
     setRestarting(true);
@@ -106,10 +109,10 @@ export default function UpdaterGate({ delayMs = 5000 }: { delayMs?: number }) {
       await relaunch();
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : String(e);
-      message.error("重启失败，请手动重启应用: " + msg);
+      msgApi.error("重启失败，请手动重启应用: " + msg);
       setRestarting(false);
     }
-  }, []);
+  }, [msgApi]);
 
   if (!update) return null;
 
@@ -119,7 +122,7 @@ export default function UpdaterGate({ delayMs = 5000 }: { delayMs?: number }) {
     <Modal
       title={
         <Space>
-          <CloudDownloadOutlined style={{ color: "#1890ff" }} />
+          <CloudDownloadOutlined style={{ color: token.colorPrimary }} />
           <span>发现新版本</span>
         </Space>
       }
@@ -129,9 +132,10 @@ export default function UpdaterGate({ delayMs = 5000 }: { delayMs?: number }) {
       maskClosable={phase !== "downloading"}
       width={640}
       footer={null}
-      destroyOnClose
+      destroyOnHidden
     >
-      <Space direction="vertical" style={{ width: "100%" }} size={16}>
+      {msgContext}
+      <Space orientation="vertical" style={{ width: "100%" }} size={16}>
         <Row gutter={12}>
           <Col span={12}>
             <Card size="small">
@@ -147,7 +151,7 @@ export default function UpdaterGate({ delayMs = 5000 }: { delayMs?: number }) {
               <Statistic
                 title="新版本"
                 value={`v${update.version}`}
-                valueStyle={{ color: "#52c41a" }}
+                valueStyle={{ color: token.colorSuccess }}
                 prefix={<CheckCircleOutlined />}
               />
             </Card>
@@ -181,7 +185,7 @@ export default function UpdaterGate({ delayMs = 5000 }: { delayMs?: number }) {
 
         {phase === "downloading" && (
           <Card size="small">
-            <Space direction="vertical" style={{ width: "100%" }}>
+            <Space orientation="vertical" style={{ width: "100%" }}>
               <Text>
                 正在下载… {formatSize(received)}
                 {total > 0 ? ` / ${formatSize(total)}` : ""}
@@ -195,7 +199,7 @@ export default function UpdaterGate({ delayMs = 5000 }: { delayMs?: number }) {
           <Alert
             type="success"
             showIcon
-            message="更新已下载并安装"
+            title="更新已下载并安装"
             description="重启应用后生效。"
             action={
               <Space>

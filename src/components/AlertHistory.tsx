@@ -47,7 +47,12 @@ export function AlertHistory({
           options={ALERT_HISTORY_SPANS.map((r) => ({ label: r.label, value: r.value }))}
         />
         <Tooltip title="重新读取落盘文件">
-          <Button size="small" icon={<ReloadOutlined />} onClick={onRefresh} />
+          <Button
+            size="small"
+            icon={<ReloadOutlined />}
+            aria-label="重新读取告警历史"
+            onClick={onRefresh}
+          />
         </Tooltip>
       </Space>
 

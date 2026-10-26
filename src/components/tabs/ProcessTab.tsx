@@ -27,6 +27,8 @@ export interface ProcessSortState {
 interface Props {
   page: ProcessPage;
   streaming: boolean;
+  /** 订阅/启流失败的原因；非空时不能把空表说成"没有匹配的进程" */
+  streamError: string | null;
   hasSnapshot: boolean;
   keyword: string;
   onKeywordChange: (value: string) => void;
@@ -59,6 +61,7 @@ interface Props {
 export const ProcessTab = memo(function ProcessTab({
   page,
   streaming,
+  streamError,
   hasSnapshot,
   keyword,
   onKeywordChange,
@@ -222,7 +225,7 @@ export const ProcessTab = memo(function ProcessTab({
   ];
 
   return (
-    <Space direction="vertical" size={16} style={{ width: "100%" }}>
+    <Space orientation="vertical" size={16} style={{ width: "100%" }}>
       <ProcessRollupPanel
         rollup={rollup}
         loading={observationLoading}
@@ -274,7 +277,17 @@ export const ProcessTab = memo(function ProcessTab({
           </Space>
         }
       >
-        {!streaming && !hasSnapshot ? <Alert type="info" showIcon title="正在建立进程采集…" /> : null}
+        {streamError ? (
+          <Alert
+            type="error"
+            showIcon
+            style={{ marginBottom: 12 }}
+            title={`进程流没有建立：${streamError}`}
+            description="下面的表格与归类可能一直为空。切到别的页签再回来会重新订阅；若仍失败，请看后端日志里的同一句原因。"
+          />
+        ) : !streaming && !hasSnapshot ? (
+          <Alert type="info" showIcon title="正在建立进程采集…" />
+        ) : null}
         <Table<ProcessInfo>
           rowKey="pid"
           columns={columns}

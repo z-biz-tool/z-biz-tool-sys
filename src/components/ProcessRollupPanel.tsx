@@ -111,7 +111,7 @@ export function ProcessRollupPanel({ rollup, loading, onRefresh, onOpenDetail }:
             pagination={false}
             scroll={{ x: 760 }}
           />
-          <Space direction="vertical" size={2} style={{ marginTop: 10 }}>
+          <Space orientation="vertical" size={2} style={{ marginTop: 10 }}>
             <Text type="secondary" style={{ fontSize: 12 }}>
               口径：一次全量枚举，不是进程表当前这一页；内存是各进程常驻内存之和，跨进程共享页会重复计入，
               因此这一列的合计比实际物理占用偏大。

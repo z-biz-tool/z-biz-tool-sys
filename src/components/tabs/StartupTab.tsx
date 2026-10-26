@@ -1,6 +1,18 @@
-import { Alert, Button, Card, Input, Modal, Space, Table, Tag, Tooltip, Typography } from "antd";
+import {
+  Alert,
+  Button,
+  Card,
+  Input,
+  Modal,
+  Space,
+  Table,
+  Tag,
+  Tooltip,
+  Typography,
+  type ButtonProps,
+} from "antd";
 import { ReloadOutlined, RocketOutlined } from "@ant-design/icons";
-import { useState } from "react";
+import { useRef, useState } from "react";
 import type { StartupAction, StartupItem } from "../../ipc_contract";
 
 const { Text } = Typography;
@@ -50,6 +62,8 @@ export function StartupTab({ items, loading, busy, onReload, onDisable, onRemove
   const copy = pending ? ACTION_COPY[pending.action] : null;
   // 前后端各有一道确认：这里挡住"手滑点"，后端挡住"没经过确认框就被调用"
   const confirmed = !!pending && confirmText === pending.item.name;
+  // 默认焦点落在"取消"：确认要输入名称，回车不该误触删除/禁用
+  const cancelRef = useRef<HTMLButtonElement>(null);
 
   const close = () => {
     setPending(null);
@@ -158,6 +172,10 @@ export function StartupTab({ items, loading, busy, onReload, onDisable, onRemove
         okText={copy?.ok}
         okButtonProps={{ danger: copy?.danger, loading: busy, disabled: !confirmed }}
         cancelText="取消"
+        cancelButtonProps={{ ref: cancelRef } as ButtonProps}
+        afterOpenChange={(next) => {
+          if (next) cancelRef.current?.focus();
+        }}
         onCancel={close}
         afterClose={() => setConfirmText("")}
         onOk={() => {

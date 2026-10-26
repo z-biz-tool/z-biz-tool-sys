@@ -11,10 +11,12 @@ interface Props {
   minSizeMb: number;
   onMinSizeChange: (value: number) => void;
   scanning: boolean;
+  /** 这一次会话里是否真的扫过：扫过而空 = "没有这么大的文件"，没扫过 = "还没开始" */
+  scanned: boolean;
   onScan: () => void;
 }
 
-export function LargeFileTab({ files, minSizeMb, onMinSizeChange, scanning, onScan }: Props) {
+export function LargeFileTab({ files, minSizeMb, onMinSizeChange, scanning, scanned, onScan }: Props) {
   return (
     <Card
       title={
@@ -32,7 +34,13 @@ export function LargeFileTab({ files, minSizeMb, onMinSizeChange, scanning, onSc
             onChange={(v) => onMinSizeChange(v || 100)}
             style={{ width: 120 }}
           />
-          <Button type="primary" icon={<SearchOutlined />} onClick={onScan} loading={scanning}>
+          <Button
+            type="primary"
+            icon={<SearchOutlined />}
+            onClick={onScan}
+            loading={scanning}
+            disabled={scanning}
+          >
             扫描
           </Button>
         </Space>
@@ -47,7 +55,11 @@ export function LargeFileTab({ files, minSizeMb, onMinSizeChange, scanning, onSc
           }}
         >
           <FileSearchOutlined style={{ fontSize: 64, marginBottom: 16 }} />
-          <div>点击“扫描”开始查找大文件</div>
+          <div>
+            {scanned
+              ? `主目录之下没有大于 ${minSizeMb} MB 的文件`
+              : "点击“扫描”开始查找大文件"}
+          </div>
         </div>
       ) : (
         <Table<LargeFile>
