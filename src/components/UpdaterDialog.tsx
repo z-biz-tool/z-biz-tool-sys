@@ -75,7 +75,10 @@ export default function UpdaterGate({ delayMs = 5000 }: { delayMs?: number }) {
   const dismiss = useCallback(() => {
     if (phase === "downloading") return;
     // Update 在 Rust 侧持有资源，不安装就主动释放
-    if (update) void update.close().catch(() => {});
+    if (update)
+      void update.close().catch((e) => {
+        console.warn("[updater] 释放更新资源失败:", e);
+      });
     setUpdate(null);
     setPhase("idle");
     setReceived(0);

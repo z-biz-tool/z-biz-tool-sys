@@ -57,8 +57,9 @@ export function usePrefs() {
         localStorage.setItem(PREF + "paused", paused ? "1" : "0");
         localStorage.setItem(PREF + "alert", JSON.stringify(alertConfig));
         localStorage.setItem(PREF + "language", language);
-      } catch {
-        /* 存不下（配额、隐私模式）不影响干活 */
+      } catch (e) {
+        /* 存不下（配额、隐私模式）不影响本次会话，但下次开机偏好会丢 */
+        console.warn("[sys] 偏好写入 localStorage 失败，下次启动会用默认值:", e);
       }
     }, 300);
     return () => window.clearTimeout(timer);
