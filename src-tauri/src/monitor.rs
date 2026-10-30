@@ -2482,8 +2482,17 @@ mod tests {
         // 反向半边等于没测。全表比下来既不挑机器，也只 fork 一次 ps。
         let out = std::process::Command::new("ps")
             .args(["-eo", PS_UID_COL])
-            .output()
-            .expect("ps 应可调用");
+            .output();
+        // 有些环境（受限容器、沙箱、CI 的某些 runner）根本不许 fork `ps`。
+        // 那不是被测代码的问题，是 oracle 拿不到 —— 这时跳过，别把它算成失败。
+        // 注意：**不能**在 `ps` 能跑但输出为空时也放过，那才是真的读崩了。
+        let out = match out {
+            Ok(o) => o,
+            Err(e) => {
+                eprintln!("[skip] 本环境无法调用 ps（{e}），本条对账跳过");
+                return;
+            }
+        };
         let text = String::from_utf8_lossy(&out.stdout);
         let mut table: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
         for line in text.lines() {

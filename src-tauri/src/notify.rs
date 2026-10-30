@@ -404,7 +404,7 @@ mod tests {
     /// 这条任务的授权门槛本来是"扩 capabilities"。实测走 Rust API 之后一条权限都不需要，
     /// 于是把它钉成回归：谁哪天改走 JS 通道，必须显式改动这条测试并说清理由。
     #[test]
-    fn capabilities_stay_the_explicit_eight_without_any_notification_entry() {
+    fn capabilities_stay_the_explicit_list_without_any_notification_entry() {
         let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let raw = std::fs::read_to_string(manifest.join("capabilities/default.json")).unwrap();
         let doc: serde_json::Value = serde_json::from_str(&raw).unwrap();
@@ -425,8 +425,12 @@ mod tests {
                 "dialog:allow-message",
                 "dialog:allow-ask",
                 "dialog:allow-confirm",
+                // 阶段 1 自动更新：前端 UpdaterDialog.tsx 走 plugin-updater
+                "updater:default",
+                // 阶段 1 自动更新：更新完要用 plugin-process 重启应用
+                "process:default",
             ],
-            "capabilities 变了：T5-02 走的是 Rust API，不需要任何新权限"
+            "capabilities 变了：通知走 Rust API 不需要 notification 权限，其余每一项都要显式列出"
         );
         assert!(
             !perms.iter().any(|p| p.contains("notification")),
