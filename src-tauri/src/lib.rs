@@ -25,16 +25,19 @@ pub fn run() {
     let alert_config = alert::AlertState::default();
     // 系统通知（T5-02）：投递结果的记账。循环里写、`notify_status` 里读，两边各持一份同一份计数。
     let notify = notify::NotifyState::default();
+    // 深链队列：manage 给命令用、seed 给冷启动用，两处必须是同一份。
+    let zbiz_pending = cap_hub::receiver::SharedPending::default();
 
     tauri::Builder::default()
         // 单实例（2026-10-26 分发底座）：第二次启动聚焦已有窗口，不再开新进程。
         // 必须作为第一个注册的插件（tauri-plugin-single-instance 官方要求）。
-        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+        .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.unminimize();
                 let _ = window.show();
                 let _ = window.set_focus();
             }
+            cap_hub::receiver::handle_second_instance(app, &argv);
         }))
         .plugin(tauri_plugin_dialog::init())
         // 通知只从后端 Rust API 投（`notify` 模块头写了为什么不走 JS 通道），
@@ -49,7 +52,10 @@ pub fn run() {
         .manage(service.clone())
         .manage(alert_config.clone())
         .manage(notify.clone())
+        .manage(zbiz_pending.clone())
         .setup(move |app| {
+            // 冷启动时带进来的 zbiz:// 先入队，前端挂上监听后再取走。
+            cap_hub::receiver::seed_cold_start(app.handle(), &zbiz_pending);
             // 历史存储只在启动时解析一次：采集循环拿写入端，command 拿只读端。
             let store = history::store_for(app.handle());
             app.manage(history::HistoryState(store.clone()));
@@ -98,7 +104,16 @@ pub fn run() {
             commands::export_history_csv,
             commands::notify_status,
             commands::send_test_notification,
+            zbiz_take_pending,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+/// 取走队列里的深链（家族统一命令名）。
+#[tauri::command]
+fn zbiz_take_pending(
+    pending: tauri::State<'_, cap_hub::receiver::SharedPending>,
+) -> Vec<cap_hub::Handoff> {
+    cap_hub::receiver::take_pending_from(pending.inner())
 }
