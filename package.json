@@ -22,7 +22,8 @@
     "dayjs": "^1.11.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
-    "recharts": "^2.10.0"
+    "recharts": "^2.10.0",
+    "z-biz-tool-shared": "^0.1.6"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.0.0",

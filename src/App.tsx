@@ -33,6 +33,8 @@ import zhCN from "antd/locale/zh_CN";
 import { invoke } from "@tauri-apps/api/core";
 import { save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { startDeepLinkReceiver, ZBIZ_TAKE_PENDING, type Handoff } from "z-biz-tool-shared/protocol";
+import { resolveSysDeepLink, type SysTab } from "./_shared/deepLink";
 import {
   Commands,
   MonitorEvent,
@@ -180,6 +182,42 @@ function App() {
     correctProcessPage,
     processes.page.total,
   ]);
+
+  // zbiz:// 深链接收侧：**机制**在共享层 `startDeepLinkReceiver`（冷启动补取、事件监听、不静默吞掉），
+  // 本仓只通过 translate 注入**语义**（切到哪个 tab / 按 pid 过滤），
+  // 并在 onEffect 里落地到 setActiveTab / changeProcessKeyword。
+  useEffect(() => {
+    const stop = startDeepLinkReceiver({
+      productId: "sys",
+      invoke: () => invoke<Handoff[]>(ZBIZ_TAKE_PENDING),
+      listen: (event, handler) => listen(event, handler),
+      translate: (item) => {
+        const out = resolveSysDeepLink(item);
+        if (out.problem) {
+          return { ok: false, problem: out.problem };
+        }
+        return { ok: true, effect: { tab: out.tab, pid: out.pid } };
+      },
+      onProblem: (msg, item) => {
+        // 未适配的深链静默吞掉 = 用户「点了没反应」，必须给可见提示
+        console.warn("[sys] 未适配的深链", item, msg);
+        msgApi.warning(msg);
+      },
+      onEffect: (effect) => {
+        const tab = effect.tab as SysTab | null;
+        const pid = effect.pid as string | null;
+        if (pid) {
+          // pid 优先：它隐含「去 processes 页」，直接喂给进程表关键字过滤
+          changeProcessKeyword(pid);
+          setActiveTab("processes");
+        } else if (tab) {
+          setActiveTab(tab);
+        }
+      },
+      log: (msg, item) => console.debug("[sys] 深链", msg, item),
+    });
+    return stop;
+  }, [setActiveTab, changeProcessKeyword, msgApi]);
 
   // 阈值只有一条链：面板改动 → usePrefs 落盘 → useAlerts 下发 → 后端回夹取后的生效值覆盖输入框
   const alertNotice = useCallback(
