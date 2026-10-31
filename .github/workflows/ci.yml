@@ -81,7 +81,7 @@ jobs:
         run: npm run build
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.99.0
         with:
           components: clippy, rustfmt
           targets: ${{ matrix.platform == 'macos-latest' && 'x86_64-apple-darwin' || '' }}
