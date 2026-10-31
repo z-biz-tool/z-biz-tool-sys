@@ -1,0 +1,15 @@
+{
+  "id": "sys",
+  "displayName": "系统监控仪表盘",
+  "description": "CPU/内存/磁盘/网络 + 清理/启动项",
+  "acceptsDeepLink": true,
+  "actions": [
+    "open"
+  ],
+  "keywords": [
+    "监控",
+    "系统",
+    "清理",
+    "进程"
+  ]
+}
