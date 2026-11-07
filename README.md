@@ -1,5 +1,32 @@
 # z-biz-tool-sys
 
+> [!IMPORTANT]
+> **本仓已于 2026-11-06 废弃，能力已并入 [z-biz-tool-file](../z-biz-tool-file)。**
+>
+> 系统监控现在是 z-biz-tool-file 的第五个板块 —— 活动栏最下面那个「系统监控」
+> 图标（`DashboardOutlined`，在「数据库」下方）。所有能力都搬过去了，**只维护一份**：
+>
+> - **实时监控**：CPU（总+每核）、内存（含压力档）、磁盘（容量+读写速率）、网络（分接口速率+接口表）
+> - **进程管理**：进程表/归因视图、监听端口反查、结束进程（含批量与二次确认）
+> - **系统清理**：垃圾文件扫描、风险分级、选择性清理、清理报告
+> - **大文件扫描**、**启动项管理**（禁用/删除/恢复）
+> - **告警**：阈值配置、告警历史、系统通知
+> - **历史趋势**（10s 采样、保留 7 天）、**迷你模式**、**Agent 面板**
+>
+> 独立 app 不再出包、不再单独发版。请直接用 z-biz-tool-file。
+>
+> 本仓保留为只读的历史存档，供追溯当时的实现细节（尤其是 sysinfo 采集口径、
+> IOKit 块设备计数对账、清理白名单与路径守卫）。**不要再往这里提交功能代码** ——
+> 要改系统监控能力，改 z-biz-tool-file 的 `src/apps/sys/` 与
+> `src-tauri/src/sys_app/`。
+>
+> ⚠️ 合并时**数据目录换了**：历史趋势与告警历史现在落在 file 的
+> `app_data_dir` 下，旧 sys app 采过的历史不会自动迁移（那是滚动数据，
+> 保留窗口只有 7 天，重采即可）。
+
+---
+
+
 > 一款轻量、实时的跨平台系统监控仪表盘，参考 [iStat Menus](https://bjango.com/istatmenus/) 和 [Stats](https://github.com/exelban/stats) 的产品形态，基于 Tauri 打造。
 
 ![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Windows%20%7C%20Linux-blue)

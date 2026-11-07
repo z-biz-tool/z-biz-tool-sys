@@ -3,6 +3,7 @@
   "version": "0.2.0",
   "license": "MIT",
   "description": "系统监控仪表盘 - 对标iStat Menus/Stats",
+  "deprecated": "本仓已于 2026-11-06 废弃，系统监控能力已并入 z-biz-tool-file。功能改动请去 z-biz-tool-file 的 src/apps/sys/ 与 src-tauri/src/sys_app/。",
   "type": "module",
   "scripts": {
     "dev": "vite",
